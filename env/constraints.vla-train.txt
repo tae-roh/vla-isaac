@@ -1,0 +1,43 @@
+# =============================================================================
+# env/constraints.vla-train.txt — SFT 전용 제약 (Phase 3, H100/A100 인스턴스)
+#
+# ★ 왜 constraints.txt 와 별도 파일인가
+#   env/constraints.txt 의 torch==2.7.0 핀은 "Isaac Sim 5.1.0 이 검증한 버전"이라는
+#   단 하나의 이유로 존재한다. SFT 인스턴스에는 Isaac Sim 이 아예 설치되지 않으므로
+#   (계획서 §3-1: VLA SFT = Isaac Sim 구동 ✗) 그 핀을 적용할 근거가 없고,
+#   오히려 openvla-oft 가 검증한 스택(torch 2.2.0 + flash-attn 2.5.5)을 깨뜨린다.
+#
+#   → SFT venv 에는 이 파일을, Isaac Sim 계열 venv 에는 constraints.txt 를 건다.
+#     두 파일을 섞어 걸지 말 것.
+#
+# 사용법:
+#     pip install -c env/constraints.vla-train.txt <pkg>
+# =============================================================================
+
+# --- openvla-oft 가 검증한 스택 (임의 상향 금지) ---
+# flash-attn 2.5.5 의 프리빌트 휠이 이 torch 버전에 맞춰져 있다.
+# torch 를 올리면 flash-attn 을 소스 빌드해야 하고, 빌드에만 30분 이상 걸린다.
+torch==2.2.0
+torchvision==0.17.0
+torchaudio==2.2.0
+
+# --- 모델/학습 스택 ---
+transformers==4.40.1          # openvla-oft 가 이 버전 기준. 상향 시 prismatic 모델 로딩이 깨진다
+tokenizers==0.19.1
+peft==0.11.1                  # LoRA r=32
+accelerate>=0.32.1
+timm==0.9.10                  # prismatic vision backbone
+huggingface_hub>=0.24
+
+# --- RLDS 데이터 로딩 ---
+# SFT 인스턴스는 렌더를 하지 않으므로 tensorflow 는 CPU 판이면 충분하고,
+# GPU 판은 VRAM 을 선점해 학습 배치를 깎아먹는다.
+tensorflow-cpu==2.15.0
+tensorflow-datasets==4.9.3
+dlimp @ git+https://github.com/kvablack/dlimp@5edaa4691567873d495633f2708982b42edf1972
+
+# --- 실험 관리 ---
+wandb>=0.17
+draccus==0.8.0                # openvla-oft 의 CLI 파서. 버전 민감
+tqdm>=4.66
+rich>=13.0

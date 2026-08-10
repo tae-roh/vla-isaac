@@ -1,0 +1,49 @@
+# =============================================================================
+# .gitignore
+#
+# RUNBOOK 은 마일스톤마다 `git add -A` 를 지시한다. 이 파일이 없으면 그 순간
+# 수십 GB 의 데이터셋과 7B 체크포인트를 커밋하려 들어 푸시가 사실상 불가능해진다.
+# 대용량 산출물의 SSOT 는 git 이 아니라 HF Hub 다 (계획서 §3-3).
+# =============================================================================
+
+# --- 대용량 산출물 (HF Hub 로 간다) ---
+datasets/
+runs/
+logs/
+ckpt/
+checkpoints/
+*.hdf5
+*.pt
+*.safetensors
+*.tfrecord*
+
+# 단, 관측 레퍼런스 PNG 는 작고 Phase 4 스펙 대조에 반드시 필요하다
+# (부록 A: "Phase 1 의 레퍼런스 관측 PNG 를 함께 가져갈 것")
+!datasets/obs_reference/
+!datasets/obs_reference/**
+
+# 정규화 통계도 작고, SFT-RFT 일치의 핵심이라 버전 관리한다
+!datasets/rlds/norm_stats.json
+
+# --- 런타임 생성물 ---
+rft/runtime/
+rft/debug_frames/
+wandb/
+*.mp4
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv*/
+venv/
+env_*/
+
+# --- 환경 lock 은 커밋한다 (인스턴스가 사라져도 복원 가능해야 한다) ---
+# env/locks/*.lock.txt 는 무시하지 않는다 — 의도적이다.
+
+# --- 편집기/OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

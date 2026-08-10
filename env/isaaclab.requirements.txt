@@ -1,0 +1,35 @@
+# =============================================================================
+# env/isaaclab.requirements.txt
+# Phase 1 · 2 · 4b 용 환경: Isaac Sim 5.1.0 + Isaac Lab
+#
+# 설치는 setup/setup_isaaclab.sh 를 통해서만 한다. 이 파일을 직접
+# `pip install -r` 하지 말 것 — isaacsim 과 torch 는 전용 인덱스가 필요하고,
+# Isaac Lab 본체는 git clone 후 `./isaaclab.sh --install none` 으로 설치된다.
+# 이 파일은 "그 외 추가 패키지" 목록이다.
+#
+# 항상 -c env/constraints.txt 와 함께 설치할 것.
+# =============================================================================
+
+# --- 데이터 파이프라인 ---
+h5py>=3.11
+numpy<2                       # Isaac Sim 5.1 스택이 numpy 1.x 기준
+Pillow>=10.0
+opencv-python-headless>=4.10   # 관측 PNG 덤프 / 리사이즈 (headless 서버이므로 -headless)
+
+# --- RLDS 변환 (Phase 2) ---
+# tensorflow 는 CPU 판으로 충분하다. GPU 판은 CUDA 런타임을 중복 적재해
+# Isaac Sim 과 충돌할 수 있으므로 반드시 CPU 판을 쓴다.
+tensorflow-cpu>=2.15,<2.17
+tensorflow-datasets>=4.9
+
+# --- 실험 관리 ---
+wandb>=0.17
+tqdm>=4.66
+rich>=13.0
+
+# --- HF Hub 업로드 (SSOT) ---
+huggingface_hub>=0.24
+
+# 참고 — 아래는 이 환경에 "설치하지 않는다":
+#   * rl_games / stable-baselines3 / skrl : `./isaaclab.sh --install none` 으로 원천 회피 (계획서 §4-4)
+#   * transformers / peft / vllm          : vla-train, rft 환경 소관

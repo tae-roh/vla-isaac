@@ -1,0 +1,40 @@
+# =============================================================================
+# rft/configs/grpo_deformable.yaml
+# 변형체 태스크 RFT — 스트레치. 강체 커브를 확보한 뒤에만 쓴다.
+#
+# 강체 설정과 다른 점은 전부 "FEM 이 무겁다" 는 한 가지 이유에서 나온다:
+#   - num_envs 를 절반으로 (계획서 §Phase4b-5: 8~16)
+#   - 에피소드를 더 짧게
+#   - 체크포인트를 더 자주 (시간이 모자라 중간에 끊을 가능성이 높다)
+#
+# 진입 조건 (둘 다 만족할 때만):
+#   1. 강체 RFT 에서 개선 커브가 확인되었다
+#   2. SFT 정책의 변형체 성공률이 0 이 아니다
+#      (0 이면 RL 이 붙잡을 신호가 없다 — SimpleVLA-RL 의 핵심 관찰)
+# =============================================================================
+
+checkpoint: ""
+task: VlaPick-Deformable-v0
+isaaclab_python: ~/env_isaaclab/bin/python
+
+num_envs: 4
+group_size: 4
+groups_per_step: 2
+max_steps_per_episode: 160
+
+# 변형체는 파지 자체가 불안정해 성공이 드물다 → 탐색을 조금 더 넓게.
+temperature: 1.5
+
+learning_rate: 1.0e-6
+clip_eps: 0.2
+kl_coef: 0.0
+max_grad_norm: 1.0
+total_steps: 150
+
+log_dir: logs/grpo_deformable
+save_every: 10
+eval_every: 10
+wandb_project: ""
+
+device: cuda:0
+seed: 0

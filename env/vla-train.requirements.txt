@@ -1,0 +1,49 @@
+# =============================================================================
+# env/vla-train.requirements.txt
+# Phase 3 (SFT) 환경 — H100/A100 인스턴스. Isaac Sim 미포함.
+#
+# 설치: setup/setup_vla_train.sh 경유. 항상 -c env/constraints.vla-train.txt.
+# (constraints.txt 가 아니다 — 이유는 해당 파일 헤더 참조)
+#
+# 이 환경의 목표는 openvla-oft 의 finetune.py 를 "이산 액션 토큰 + CE" 모드로
+# 돌리는 것이다 (계획서 §2-1: SimpleVLA-RL 판과 구조 일치 = RL 호환).
+#   --use_l1_regression False   ← 연속 L1 회귀 헤드를 끄는 것이 핵심
+#   --use_diffusion     False
+# =============================================================================
+
+# --- 핵심 스택 (버전은 constraints.vla-train.txt 가 고정) ---
+torch
+torchvision
+torchaudio
+transformers
+tokenizers
+peft
+accelerate
+timm
+huggingface_hub
+
+# --- RLDS 데이터 로딩 ---
+tensorflow-cpu
+tensorflow-datasets
+dlimp
+
+# --- openvla-oft 런타임 의존 ---
+draccus
+einops
+jsonlines
+matplotlib
+numpy<2
+Pillow>=10.0
+opencv-python-headless>=4.10
+sentencepiece
+protobuf
+
+# --- 실험 관리 ---
+wandb
+tqdm
+rich
+
+# --- 별도 설치 (requirements 로 처리하지 않음) ---
+#   flash-attn==2.5.5 : torch 설치 후에 --no-build-isolation 으로 설치해야 한다.
+#                       setup_vla_train.sh 가 순서를 보장한다.
+#   openvla-oft       : git clone 후 pip install -e . (편집 가능 설치)

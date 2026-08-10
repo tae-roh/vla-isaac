@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vla-isaac-tasks"
+version = "0.1.0"
+description = "VLA SFT/RFT 용 Isaac Lab 태스크 — 형상 랜덤화 자재 픽앤플레이스"
+requires-python = ">=3.10"
+# 의존성은 여기서 선언하지 않는다.
+# Isaac Sim / Isaac Lab / torch 는 setup/setup_isaaclab.sh 가 전용 인덱스와
+# constraints 를 걸어 설치한다. 여기에 적으면 pip 가 그 핀을 무시하고
+# 다른 버전을 끌어와 환경을 깨뜨린다.
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["vla_isaac_tasks*"]

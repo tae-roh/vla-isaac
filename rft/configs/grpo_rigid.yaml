@@ -1,0 +1,52 @@
+# =============================================================================
+# rft/configs/grpo_rigid.yaml
+# 강체 태스크 RFT — 이 프로젝트의 핵심 결과를 내는 설정.
+#
+# 규모는 계획서 §3-2 의 경고를 반영해 축소했다:
+#   SimpleVLA-RL 레퍼런스가 8× A100 에서 스텝당 ~20분(롤아웃 88%), 300스텝 ~4.3일.
+#   그건 LIBERO(MuJoCo/OpenGL) 기준이고 Isaac Lab 은 렌더가 더 무겁다.
+#   → 그룹 크기 / 에피소드 길이 / num_envs 를 모두 줄여 스텝 시간을 관리한다.
+#
+# 시간 예산 잡는 법:
+#   한 스텝 = groups_per_step × (에피소드 길이 / 청크 8) × num_envs 번의 정책 forward
+#           = 2 × (200/8) × 8 = 400회
+#   첫 20스텝의 실제 소요를 보고 total_steps 를 조정할 것. 커브가 오르기 시작하는
+#   것만 확인되면 되므로, 끝까지 돌릴 필요는 없다.
+# =============================================================================
+
+checkpoint: ""                    # --checkpoint 로 넘기거나 여기에 채운다
+task: VlaPick-v0
+isaaclab_python: ~/env_isaaclab/bin/python
+
+# --- 롤아웃 ---
+# num_envs 를 그룹 크기로 그대로 쓴다: 한 번의 reset 으로 만든 배치가 곧 한 그룹.
+# 같은 시드로 리셋하므로 그룹 내 초기 상태가 공유된다 (GRPO 전제).
+num_envs: 8
+group_size: 8
+groups_per_step: 2
+
+# 에피소드를 짧게 자른다. 스텝 시간에 선형으로 들어가는 항목이라 여기가 가장 효과적이다.
+# 200스텝이면 24Hz 기준 8초 — 픽앤플레이스에 충분하다.
+max_steps_per_episode: 200
+
+# 탐색 온도. 계획서 §Phase4b-5 권장 1.2~1.6.
+# 낮으면 그룹이 전멸/전승으로 쏠려 advantage 가 0 이 되고(무신호 그룹),
+# 높으면 궤적이 망가져 성공이 아예 안 나온다. 로그의 '무신호그룹' 비율을 보고 조정.
+temperature: 1.4
+
+# --- 최적화 ---
+learning_rate: 1.0e-6
+clip_eps: 0.2
+# SimpleVLA-RL 기본은 KL 항 없음. 정책이 발산하면 0.01 정도부터 켜 본다.
+kl_coef: 0.0
+max_grad_norm: 1.0
+total_steps: 300
+
+# --- 로깅 ---
+log_dir: logs/grpo_rigid
+save_every: 25
+eval_every: 25
+wandb_project: ""                 # 채우면 wandb 로 보낸다 (아웃바운드라 포트 개방 불필요)
+
+device: cuda:0
+seed: 0

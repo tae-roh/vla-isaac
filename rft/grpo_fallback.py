@@ -1,0 +1,440 @@
+"""자작 GRPO 루프 — veRL 어댑터가 막혔을 때의 fallback.
+
+★ 언제 이걸로 갈아타는가
+  Day 3 정오까지 SimpleVLA-RL 어댑터로 롤아웃 1회가 안 돌면 전환한다.
+  계획서 §6 도 같은 판단을 적어 두었다: "num_envs 가 작아 veRL 스케일링 이점이
+  제한적 → 단일 노드에선 자작이 오히려 단순할 수 있음".
+
+  전환 비용이 작은 이유: 환경·보상·관측·브리지·평가 코드가 전부 그대로 쓰인다.
+  갈아끼우는 것은 "정책을 어떻게 업데이트하는가" 한 조각뿐이다.
+
+★ veRL 대비 포기하는 것 (알고 쓸 것)
+  - vLLM 가속 생성 → HF generate 를 쓴다. 느리다. num_envs 가 작아 감당은 된다.
+  - FSDP 멀티 GPU 샤딩 → 단일 GPU LoRA 만. 7B LoRA + bf16 이면 48GB 에 들어간다.
+  - 정교한 KV 캐시/시퀀스 패킹 최적화
+
+  즉 "느리지만 확실히 도는 것" 과 "빠르지만 이틀 안에 못 붙일 수도 있는 것"의
+  교환이다. 3~4일 예산에서 유의미한 결과를 보장해야 하므로 이 선택지가 존재한다.
+
+GRPO 요약:
+  1. 같은 초기 상태에서 G개 궤적을 샘플링 (temperature > 1 로 탐색)
+  2. 그룹 안에서 보상을 정규화 → advantage  (critic 불필요)
+  3. PPO 스타일 클리핑으로 정책 업데이트
+
+사용 예:
+    python rft/grpo_fallback.py --config rft/configs/grpo_rigid.yaml
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+_spec_mod = importlib.util.spec_from_file_location(
+    "vla_spec", REPO_ROOT / "configs" / "vla_spec.py"
+)
+SPEC = importlib.util.module_from_spec(_spec_mod)
+sys.modules["vla_spec"] = SPEC
+_spec_mod.loader.exec_module(SPEC)
+
+from rft.ipc_bridge import RolloutClient  # noqa: E402
+
+
+# =============================================================================
+@dataclass
+class GRPOConfig:
+    checkpoint: str = ""
+    task: str = "VlaPick-v0"
+    isaaclab_python: str = str(Path.home() / "env_isaaclab" / "bin" / "python")
+
+    # 롤아웃
+    group_size: int = 8           # 같은 초기 상태에서 굴릴 궤적 수 (G)
+    num_envs: int = 8             # 워커의 배치 크기. group_size 와 같게 두면 한 라운드 = 한 그룹
+    groups_per_step: int = 2      # 한 업데이트에 쓸 그룹 수
+    max_steps_per_episode: int = SPEC.MAX_EPISODE_STEPS
+    temperature: float = 1.4      # 계획서 §Phase4b-5 권장 1.2~1.6
+
+    # 최적화
+    learning_rate: float = 1e-6
+    clip_eps: float = 0.2
+    kl_coef: float = 0.0          # 0 = KL 항 없음 (SimpleVLA-RL 기본)
+    max_grad_norm: float = 1.0
+    total_steps: int = 300
+
+    # 로깅/체크포인트
+    log_dir: str = "logs/grpo"
+    save_every: int = 25
+    eval_every: int = 25
+    wandb_project: str = ""
+
+    device: str = "cuda:0"
+    seed: int = 0
+
+    extra: dict = field(default_factory=dict)
+
+
+def load_config(path: Path) -> GRPOConfig:
+    """YAML 이 있으면 YAML, 없으면 JSON 으로 읽는다."""
+    text = path.read_text(encoding="utf-8")
+    try:
+        import yaml
+
+        raw = yaml.safe_load(text)
+    except ImportError:
+        raw = json.loads(text)
+    known = {f for f in GRPOConfig.__dataclass_fields__}
+    kwargs = {k: v for k, v in raw.items() if k in known}
+    kwargs["extra"] = {k: v for k, v in raw.items() if k not in known}
+    return GRPOConfig(**kwargs)
+
+
+# =============================================================================
+def compute_group_advantages(rewards: np.ndarray) -> np.ndarray:
+    """그룹 내 보상 정규화 → advantage.
+
+    GRPO 의 핵심이자 critic 이 필요 없는 이유다. 같은 초기 상태에서 나온
+    궤적들끼리만 비교하므로 상태 가치를 추정할 필요가 없다.
+
+    Args:
+        rewards: (num_groups, group_size) 0/1 보상
+
+    Returns:
+        같은 shape 의 advantage.
+
+    그룹 전체가 성공(전부 1)이거나 전멸(전부 0)이면 표준편차가 0 이라
+    학습 신호가 없다. 이 경우 advantage 를 0 으로 둔다 — 0 으로 나눠 NaN 이
+    되면 그 스텝뿐 아니라 모델 가중치 전체가 오염된다.
+    """
+    mean = rewards.mean(axis=1, keepdims=True)
+    std = rewards.std(axis=1, keepdims=True)
+    adv = np.zeros_like(rewards)
+    valid = std.squeeze(1) > 1e-6
+    adv[valid] = (rewards[valid] - mean[valid]) / (std[valid] + 1e-8)
+    return adv
+
+
+def degenerate_fraction(rewards: np.ndarray) -> float:
+    """학습 신호가 없는 그룹의 비율. 이게 계속 1.0 이면 커브가 오르지 않는다."""
+    std = rewards.std(axis=1)
+    return float((std <= 1e-6).mean())
+
+
+# =============================================================================
+class GRPOTrainer:
+    def __init__(self, cfg: GRPOConfig):
+        self.cfg = cfg
+        self.log_dir = Path(cfg.log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        import torch
+        from transformers import AutoModelForVision2Seq, AutoProcessor
+
+        self.torch = torch
+        print(f"[grpo] 정책 로드: {cfg.checkpoint}")
+        self.processor = AutoProcessor.from_pretrained(
+            cfg.checkpoint, trust_remote_code=True
+        )
+        self.model = AutoModelForVision2Seq.from_pretrained(
+            cfg.checkpoint,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        ).to(cfg.device)
+
+        # LoRA 파라미터만 학습한다. 7B 전체를 열면 48GB 에 옵티마이저 상태가 안 들어간다.
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        if not trainable:
+            raise RuntimeError(
+                "학습 가능한 파라미터가 없다. LoRA 어댑터가 붙은 체크포인트인지 확인할 것 "
+                "(SFT 시 merge_lora_during_training=True 였다면 새로 LoRA 를 붙여야 한다)."
+            )
+        n_train = sum(p.numel() for p in trainable) / 1e6
+        print(f"[grpo] 학습 파라미터 {n_train:.1f}M / "
+              f"전체 {sum(p.numel() for p in self.model.parameters()) / 1e9:.1f}B")
+
+        self.optimizer = torch.optim.AdamW(trainable, lr=cfg.learning_rate)
+        self.prompt = SPEC.build_prompt()
+
+        # 액션 디토크나이저 구간. SFT 가 만든 것과 같은 파일을 읽어야 한다 —
+        # 다르면 같은 토큰이 다른 물리량을 뜻하게 되어 정책이 통째로 어긋난다.
+        stats_path = REPO_ROOT / "datasets" / "rlds" / SPEC.NORM_STATS_FILENAME
+        self.norm_stats = (
+            json.loads(stats_path.read_text(encoding="utf-8"))
+            if stats_path.exists()
+            else None
+        )
+        if self.norm_stats is None:
+            print(f"[grpo] ⚠ {stats_path} 없음 — SFT 와 액션 스케일이 어긋날 수 있다.")
+
+        self.client = RolloutClient(
+            isaaclab_python=cfg.isaaclab_python,
+            worker_script=REPO_ROOT / "rft" / "isaaclab_rollout_worker.py",
+            num_envs=cfg.num_envs,
+            task=cfg.task,
+            device="cuda:0",
+        )
+        self.client.start()
+
+        self.writer = None
+        if cfg.wandb_project:
+            import wandb
+
+            wandb.init(project=cfg.wandb_project, config=cfg.__dict__)
+            self.writer = wandb
+
+    # -------------------------------------------------------------------------
+    def _sample_actions(self, images: np.ndarray):
+        """관측 배치 → (액션 청크, 샘플된 토큰, behavior log-prob).
+
+        수집 단계는 그래디언트 없이 돈다. **업데이트 때 같은 (이미지, 토큰) 쌍으로
+        log-prob 을 다시 계산해야** ratio 에 그래디언트가 흐른다 — 수집 때 만든
+        log-prob 을 그대로 쓰면 ratio 가 항상 1 이 되어 학습이 전혀 일어나지 않는다.
+        (조용히 도는 것처럼 보이는 종류의 버그라 명시해 둔다)
+
+        계획서 §Phase4b-6 대로 토큰별 log-prob 을 처음부터 기록한다 — GRPO ratio 에
+        필요할 뿐 아니라 KL 예산을 따질 때도 이 로그가 있어야 한다.
+        """
+        import torch
+
+        n_tokens = SPEC.NUM_ACTIONS_CHUNK * SPEC.ACTION_DIM
+        actions, tokens, logps = [], [], []
+
+        for i in range(images.shape[0]):
+            # center crop 포함. _recompute_logp 와 반드시 같은 전처리여야 한다 —
+            # 다르면 ratio 가 전처리 차이까지 반영해 버려 학습이 망가진다.
+            inputs = self.processor(
+                self.prompt, SPEC.prepare_image_for_vla(images[i])
+            ).to(self.cfg.device, dtype=torch.bfloat16)
+            with torch.no_grad():
+                out = self.model.generate(
+                    **inputs,
+                    do_sample=True,
+                    temperature=self.cfg.temperature,
+                    max_new_tokens=n_tokens,
+                    output_scores=True,
+                    return_dict_in_generate=True,
+                )
+            seq = out.sequences[0, -n_tokens:]
+            token_logps = [
+                torch.log_softmax(score[0].float(), dim=-1)[seq[t]]
+                for t, score in enumerate(out.scores)
+            ]
+            logps.append(torch.stack(token_logps).sum())
+            tokens.append(seq)
+            actions.append(self._tokens_to_action(seq))
+
+        return np.stack(actions), torch.stack(tokens), torch.stack(logps)
+
+    def _recompute_logp(self, images: np.ndarray, tokens):
+        """저장해 둔 (이미지, 토큰) 으로 현재 정책의 log-prob 을 **그래디언트와 함께** 계산.
+
+        teacher forcing 이다 — 샘플링을 다시 하는 게 아니라, 이미 샘플된 토큰열의
+        확률을 현재 파라미터로 다시 평가한다. 이게 PPO/GRPO ratio 의 분자다.
+        """
+        import torch
+
+        logps = []
+        for i in range(images.shape[0]):
+            inputs = self.processor(
+                self.prompt, SPEC.prepare_image_for_vla(images[i])
+            ).to(self.cfg.device, dtype=torch.bfloat16)
+            action_tokens = tokens[i].unsqueeze(0)
+            full = torch.cat([inputs["input_ids"], action_tokens], dim=1)
+            attn = torch.ones_like(full)
+
+            out = self.model(
+                input_ids=full,
+                attention_mask=attn,
+                pixel_values=inputs["pixel_values"],
+            )
+            # 위치 t 의 로짓이 위치 t+1 의 토큰을 예측한다 → 한 칸 밀어서 정렬.
+            n = action_tokens.shape[1]
+            logits = out.logits[:, -n - 1 : -1, :].float()
+            logp = torch.log_softmax(logits, dim=-1)
+            picked = logp.gather(-1, action_tokens.unsqueeze(-1)).squeeze(-1)
+            logps.append(picked.sum())
+
+        return torch.stack(logps)
+
+    def _tokens_to_action(self, token_ids) -> np.ndarray:
+        """액션 토큰 → 연속 액션. OpenVLA 의 이산 토큰 규약을 따른다.
+
+        vocab 끝쪽 256개 토큰을 [q01, q99] 구간의 bin 으로 되돌린다.
+        여기서 쓰는 구간은 SFT 때 쓴 것과 **반드시 같아야 한다** —
+        그래서 datasets/norm_stats.json 을 단일 출처로 쓴다.
+        """
+        import torch
+
+        ids = token_ids.detach().cpu().numpy()
+        bins = self.model.config.vocab_size - ids
+        bins = np.clip(bins, 0, 255)
+        normalized = bins / 255.0 * 2.0 - 1.0
+        action = normalized[: SPEC.NUM_ACTIONS_CHUNK * SPEC.ACTION_DIM].reshape(
+            SPEC.NUM_ACTIONS_CHUNK, SPEC.ACTION_DIM
+        )
+        if self.norm_stats is not None:
+            low = np.array(self.norm_stats["action"]["q01"], dtype=np.float32)
+            high = np.array(self.norm_stats["action"]["q99"], dtype=np.float32)
+            mask = np.array(self.norm_stats["action"]["mask"], dtype=bool)
+            denorm = 0.5 * (action + 1.0) * (high - low) + low
+            action = np.where(mask, denorm, action)
+        return action.astype(np.float32)
+
+    # -------------------------------------------------------------------------
+    def collect_group(self, seed: int):
+        """한 그룹(같은 초기 상태에서 num_envs 개 궤적)을 수집한다.
+
+        업데이트에 필요한 (이미지, 토큰) 쌍을 함께 들고 나온다 — 그래야
+        _recompute_logp 로 ratio 를 만들 수 있다.
+
+        메모리 주의: 궤적당 스텝 수 × num_envs 개의 224² 이미지를 들고 있게 된다.
+        max_steps_per_episode 를 키우면 여기가 먼저 터진다.
+        """
+        obs = self.client.reset(seeds=[seed])
+        steps = int(np.ceil(self.cfg.max_steps_per_episode / SPEC.NUM_ACTIONS_CHUNK))
+
+        transitions = []      # [(images, tokens, behavior_logp), ...]
+        rewards = np.zeros(self.cfg.num_envs, dtype=np.float32)
+
+        for _ in range(steps):
+            images = obs["image"]
+            chunk, tokens, logp = self._sample_actions(images)
+            transitions.append((images, tokens, logp.detach()))
+            obs, rewards, done = self.client.step(chunk)
+            if bool(done.all()):
+                break
+
+        return rewards, transitions
+
+    # -------------------------------------------------------------------------
+    def train(self) -> int:
+        cfg = self.cfg
+        history = []
+        t0 = time.time()
+
+        torch = self.torch
+
+        for step in range(cfg.total_steps):
+            group_rewards, group_transitions = [], []
+            for g in range(cfg.groups_per_step):
+                r, transitions = self.collect_group(seed=step * 1000 + g)
+                group_rewards.append(r)
+                group_transitions.append(transitions)
+
+            rewards = np.stack(group_rewards)                      # (그룹수, num_envs)
+            advantages = compute_group_advantages(rewards)
+            degen = degenerate_fraction(rewards)
+            success_rate = float(rewards.mean())
+
+            # --- 정책 업데이트 (PPO 클리핑) ---
+            # advantage 는 궤적 단위다. 궤적 안의 모든 액션 청크가 같은 advantage 를
+            # 공유한다 (sparse 0/1 보상이라 credit assignment 를 더 쪼갤 근거가 없다).
+            self.optimizer.zero_grad()
+            total_loss = 0.0
+            num_terms = 0
+
+            for gi, transitions in enumerate(group_transitions):
+                adv_row = torch.tensor(
+                    advantages[gi], device=cfg.device, dtype=torch.float32
+                )
+                # advantage 가 전부 0 인 그룹은 그래디언트가 0 이므로 건너뛴다
+                # (forward 비용만 나가고 얻는 게 없다).
+                if float(adv_row.abs().max()) < 1e-8:
+                    continue
+
+                for images, tokens, behavior_logp in transitions:
+                    new_logp = self._recompute_logp(images, tokens)
+                    ratio = torch.exp(new_logp - behavior_logp.to(new_logp.dtype))
+                    unclipped = ratio * adv_row
+                    clipped = (
+                        torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * adv_row
+                    )
+                    loss = -torch.min(unclipped, clipped).mean()
+
+                    if cfg.kl_coef > 0:
+                        # 사전학습 정책 대비 KL 예산. SimpleVLA-RL 기본은 0 이지만,
+                        # 정책이 발산하면 여기를 켜는 것이 첫 번째 대응이다.
+                        approx_kl = (behavior_logp.to(new_logp.dtype) - new_logp).mean()
+                        loss = loss + cfg.kl_coef * approx_kl
+
+                    # 청크 수로 나눠 스케일을 맞춘 뒤 즉시 backward —
+                    # 전체 그래프를 들고 있으면 VRAM 이 터진다.
+                    (loss / max(len(transitions), 1)).backward()
+                    total_loss += float(loss.item())
+                    num_terms += 1
+
+            if num_terms:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in self.model.parameters() if p.requires_grad],
+                    cfg.max_grad_norm,
+                )
+                self.optimizer.step()
+
+            mean_loss = total_loss / num_terms if num_terms else 0.0
+            elapsed = time.time() - t0
+            record = {
+                "step": step,
+                "success_rate": success_rate,
+                "loss": mean_loss,
+                "degenerate_group_frac": degen,
+                "updated_terms": num_terms,
+                "elapsed_min": elapsed / 60,
+            }
+            history.append(record)
+            print(
+                f"[grpo] step {step:4d} | 성공률 {success_rate:.1%} | "
+                f"loss {mean_loss:+.4f} | 무신호그룹 {degen:.0%} | "
+                f"{elapsed / 60:.1f}분"
+            )
+            if degen > 0.9:
+                print("       ⚠ 그룹 대부분이 전멸 또는 전승이라 학습 신호가 없다. "
+                      "temperature 를 올리거나(탐색↑) SFT prior 를 점검할 것.")
+
+            if self.writer:
+                self.writer.log(record)
+            (self.log_dir / "history.json").write_text(
+                json.dumps(history, indent=2), encoding="utf-8"
+            )
+
+            if (step + 1) % cfg.save_every == 0:
+                out = self.log_dir / f"checkpoint-{step + 1}"
+                self.model.save_pretrained(out)
+                self.processor.save_pretrained(out)
+                print(f"       체크포인트 저장: {out}")
+
+        self.client.close()
+        return 0
+
+
+# =============================================================================
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--total-steps", type=int, default=None)
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    if args.checkpoint:
+        cfg.checkpoint = args.checkpoint
+    if args.total_steps:
+        cfg.total_steps = args.total_steps
+    if not cfg.checkpoint:
+        parser.error("체크포인트가 필요하다 (config 또는 --checkpoint).")
+
+    print(SPEC.summary())
+    return GRPOTrainer(cfg).train()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

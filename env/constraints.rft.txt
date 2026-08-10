@@ -1,0 +1,31 @@
+# =============================================================================
+# env/constraints.rft.txt — RFT 전용 제약 (Phase 4)
+#
+# ★ Isaac Sim 이 이 환경에 없다 → torch==2.7.0 핀이 적용되지 않는다.
+#   (rft.requirements.txt 헤더의 "프로세스 분리" 아키텍처 결정 참조)
+#   Isaac Sim 은 별도 venv/프로세스에서 torch 2.7.0 으로 계속 돌아간다.
+#
+# 사용법:
+#     pip install -c env/constraints.rft.txt <pkg>
+#
+# ⚠ 아래 vllm/torch 핀은 **Day 2 에 실측 확정할 잠정값**이다.
+#   SimpleVLA-RL/SETUP.md 와 저장소의 requirements 를 직접 읽고 맞춘 뒤
+#   이 파일을 갱신하고, 갱신 사유를 이 헤더에 한 줄 남길 것.
+#   근거: SimpleVLA-RL README 는 CUDA 12.4 / A800 기준으로만 검증되어 있고,
+#         vLLM 버전이 명시되지 않아 원격으로 단정할 수 없다.
+# =============================================================================
+
+# --- 잠정 핀 (Day 2 실측 후 확정) ---
+# vLLM 0.9.x 가 torch 2.7.0 을 요구하므로 이 조합이 가장 유력하다.
+# veRL 포크가 구버전 vLLM(0.6.x/0.8.x) API 를 쓰고 있으면 함께 내려야 한다.
+torch==2.7.0
+vllm==0.9.1
+
+# --- 버전 상한만 걸어두는 항목 ---
+# transformers 는 vLLM 이 요구하는 하한을 따라간다. 상한만 방어.
+transformers<4.53
+numpy<2
+
+# --- 확정 사항 ---
+# ray 는 veRL 이 단일 노드 FSDP 로 쓰므로 [default] 로 충분하다.
+# 멀티노드는 쓰지 않는다 (계획서 §3-2: 반드시 단일 노드).
