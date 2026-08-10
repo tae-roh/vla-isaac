@@ -390,6 +390,12 @@ class PickPlaceEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.gpu_total_aggregate_pairs_capacity = 16 * 1024
         self.sim.physx.friction_correlation_distance = 0.00625
 
+        # Isaac Lab Mimic 이 환경 cfg 에서 이 이름을 찾는다. 없으면
+        #   NotImplementedError: Cannot find gripper_joint_names in the environment config
+        # 로 환경 생성이 실패한다. 액션 cfg 의 joint_names 는 정규식이라
+        # 그걸로는 대체되지 않고, 실제 관절 이름 목록이 따로 필요하다.
+        self.gripper_joint_names = list(SPEC.GRIPPER_JOINT_NAMES)
+
         # ---------------------------------------------------------------
         # 텔레옵 장치 (계획서 §2-4: SpaceMouse 없이 키보드/게임패드)
         # ---------------------------------------------------------------

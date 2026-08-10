@@ -75,6 +75,10 @@ EEF_FRAME_OFFSET = (0.0, 0.0, 0.1034)
 # 그리퍼 (평행 2지)
 GRIPPER_JOINT_REGEX = "panda_finger.*"       # 액션이 제어할 관절 선택용
 GRIPPER_COMMAND_REGEX = "panda_finger_.*"    # 열림/닫힘 명령 표현식의 키
+# 정규식이 아닌 실제 관절 이름. Isaac Lab Mimic 이 환경 cfg 에서
+# `gripper_joint_names` 를 찾는다 (없으면 NotImplementedError).
+# 정규식으로는 안 되고 이름 목록이어야 한다.
+GRIPPER_JOINT_NAMES = ("panda_finger_joint1", "panda_finger_joint2")
 FINGER_LINK_NAMES = ("panda_leftfinger", "panda_rightfinger")
 FINGER_FRAME_OFFSET = (0.0, 0.0, 0.046)
 GRIPPER_OPEN_QPOS = 0.04             # 손가락 1개의 최대 개방 [m]
