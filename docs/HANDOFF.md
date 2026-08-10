@@ -1,23 +1,35 @@
-# 인수인계 — 원격(Brev) 인스턴스에서 스모크 테스트 통과시키기
+# 인수인계 — 원격(Brev) 인스턴스, 스모크 통과 후 카메라 확정 대기
 
-원격 Claude Code용 브리핑. 로컬에서 코드를 다 짜 두었고, 이제 실제 인스턴스에서
+원격 Claude Code용 브리핑. 로컬에서 코드를 다 짜 두었고, 실제 인스턴스에서
 돌려 보며 깨지는 곳을 고치는 단계다.
 
+**현재 위치: 스모크 전체 통과 → RUNBOOK §1-2 카메라 확정에서 사람의 판단 대기 중.**
+데모 수집(§1-4)은 카메라가 확정되기 전에는 시작하지 않는다.
+
 ## 지금 할 일
+
+스모크는 **전체 통과했다** (2026-08-10, isaaclab 0.54.4 / isaacsim 5.1.0.0 / L40S).
+lock도 `env/locks/isaaclab.lock.txt`에 박제·커밋됐다. 다시 확인하려면:
 
 ```bash
 cd ~/workspace/vla-isaac && python env/smoke/check_isaaclab.py --full
 ```
 
-**통과할 때까지 반복한다.** 실패 항목을 고치고, 다시 돌리고, 통과하면 lock을 박제한다.
 스모크가 이 환경의 **유일한 검증 기준**이다 (`pip check`는 이 스택에서 원리적으로
 깨끗해질 수 없으므로 기준이 아니다).
 
-통과 후:
+**다음 할 일은 RUNBOOK §1-2 카메라 확정이고, 사람의 판단을 기다리는 중이다.**
+`scripts/dump_obs_reference.py`는 정상 동작하며 레퍼런스 PNG 8장을 만든다. 그런데
+**현재 카메라 설정으로는 목표 영역이 화면 밖이다** — 중심이 u=225.0 에 투영된다
+(프레임 224px). 즉 VLA가 자재를 어디에 놓아야 하는지 볼 수 없다.
+`CAMERA_POS`/`CAMERA_ROT`은 "사람이 눈으로 보고 확정" 항목이라 **바꾸지 않고 남겨 뒀다.**
+확정되기 전까지 데모 수집(§1-4)으로 넘어가면 안 된다 — 그 데이터로 SFT를 만들면
+카메라를 바꾸는 순간 전부 다시 만들어야 한다.
 
-```bash
-pip freeze > env/locks/isaaclab.lock.txt
-```
+자재 스폰 박스와 목표 원주가 center crop 후에도 모두 들어오는 후보는 계산해 뒀다:
+`(1.05, 0.0, 0.55)` + focal 16, `(1.05, 0.1, 0.55)` + focal 18,
+`(1.15, 0.1, 0.60)` + focal 18. 어느 것이든 ROI가 화면 아래쪽 1/4에 몰리므로
+세로 중앙에 놓으려면 `CAMERA_ROT` 피치도 함께 봐야 한다.
 
 ## 프로젝트 한 줄 요약
 
@@ -31,8 +43,18 @@ OpenVLA-OFT를 SFT한 뒤 GRPO로 RFT까지 3~4일 안에 완주한다. Franka E
 |---|---|
 | 저장소 | `~/workspace/vla-isaac` |
 | venv | `~/env_isaaclab` (`source ~/env_isaaclab/bin/activate`) |
-| Isaac Lab | `$ISAACLAB_DIR` = `~/workspace/IsaacLab` (`~/.bashrc`에 기록됨) |
-| GPU | L40S |
+| Isaac Lab | `~/workspace/IsaacLab` (isaaclab 0.54.4 / isaacsim 5.1.0.0) |
+| GPU | L40S 1장 |
+
+⚠ **`ISAACLAB_DIR`이 `~/.bashrc`에 없다.** `setup_isaaclab.sh`가 기록하도록 되어
+있는데(스크립트 152~159줄) 실제로는 비어 있다. `OMNI_KIT_ACCEPT_EULA`도 없다
+(Isaac Sim은 지금 잘 뜨므로 이쪽은 급하지 않다). RUNBOOK §1-4 이후의 명령들이
+`python $ISAACLAB_DIR/scripts/tools/record_demos.py` 형태라 그대로 두면
+`No such file`로 죽는다. **데모 수집 전에** 한 번 넣어 둘 것:
+
+```bash
+echo 'export ISAACLAB_DIR=~/workspace/IsaacLab' >> ~/.bashrc && source ~/.bashrc
+```
 
 ## 이미 확인된 상태
 
@@ -41,11 +63,14 @@ OpenVLA-OFT를 SFT한 뒤 GRPO로 RFT까지 3~4일 안에 완주한다. Franka E
 - `vla_isaac_tasks`: editable 설치 + `.pth` 자동 등록 완료, gym에 4종 등록됨
 - 씬 생성, 액션 매니저(7차원 = arm 6 + gripper 1)까지 정상 동작 확인
 
-**마지막으로 막힌 지점**: `Visuomotor-Mimic 환경 생성`에서
-`NotImplementedError: Cannot find gripper_joint_names in the environment config`
+- `Visuomotor-Mimic 환경 생성`까지 통과, 카메라 관측 `(2, 224, 224, 3) uint8` 확인
+- 텔레옵 장치 keyboard/gamepad 등록 확인
 
-이에 대한 수정(`PickPlaceEnvCfg.__post_init__`에서 `self.gripper_joint_names` 설정)을
-커밋했지만 **아직 실행 검증되지 않았다.** 이것부터 확인할 것.
+**해결된 막힘**: `gripper_joint_names` 수정은 맞았고, 바로 다음 것에서 죽었다 —
+`AttributeError: 'PickPlaceVisuomotorMimicEnvCfg' object has no attribute 'gripper_open_val'`.
+이 리비전의 `stack.mdp.observations.object_grasped`는 `gripper_joint_names`만
+`hasattr`로 확인하고 `gripper_open_val`·`gripper_threshold`는 그냥 참조한다.
+**셋이 한 세트다.** 지금은 세 개 모두 설정되어 있다.
 
 ## ★ 가장 중요한 교훈 — 이것 때문에 세 번 깨졌다
 
@@ -63,6 +88,77 @@ grep -rn "찾는_심볼" $ISAACLAB_DIR/source/ | head -20
 | `SubTaskConfig got unexpected keyword 'subtask_start_signal'` | 문서 요약엔 있었지만 실제 dataclass엔 없는 필드. 시작 신호는 `get_subtask_start_signals()` 메서드로 받는다 |
 | `Cannot find gripper_joint_names` | 위치를 main 소스에서 못 찾음. 로컬 grep이 확정 |
 | `No module named 'pxr'` | `AppLauncher`보다 먼저 `isaaclab`을 import함 |
+| `no attribute 'gripper_open_val'` | `gripper_joint_names`만 넣어서. 셋이 한 세트다 |
+| 성공 판정이 영원히 False | `gripper_pos`가 `[f1, -f2]`를 돌려주는데 `.sum()`을 씀 (아래) |
+
+**Isaac Lab 함수의 반환 규약도 소스로 확인할 것.** 시그니처가 맞아도 의미가 다를 수 있다.
+`gripper_pos`는 두 번째 손가락 부호를 뒤집어 `[f1, -f2]`를 돌려준다(LIBERO/robosuite
+qpos 규약). Franka 두 손가락은 둘 다 `0~+0.04`로 대칭 이동하므로 `.sum()`은 항상 ≈0 이다.
+`placed_signal`이 그 합으로 그리퍼 개방을 판정하고 있어서 **성공이 절대 뜨지 않았다.**
+에러가 없어서 데모 수집·RFT 보상 0 으로만 드러나는 종류의 버그다. `.abs()`로 고쳤다.
+실측으로 확인한 값 (`VlaPick-v0`, 임계값 `GRIPPER_OPEN_QPOS_SUM=0.06`):
+
+| 그리퍼 명령 | `gripper_pos` | 수정 전 `sum()` | 수정 후 `abs().sum()` |
+|---|---|---|---|
+| OPEN | `[+0.0400, -0.0400]` | `-0.0000` → False | `+0.0800` → **True** |
+| CLOSE | `[+0.0001, -0.0001]` | `-0.0000` → False | `+0.0002` → False |
+
+곁가지로 하나 더: `reset_robot` 이벤트의 `reset_joints_by_offset` 이 `joint_names` 없이
+로봇 전체에 걸려 있어서 **손가락 관절까지 ±0.05 랜덤화된다** (리셋 직후 실측
+`[0.0400, 0.0029]` — 한쪽이 거의 닫힌 채로 시작). 첫 OPEN 명령이면 풀리므로
+급하지는 않은데, 팔 관절만 흔들 의도였다면 `joint_names=[SPEC.ARM_JOINT_REGEX]`를
+넣어야 한다.
+
+## ★ 운영 함정 — 실패한 Isaac Sim은 죽지 않는다
+
+`gym.make`가 예외를 던지면 그 뒤 `simulation_app.close()`가 **돌아오지 않는다.**
+프로세스가 GPU 4.3GB를 물고 CPU를 계속 태우며 남는다. 이게 두 번 시간을 잡아먹었다:
+
+- 남은 프로세스 2개 때문에 L40S 하나를 셋이 나눠 쓰게 되어, 환경 생성이 **10분 넘게
+  멈춘 것처럼** 보였다. 정리하니 **12초** 만에 진짜 에러가 났다.
+- 즉 "느리다/멈췄다"를 디버깅하기 전에 **먼저 유령 프로세스를 확인할 것.**
+
+```bash
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+ps -eo pid,etime,time,args | grep -E "[c]heck_isaaclab|[t]est_deformable|[d]ump_obs"
+pkill -9 -f check_isaaclab    # 필요하면
+```
+
+스크립트를 하나 돌리기 전에 GPU가 비어 있는지 보는 습관이 제일 싸게 먹힌다.
+
+## §1-3 변형체 예비 테스트 — 결과를 믿지 말 것
+
+두 가지 문제를 확인했다. **고치지 않았다** (변형체는 Phase 4b 스트레치이고
+RUNBOOK이 타임박스를 지시하므로). 다만 결과를 그대로 해석하면 안 된다.
+
+**(1) `--youngs` 를 여러 개 주면 두 번째에서 멈춘다.** 한 `SimulationApp` 안에서
+`gym.make` 를 두 번 하는 구조인데, Isaac Lab은 같은 앱에서 `InteractiveScene` 을
+허물고 다시 세우는 것을 지원하지 않는다. 두 번째 환경 생성에서 로그 한 줄 없이
+9분 넘게 CPU만 태웠다. **값 하나당 프로세스 하나로 돌릴 것:**
+
+```bash
+for Y in 5e5 1e5 5e4; do python scripts/test_deformable_grasp.py --headless --youngs $Y; done
+```
+
+**(2) 그렇게 돌린 결과는 영률과 무관하다** — 10배 범위에서 값이 전부 똑같다:
+
+| 영률 | 상승 | 퍼짐배율 | FPS | 파지 |
+|---|---|---|---|---|
+| 5.0e+05 | 3.9cm | 1.00x | 13.3 | ✗ |
+| 1.0e+05 | 3.9cm | 1.00x | 13.4 | ✗ |
+| 5.0e+04 | 3.9cm | 1.00x | 13.5 | ✗ |
+
+퍼짐배율이 정확히 1.00x = **노드가 한 번도 변형되지 않았다** = 그리퍼가 물체에
+닿은 적이 없다. 원인은 FEM이 아니라 스크립트다: `phase_action()` 이 물체 위치를
+보지 않고 `dz=-0.35` 로 곧장 내려가는데, 물체는 리셋마다 `y∈[-0.22,-0.02]` 로
+랜덤 배치된다(팔은 `y≈0` 에서 내려간다). 최대 22cm 빗나가므로 어떤 영률에서도
+잡힐 수 없다.
+
+**따라서 "어떤 설정에서도 파지 실패 → 변형체 제외" 라는 결론을 여기서 내리면 안 된다.**
+그건 물리 결과가 아니라 스크립트가 물체를 조준하지 않는다는 사실일 뿐이다. FEM 자체는
+안정적이고(발산 없음) 13 FPS 로 돈다 — 그 두 가지는 유효한 정보다. 판단이 필요하면
+`phase_action()` 이 `deformable_center()` 로 물체 xy 를 먼저 잡아 가로로 정렬한 뒤
+하강하게 고쳐야 한다.
 
 ## 절대 바꾸지 말 것
 
