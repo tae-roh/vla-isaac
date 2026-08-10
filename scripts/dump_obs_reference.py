@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import sys
 from pathlib import Path
 
@@ -48,6 +50,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate", type=Path, default=None, help="비교 대상 디렉토리")
     parser.add_argument("--tolerance", type=float, default=2.0,
                         help="채널당 평균 절대 오차 허용치 (0~255 스케일)")
+    # ★ AppLauncher 로 그대로 넘긴다. 예전에는 이 인자가 parse_known_args 에 흡수되어
+    #   조용히 무시됐고, --livestream 2 를 줘도 헤드리스로만 돌아 카메라를 눈으로
+    #   확인할 수 없었다 (RUNBOOK §1-2 는 라이브로 보면서 확정하는 단계다).
+    #   AppLauncher.add_app_launcher_args 를 쓰지 않는 이유: 이 스크립트의 --compare
+    #   모드는 isaaclab 이 없는 venv(env_rft)에서도 돌아야 하므로 isaaclab.app 을
+    #   모듈 최상단에서 import 할 수 없다. kwarg 로 넘기는 것도 공식 경로다.
+    parser.add_argument("--livestream", type=int, default=-1, choices=[-1, 0, 1, 2],
+                        help="1=WebRTC 공용망(PUBLIC_IP 필요) / 2=WebRTC 사설망. "
+                             "-1 이면 LIVESTREAM 환경변수를 따른다.")
     return parser.parse_known_args()[0]
 
 
@@ -131,7 +142,12 @@ def run_compare(args: argparse.Namespace) -> int:
 def run_save(args: argparse.Namespace) -> int:
     from isaaclab.app import AppLauncher
 
-    app_launcher = AppLauncher(headless=True, enable_cameras=True)
+    # headless=True 로 고정해도 라이브스트림은 켜진다 — AppLauncher 는 livestream 이
+    # 1/2 일 때 호스트를 항상 헤드리스로 두고 WebRTC 로만 내보낸다.
+    # enable_cameras 는 선택이 아니다: 씬에 TiledCamera 가 있어 없으면 센서 초기화가 실패한다.
+    app_launcher = AppLauncher(
+        headless=True, enable_cameras=True, livestream=args.livestream
+    )
     simulation_app = app_launcher.app
 
     try:
@@ -151,14 +167,16 @@ def run_save(args: argparse.Namespace) -> int:
 
         print(SPEC.summary())
 
+        # 루프 밖에서 한 번만 만든다 — 아래 라이브스트림 유지 루프도 이 텐서를 쓴다.
+        zero = torch.zeros(
+            (env.unwrapped.num_envs, SPEC.ACTION_DIM), device=env.unwrapped.device
+        )
+
         saved = 0
         obs, _ = env.reset()
         while saved < args.num_frames:
             # 몇 스텝 굴려 물체가 안착한 뒤에 찍는다. 리셋 직후 프레임은
             # 자재가 공중에 떠 있어 레퍼런스로 부적절하다.
-            zero = torch.zeros(
-                (env.unwrapped.num_envs, SPEC.ACTION_DIM), device=env.unwrapped.device
-            )
             for _ in range(15):
                 obs, *_ = env.step(zero)
 
@@ -201,7 +219,6 @@ def run_save(args: argparse.Namespace) -> int:
             ),
             encoding="utf-8",
         )
-        env.close()
 
         print(f"\n레퍼런스 {saved}장 + spec.json → {args.out}")
         print("★ 이 PNG 들을 반드시 눈으로 확인할 것:")
@@ -210,6 +227,39 @@ def run_save(args: argparse.Namespace) -> int:
         print("   - 이미지가 뒤집혀 있지 않은가 (뒤집혀 있으면 "
               "configs/vla_spec.py 의 ROTATE_IMAGE_180 을 켤 것)")
         print("   - Phase 3·4 로 반드시 함께 가져갈 것 (부록 A 체크리스트)")
+
+        # 라이브스트림을 켰다면 여기서 앱을 닫으면 안 된다. PNG 저장은 몇 초면
+        # 끝나서, 그대로 종료하면 WebRTC 클라이언트가 붙기도 전에 창이 사라진다.
+        # 카메라 확정은 사람이 보고 판단하는 단계이므로 Ctrl-C 까지 씬을 굴려 준다.
+        # --livestream 이 -1 이면 AppLauncher 는 LIVESTREAM 환경변수를 따르므로,
+        # 유지 여부 판정도 같은 규칙으로 계산해야 한다.
+        livestream = (
+            args.livestream
+            if args.livestream >= 0
+            else int(os.environ.get("LIVESTREAM", 0))
+        )
+        if livestream >= 1 and simulation_app.is_running():
+            print(f"\n라이브스트림 유지 중 (livestream={livestream}). "
+                  "WebRTC 클라이언트로 접속해 씬을 확인할 것.")
+            print("확인이 끝나면 Ctrl-C.")
+
+            # SIGINT 를 직접 받는다. try/except KeyboardInterrupt 로는 안 된다 —
+            # SimulationApp 이 자기 SIGINT 핸들러를 걸어 두어서, 그냥 Ctrl-C 하면
+            # 파이썬까지 올라오지 않고 앱이 종료 코드 1 로 즉사한다.
+            # (PNG 는 이미 저장된 뒤라 잃는 것은 없지만, 문서에 적어 둔 정상 종료
+            #  경로가 에러로 끝나는 것은 다음 페이즈에서 오해를 만든다.)
+            interrupted = {"flag": False}
+
+            def _on_sigint(signum, frame):  # noqa: ARG001
+                interrupted["flag"] = True
+
+            signal.signal(signal.SIGINT, _on_sigint)
+            while simulation_app.is_running() and not interrupted["flag"]:
+                obs, *_ = env.step(zero)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            print("\n종료한다.")
+
+        env.close()
     finally:
         simulation_app.close()
 
