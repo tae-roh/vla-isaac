@@ -1,0 +1,24 @@
+{
+  "task": "VlaPick-v0",
+  "image_hw": [
+    224,
+    224
+  ],
+  "camera_sensor": "table_cam",
+  "camera_pos": [
+    1.2,
+    0.0,
+    0.8
+  ],
+  "camera_rot": [
+    0.32818,
+    -0.66487,
+    -0.6017,
+    0.297
+  ],
+  "camera_convention": "ros",
+  "rotate_image_180": false,
+  "action_dim": 7,
+  "num_actions_chunk": 8,
+  "instruction": "pick up the material and place it in the target zone"
+}
