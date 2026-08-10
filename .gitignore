@@ -7,7 +7,12 @@
 # =============================================================================
 
 # --- 대용량 산출물 (HF Hub 로 간다) ---
-datasets/
+# ★ `datasets/` 가 아니라 `datasets/*` 여야 한다.
+#   git 은 "제외된 디렉토리" 안으로는 아예 내려가지 않아서, 디렉토리 자체를
+#   제외하면 그 안을 가리키는 `!` 규칙이 전부 죽는다. 아래 obs_reference /
+#   norm_stats 화이트리스트가 실제로 그렇게 무력화되어 있었다
+#   (git check-ignore 로 확인). 한 단계만 제외하고 필요한 것을 되살린다.
+datasets/*
 runs/
 logs/
 ckpt/
@@ -20,9 +25,11 @@ checkpoints/
 # 단, 관측 레퍼런스 PNG 는 작고 Phase 4 스펙 대조에 반드시 필요하다
 # (부록 A: "Phase 1 의 레퍼런스 관측 PNG 를 함께 가져갈 것")
 !datasets/obs_reference/
-!datasets/obs_reference/**
 
-# 정규화 통계도 작고, SFT-RFT 일치의 핵심이라 버전 관리한다
+# 정규화 통계도 작고, SFT-RFT 일치의 핵심이라 버전 관리한다.
+# rlds 디렉토리는 되살린 뒤 그 안을 다시 제외해야 한다 — 위와 같은 이유다.
+!datasets/rlds/
+datasets/rlds/*
 !datasets/rlds/norm_stats.json
 
 # --- 런타임 생성물 ---
