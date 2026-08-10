@@ -25,6 +25,8 @@
 
 from __future__ import annotations
 
+import math
+
 # =============================================================================
 # Embodiment (로봇 플랫폼)
 # =============================================================================
@@ -165,12 +167,28 @@ IMAGE_WIDTH = 224
 # Isaac Lab 씬 안에서 이 카메라 센서의 이름. 관측 dict 의 키로도 쓰인다.
 CAMERA_SENSOR_NAME = "table_cam"
 
-# TiledCamera 배치. Phase 1 에서 라이브로 보며 확정하고 이후 변경 금지.
-# 값은 Isaac Lab Franka stack visuomotor 의 table_cam 을 출발점으로 삼되,
-# 우리 태스크(픽업 → 목표 영역 이동)는 목표 영역까지 화각에 들어와야 하므로
-# 약간 뒤로 물리고 위에서 내려다보게 조정했다.
-CAMERA_POS = (1.05, 0.0, 0.55)
-CAMERA_ROT = (0.35355, -0.61237, -0.61237, 0.35355)   # ROS 규약 쿼터니언 (w, x, y, z)
+# TiledCamera 배치. Phase 1 에서 확정했고 이후 변경 금지.
+#
+# ★ 왜 초기값을 고쳤는가 (Day 1 §1-2 에서 확정)
+#   출발점은 Isaac Lab Franka stack visuomotor 의 table_cam = (1.05, 0, 0.55) +
+#   쿼터니언 (0.35355, -0.61237, -0.61237, 0.35355) 이었다. 그런데 그 조합의
+#   시선은 테이블 평면과 (0.097, 0.0) 에서 만난다 — **로봇 베이스**다. 우리
+#   작업공간(자재 스폰 x 0.38~0.60 / y -0.22~0.05, 목표 영역 중심 (0.45, 0.35))이
+#   아니라 로봇을 조준하고 있었다. 그 결과:
+#     - 목표 영역 중심이 u=225.0 에 투영 → 224px 프레임 **밖**
+#     - 작업공간이 화면 아래 1/4 에 몰려 픽셀을 낭비
+#   즉 정책이 "자재를 어디에 놓아야 하는지" 를 볼 수 없는 상태였다.
+#
+#   아래 값은 시선을 테이블의 (0.36, 0.09) 로 맞춘 것이다. 자재 스폰 박스 +
+#   목표 영역 원주 + 운반/접근 높이(z ≤ 0.30)를 42점으로 샘플해, 전부 center crop
+#   이후에도 여유 12px 이상으로 들어오도록 풀었다. 화면 점유율 19% → 38%.
+#
+#   ★ OpenVLA 규약은 건드리지 않았다. 고정해야 하는 것은 224x224 / 단일 3인칭 뷰 /
+#     uint8 / center crop 이고, 카메라 외부 파라미터는 그중 어디에도 없다.
+#     focal length·aperture·클리핑도 원래 값 그대로다 — **위치와 조준만** 바꿨다.
+#     결과 기하는 오히려 LIBERO agentview 에 더 가깝다 (거리 1.08m, 하각 48도).
+CAMERA_POS = (1.2, 0.0, 0.8)
+CAMERA_ROT = (0.32818, -0.66487, -0.6017, 0.297)      # ROS 규약 쿼터니언 (w, x, y, z)
 CAMERA_CONVENTION = "ros"
 CAMERA_FOCAL_LENGTH = 24.0
 CAMERA_FOCUS_DISTANCE = 400.0
@@ -265,6 +283,13 @@ EPISODE_LENGTH_S = MAX_EPISODE_STEPS * SIM_DT * DECIMATION
 # -----------------------------------------------------------------------------
 # 성공 판정 (Mimic 서브태스크 시그널 + RFT 0/1 보상이 공유)
 # -----------------------------------------------------------------------------
+# 자재 스폰 범위 (리셋마다 이 안에서 무작위 배치). mdp/events.py 의
+# randomize_material_pose 가 이 값을 읽는다 — 두 곳에 적지 않는다.
+# ★ 카메라 화각이 이 범위와 목표 영역을 모두 덮어야 한다.
+#   assert_workspace_visible() 이 그것을 검사한다.
+MATERIAL_SPAWN_X_RANGE = (0.38, 0.60)
+MATERIAL_SPAWN_Y_RANGE = (-0.22, 0.05)
+
 # 목표 영역: 테이블 위 원기둥 형태 영역 (중심 xy + 반경).
 GOAL_REGION_CENTER = (0.45, 0.35)    # 로봇 베이스 기준 xy [m]
 GOAL_REGION_RADIUS = 0.09            # [m]
@@ -356,6 +381,126 @@ def assert_consistent() -> None:
         "파지로 인정되지 않는다."
     )
     assert CONTROL_FRAME in ("robot_base", "world", "eef")
+
+    # 자재 스폰 범위가 목표 영역과 겹치면 아무것도 안 해도 성공으로 잡힌다
+    # (mdp/events.py 의 randomize_material_pose 주석 참조).
+    gx, gy = GOAL_REGION_CENTER
+    assert not (
+        MATERIAL_SPAWN_X_RANGE[0] - GOAL_REGION_RADIUS <= gx <= MATERIAL_SPAWN_X_RANGE[1] + GOAL_REGION_RADIUS
+        and MATERIAL_SPAWN_Y_RANGE[0] - GOAL_REGION_RADIUS <= gy <= MATERIAL_SPAWN_Y_RANGE[1] + GOAL_REGION_RADIUS
+    ), (
+        f"자재 스폰 범위 x{MATERIAL_SPAWN_X_RANGE} y{MATERIAL_SPAWN_Y_RANGE} 가 "
+        f"목표 영역(중심 {GOAL_REGION_CENTER}, 반경 {GOAL_REGION_RADIUS})과 겹친다. "
+        "리셋 직후 성공이 뜨는 에피소드가 생겨 RFT 보상이 오염된다."
+    )
+
+    # 카메라가 작업공간 전체를 담고 있는지 — 에러 없이 성능만 깎는 불일치를 막는다.
+    assert_workspace_visible()
+
+
+def _camera_axes():
+    """CAMERA_ROT(ROS 규약)에서 카메라 축 3개를 뽑는다 → (right, down, forward).
+
+    ROS 규약: +X 오른쪽, +Y 아래, +Z 광축(전방). 회전행렬의 열이 그 순서다.
+    """
+    w, x, y, z = CAMERA_ROT
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    w, x, y, z = w / n, x / n, y / n, z / n
+    right = (1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y))
+    down = (2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x))
+    forward = (2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y))
+    return right, down, forward
+
+
+def project_to_image(point):
+    """env 로컬 좌표의 점을 카메라 픽셀 (u, v) 로 투영한다. 카메라 뒤면 None.
+
+    Isaac Lab 을 띄우지 않고도 "이게 화면에 들어오나" 를 답할 수 있어야 한다 —
+    한 번 렌더해 보려면 Isaac Sim 기동에 수 분이 들고, 그 비용 때문에 아무도
+    확인하지 않게 된다. 실제로 그래서 목표 영역이 화면 밖인 채로 굴러갔다.
+    """
+    right, down, forward = _camera_axes()
+    v = (
+        point[0] - CAMERA_POS[0],
+        point[1] - CAMERA_POS[1],
+        point[2] - CAMERA_POS[2],
+    )
+
+    def dot(a, b):
+        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+    z_cam = dot(v, forward)
+    if z_cam <= 1e-6:
+        return None
+    fx = CAMERA_FOCAL_LENGTH / CAMERA_HORIZONTAL_APERTURE * IMAGE_WIDTH
+    return (
+        IMAGE_WIDTH / 2.0 + fx * dot(v, right) / z_cam,
+        IMAGE_HEIGHT / 2.0 + fx * dot(v, down) / z_cam,
+    )
+
+
+def center_crop_bounds() -> tuple[float, float]:
+    """center crop 이후에도 살아남는 픽셀 구간 [lo, hi). crop 을 끄면 프레임 전체."""
+    if not IMAGE_CENTER_CROP:
+        return 0.0, float(IMAGE_WIDTH)
+    ratio = IMAGE_CENTER_CROP_SCALE**0.5
+    cw = int(IMAGE_WIDTH * ratio)
+    lo = (IMAGE_WIDTH - cw) // 2
+    return float(lo), float(lo + cw)
+
+
+def workspace_roi_points() -> list:
+    """정책이 반드시 봐야 하는 점들 — 자재가 놓일 수 있는 곳 + 목표 영역 + 운반 높이."""
+    x0, x1 = MATERIAL_SPAWN_X_RANGE
+    y0, y1 = MATERIAL_SPAWN_Y_RANGE
+    gx, gy = GOAL_REGION_CENTER
+    r = GOAL_REGION_RADIUS
+    pts = []
+    # 자재 정지 위치 (테이블면 ~ 자재 높이)
+    for x in (x0, x1):
+        for y in (y0, y1):
+            for z in (TABLE_HEIGHT, TABLE_HEIGHT + 0.08):
+                pts.append((x, y, z))
+    # 목표 영역 원주
+    for i in range(16):
+        a = 2.0 * math.pi * i / 16.0
+        pts.append((gx + r * math.cos(a), gy + r * math.sin(a), TABLE_HEIGHT))
+    # 운반 중 자재 (스폰 위 / 목표 위)
+    for x, y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1), (gx, gy), (gx, gy + r)):
+        pts.append((x, y, TABLE_HEIGHT + 0.20))
+    return pts
+
+
+def assert_workspace_visible(margin_px: float = 6.0) -> None:
+    """작업공간 전체가 center crop 이후에도 화면 안에 있는지 확인한다.
+
+    ★ 이 검사가 왜 있는가 (Day 1 §1-2 에서 실제로 당했다)
+      초기 카메라 설정은 시선이 로봇 베이스를 향해 있어서 **목표 영역 중심이
+      프레임 밖**(u=225.0 / 224px)이었다. 에러는 전혀 나지 않는다 — 씬도 만들어지고
+      관측 shape 도 맞고 스모크도 통과한다. 정책이 "어디에 놓아야 하는지" 를 못 보는
+      것뿐이고, 그건 SFT 를 다 돌린 뒤 "성능이 안 나온다" 로만 드러난다.
+      카메라·목표·스폰 범위는 서로 다른 파일에 있어서 한쪽만 바뀌기 쉽다.
+    """
+    lo, hi = center_crop_bounds()
+    lo, hi = lo + margin_px, hi - margin_px
+    bad = []
+    for p in workspace_roi_points():
+        uv = project_to_image(p)
+        if uv is None:
+            bad.append((p, "카메라 뒤"))
+            continue
+        u, v = uv
+        if not (lo <= u <= hi and lo <= v <= hi):
+            bad.append((p, f"u={u:.1f} v={v:.1f}"))
+    if bad:
+        lines = "\n".join(f"    {p} → {why}" for p, why in bad[:8])
+        raise AssertionError(
+            f"작업공간이 카메라 화각을 벗어난다 (crop 후 허용 {lo:.1f}~{hi:.1f}px, "
+            f"{len(bad)}개 지점 실패):\n{lines}\n"
+            "  CAMERA_POS / CAMERA_ROT / CAMERA_FOCAL_LENGTH 와 "
+            "GOAL_REGION_CENTER / MATERIAL_SPAWN_*_RANGE 중 하나가 어긋났다.\n"
+            "  이건 에러 없이 조용히 성능만 깎는 종류의 불일치다 — 반드시 맞출 것."
+        )
 
 
 def summary() -> str:

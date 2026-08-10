@@ -33,8 +33,10 @@ def randomize_material_pose(
     env: "ManagerBasedEnv",
     env_ids: torch.Tensor,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
-    x_range: tuple[float, float] = (0.38, 0.60),
-    y_range: tuple[float, float] = (-0.22, 0.05),
+    # 스펙에서 온다 — 카메라 화각 검사(assert_workspace_visible)가 같은 값을 쓰므로
+    # 여기에 숫자를 박으면 둘이 어긋난 채로 조용히 굴러간다.
+    x_range: tuple[float, float] = SPEC.MATERIAL_SPAWN_X_RANGE,
+    y_range: tuple[float, float] = SPEC.MATERIAL_SPAWN_Y_RANGE,
     z_offset: float = 0.03,
     yaw_range: tuple[float, float] = (-math.pi, math.pi),
 ) -> None:
