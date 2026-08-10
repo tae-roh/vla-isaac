@@ -77,6 +77,16 @@ python scripts/dump_obs_reference.py --task VlaPick-v0 --save \
 맞지 않으면 `configs/vla_spec.py` 의 `CAMERA_POS` / `CAMERA_ROT` 을 고치고 다시.
 **여기서 확정한 카메라 설정이 곧 RFT 설정이다. Phase 2 이후에는 바꿀 수 없다.**
 
+> **확정 완료** (2026-08-10): `CAMERA_POS=(1.2, 0.0, 0.8)`,
+> `CAMERA_ROT=(0.32818, -0.66487, -0.6017, 0.297)`. 초기값은 시선이 작업공간이 아니라
+> 로봇 베이스를 향해 목표 영역 중심이 프레임 밖(u=225.0)이었다. focal·해상도·
+> center crop 등 OpenVLA 규약 항목은 건드리지 않았고 위치와 조준만 바꿨다.
+>
+> 이제 `configs/vla_spec.py` 의 `assert_workspace_visible()` 이 스펙 자체 검사로
+> "자재 스폰 범위 + 목표 영역이 center crop 후에도 화면 안" 을 확인한다. Isaac Sim
+> 없이 도는 순수 계산이라 `python configs/vla_spec.py` 만으로도 즉시 검증된다 —
+> 카메라를 다시 만질 일이 생기면 렌더 전에 이걸 먼저 볼 것.
+
 ### 1-3. 변형체 예비 테스트 (15~20분, 타임박스 엄수)
 
 ```bash
