@@ -390,11 +390,17 @@ class PickPlaceEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.gpu_total_aggregate_pairs_capacity = 16 * 1024
         self.sim.physx.friction_correlation_distance = 0.00625
 
-        # Isaac Lab Mimic 이 환경 cfg 에서 이 이름을 찾는다. 없으면
-        #   NotImplementedError: Cannot find gripper_joint_names in the environment config
-        # 로 환경 생성이 실패한다. 액션 cfg 의 joint_names 는 정규식이라
-        # 그걸로는 대체되지 않고, 실제 관절 이름 목록이 따로 필요하다.
+        # Isaac Lab 의 그리퍼 상태 판정 헬퍼가 환경 cfg 에서 찾는 값들.
+        # ★ 세 개가 한 세트다. 하나만 넣으면 다음 것에서 죽는다:
+        #     gripper_joint_names 없음 → NotImplementedError: Cannot find gripper_joint_names
+        #     gripper_open_val 없음    → AttributeError: no attribute 'gripper_open_val'
+        #     gripper_threshold 없음   → AttributeError: no attribute 'gripper_threshold'
+        #   (이 리비전 isaaclab 0.54.4 의 stack.mdp.observations.object_grasped 가
+        #    hasattr 로 gripper_joint_names 만 확인하고 나머지 둘은 그냥 참조한다.)
+        # 액션 cfg 의 joint_names 는 정규식이라 그걸로는 대체되지 않는다.
         self.gripper_joint_names = list(SPEC.GRIPPER_JOINT_NAMES)
+        self.gripper_open_val = SPEC.GRIPPER_OPEN_QPOS
+        self.gripper_threshold = SPEC.GRIPPER_STATUS_THRESHOLD
 
         # ---------------------------------------------------------------
         # 텔레옵 장치 (계획서 §2-4: SpaceMouse 없이 키보드/게임패드)

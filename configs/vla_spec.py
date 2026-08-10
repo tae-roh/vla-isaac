@@ -79,6 +79,12 @@ GRIPPER_COMMAND_REGEX = "panda_finger_.*"    # 열림/닫힘 명령 표현식의
 # `gripper_joint_names` 를 찾는다 (없으면 NotImplementedError).
 # 정규식으로는 안 되고 이름 목록이어야 한다.
 GRIPPER_JOINT_NAMES = ("panda_finger_joint1", "panda_finger_joint2")
+# Isaac Lab 의 그리퍼 상태 판정 헬퍼(stack.mdp 의 object_grasped 등)가 요구하는
+# 임계값. "열림 기준값에서 이만큼 벗어나면 닫힌 것으로 본다" 는 뜻이다 [m].
+# gripper_joint_names / gripper_open_val / gripper_threshold 는 **세 개가 한 세트**로,
+# 하나만 설정하면 나머지에서 AttributeError 가 난다 (이 리비전에서 확인).
+# Isaac Lab Franka stack 레퍼런스와 같은 값을 쓴다.
+GRIPPER_STATUS_THRESHOLD = 0.005
 FINGER_LINK_NAMES = ("panda_leftfinger", "panda_rightfinger")
 FINGER_FRAME_OFFSET = (0.0, 0.0, 0.046)
 GRIPPER_OPEN_QPOS = 0.04             # 손가락 1개의 최대 개방 [m]
