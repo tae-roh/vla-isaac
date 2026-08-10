@@ -55,8 +55,11 @@ cuRobo 를 아예 건너뛰려면 `USE_SKILLGEN=0 ./setup/setup_isaaclab.sh`.
 
 ```bash
 source ~/env_isaaclab/bin/activate
-cd ~/vla-isaac
+cd "$(git -C ~/workspace/vla-isaac rev-parse --show-toplevel 2>/dev/null || echo ~/vla-isaac)"
 ```
+
+이후 명령은 모두 저장소 루트 기준이다. setup 스크립트들은 자기 위치에서
+`REPO_ROOT` 를 계산하므로 저장소를 어디에 두든 상관없다.
 
 ### 1-2. 씬 확인 + 카메라 확정 (~1시간) ★ 되돌릴 수 없는 결정
 
