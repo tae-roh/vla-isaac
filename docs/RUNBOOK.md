@@ -38,6 +38,13 @@ chmod +x setup/*.sh
 FULL_SMOKE=1 ./setup/setup_isaaclab.sh
 ```
 
+**Isaac Lab 이 이미 다른 경로에 있으면** `ISAACLAB_DIR` 로 알려 준다.
+스크립트가 이 값을 `~/.bashrc` 에 남기고, 이후 모든 명령이 `$ISAACLAB_DIR` 을 쓴다:
+
+```bash
+ISAACLAB_DIR=~/workspace/IsaacLab FULL_SMOKE=1 ./setup/setup_isaaclab.sh
+```
+
 `--install none` 으로 설치하므로 sb3/rl_games 충돌이 원천 회피된다.
 `pip check` 경고는 정상 — 통과 기준은 스모크 테스트뿐이다.
 
@@ -85,14 +92,19 @@ python scripts/test_deformable_grasp.py --headless --youngs 5e5 1e5 5e4
 
 ```bash
 python -c "import gymnasium as gym; print([k for k in gym.registry if k.startswith('VlaPick')])"
-# 4개가 나와야 한다. 비어 있으면:
+# 4개가 나와야 한다. 비어 있으면 먼저 어느 쪽 문제인지 가른다:
+#   python -c "import vla_isaac_tasks; import gymnasium as gym; print([k for k in gym.registry if k.startswith('VlaPick')])"
+#     → 4개 나오면 .pth 만 안 걸린 것 / 에러 나면 패키지 설치 문제
+#
+# .pth 재설치 (경로는 반드시 sysconfig 로 — site.getsitepackages()[0] 은
+# venv 안에서도 베이스 파이썬 경로를 돌려줄 수 있어 조용히 무시된다):
 #   pip install -e source
-#   echo "import vla_isaac_tasks" > "$(python -c 'import site;print(site.getsitepackages()[0])')/vla_isaac_tasks.pth"
+#   echo "import vla_isaac_tasks" > "$(python -c 'import sysconfig;print(sysconfig.get_paths()["purelib"])')/vla_isaac_tasks.pth"
 ```
 
 ```bash
 mkdir -p datasets
-python ~/IsaacLab/scripts/tools/record_demos.py \
+python $ISAACLAB_DIR/scripts/tools/record_demos.py \
     --task VlaPick-v0 --teleop_device keyboard --enable_cameras \
     --dataset_file ./datasets/source.hdf5 --num_demos 15 \
     --step_hz 24 --livestream 2
@@ -115,7 +127,7 @@ python ~/IsaacLab/scripts/tools/record_demos.py \
 그 계단이 그대로 Mimic 생성 성공률을 깎는다.
 
 ```bash
-python ~/IsaacLab/scripts/tools/record_demos.py \
+python $ISAACLAB_DIR/scripts/tools/record_demos.py \
     --task VlaPick-v0 --teleop_device gamepad --enable_cameras \
     --dataset_file ./datasets/source.hdf5 --num_demos 15 \
     --step_hz 24 --livestream 2
@@ -127,7 +139,7 @@ python ~/IsaacLab/scripts/tools/record_demos.py \
 
 ```bash
 # 재생 검증 — 물리 비결정성으로 일부는 실패한다. 넉넉히 수집했으면 정상.
-python ~/IsaacLab/scripts/tools/replay_demos.py \
+python $ISAACLAB_DIR/scripts/tools/replay_demos.py \
     --task VlaPick-v0 --enable_cameras --dataset_file ./datasets/source.hdf5
 ```
 
@@ -148,13 +160,13 @@ python -c "import curobo; print('SkillGen 사용 가능')"
 ```bash
 # 어노테이션 — SkillGen 은 시작 경계가 필수다.
 # --annotate_subtask_start_signals 를 빼면 생성이 실패한다.
-python ~/IsaacLab/scripts/imitation_learning/isaaclab_mimic/annotate_demos.py \
+python $ISAACLAB_DIR/scripts/imitation_learning/isaaclab_mimic/annotate_demos.py \
     --task VlaPick-Visuomotor-Mimic-v0 --auto --enable_cameras \
     --annotate_subtask_start_signals \
     --input_file ./datasets/source.hdf5 --output_file ./datasets/annotated.hdf5
 
 # 소량 시험 생성 — 성공률을 여기서 본다
-python ~/IsaacLab/scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
+python $ISAACLAB_DIR/scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
     --task VlaPick-Visuomotor-Mimic-v0 --enable_cameras --use_skillgen \
     --num_envs 10 --generation_num_trials 20 \
     --input_file ./datasets/annotated.hdf5 --output_file ./datasets/generated_small.hdf5
@@ -165,12 +177,12 @@ python ~/IsaacLab/scripts/imitation_learning/isaaclab_mimic/generate_dataset.py 
 **환경 코드는 고칠 것이 없다.** 두 플래그만 빼면 된다:
 
 ```bash
-python ~/IsaacLab/scripts/imitation_learning/isaaclab_mimic/annotate_demos.py \
+python $ISAACLAB_DIR/scripts/imitation_learning/isaaclab_mimic/annotate_demos.py \
     --task VlaPick-Visuomotor-Mimic-v0 --auto --enable_cameras \
     --input_file ./datasets/source.hdf5 --output_file ./datasets/annotated.hdf5
 #   ↑ --annotate_subtask_start_signals 없음
 
-python ~/IsaacLab/scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
+python $ISAACLAB_DIR/scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
     --task VlaPick-Visuomotor-Mimic-v0 --enable_cameras \
     --num_envs 10 --generation_num_trials 20 \
     --input_file ./datasets/annotated.hdf5 --output_file ./datasets/generated_small.hdf5
@@ -198,7 +210,7 @@ Isaac Sim 6.0 API 를 기대하는 것이다(문서가 6.0.0 기준, 우리는 5
 
 ```bash
 tmux new -s gen
-python ~/IsaacLab/scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
+python $ISAACLAB_DIR/scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
     --task VlaPick-Visuomotor-Mimic-v0 --enable_cameras --headless --use_skillgen \
     --num_envs 30 --generation_num_trials 3000 \
     --input_file ./datasets/annotated.hdf5 --output_file ./datasets/generated.hdf5
@@ -279,7 +291,7 @@ python env/smoke/check_rft.py --full
 강체 RFT 가 우선이다. 시간이 남을 때만:
 
 ```bash
-python ~/IsaacLab/scripts/tools/record_demos.py \
+python $ISAACLAB_DIR/scripts/tools/record_demos.py \
     --task VlaPick-Deformable-v0 --teleop_device keyboard --enable_cameras \
     --dataset_file ./datasets/deformable_source.hdf5 --num_demos 20 \
     --step_hz 24 --livestream 2

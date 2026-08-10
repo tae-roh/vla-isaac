@@ -109,9 +109,15 @@ pip install --upgrade pip
 STAGE="4. Isaac Sim + PyTorch"
 log 4 "Isaac Sim ${ISAACSIM_VERSION} + PyTorch ${TORCH_VERSION} (cu128) — 수십 GB, 오래 걸림"
 # =============================================================================
-if python -c "import isaacsim" 2>/dev/null; then
-    info "isaacsim 이미 설치됨 — 건너뜀"
+# 버전까지 확인한다. `import isaacsim` 성공만으로 건너뛰면, 직접 설치해 둔
+# 다른 버전이 그대로 남아 조용히 진행된다 — constraints 는 5.1.0 기준이므로
+# 버전이 다르면 나중에 원인 불명 오류로 나타난다.
+INSTALLED_ISAACSIM="$(pip show isaacsim 2>/dev/null | awk '/^Version:/{print $2}')"
+if [[ "${INSTALLED_ISAACSIM}" == "${ISAACSIM_VERSION}" ]]; then
+    info "isaacsim ${ISAACSIM_VERSION} 이미 설치됨 — 건너뜀"
 else
+    [[ -n "${INSTALLED_ISAACSIM}" ]] && \
+        warn "isaacsim ${INSTALLED_ISAACSIM} 가 설치되어 있다 (기대: ${ISAACSIM_VERSION}) — 교체한다."
     pip install "isaacsim[all,extscache]==${ISAACSIM_VERSION}" \
         --extra-index-url https://pypi.nvidia.com
 fi
@@ -132,8 +138,25 @@ log 5 "Isaac Lab clone + install none"
 if [[ ! -d "${ISAACLAB_DIR}" ]]; then
     git clone https://github.com/isaac-sim/IsaacLab.git --branch main "${ISAACLAB_DIR}"
 else
-    info "이미 clone 됨 — 건너뜀"
+    info "이미 clone 됨 — 건너뜀: ${ISAACLAB_DIR}"
 fi
+
+# 디렉토리는 있는데 Isaac Lab 이 아닌 경우를 여기서 잡는다.
+# ISAACLAB_DIR 을 잘못 지정하면 아래 ./isaaclab.sh 가 "No such file" 로 죽는데,
+# 그 메시지만으로는 경로 문제인지 설치 문제인지 구분이 안 된다.
+[[ -x "${ISAACLAB_DIR}/isaaclab.sh" ]] || die \
+    "${ISAACLAB_DIR} 는 Isaac Lab 체크아웃이 아니다 (isaaclab.sh 없음).
+     경로가 다르면 ISAACLAB_DIR 로 지정할 것:
+       ISAACLAB_DIR=~/workspace/IsaacLab ./setup/setup_isaaclab.sh"
+
+# 이후 페이즈의 명령들이 \$ISAACLAB_DIR 을 쓴다 (docs/RUNBOOK.md).
+# 경로가 홈 바로 아래가 아닐 수 있으므로 셸에 남겨 둔다.
+if grep -q "^export ISAACLAB_DIR=" "${HOME}/.bashrc" 2>/dev/null; then
+    sed -i "s|^export ISAACLAB_DIR=.*|export ISAACLAB_DIR=${ISAACLAB_DIR}|" "${HOME}/.bashrc"
+else
+    echo "export ISAACLAB_DIR=${ISAACLAB_DIR}" >> "${HOME}/.bashrc"
+fi
+info "ISAACLAB_DIR=${ISAACLAB_DIR} 를 ~/.bashrc 에 기록"
 
 pushd "${ISAACLAB_DIR}" >/dev/null
 # ★ --install none 이 핵심이다. all 로 설치하면 sb3/rl_games/skrl 이 isaacsim 의
@@ -160,9 +183,23 @@ pip install -c "${CONSTRAINTS}" -e "${REPO_ROOT}/source"
 #   (stdlib 표준 동작). 이 한 줄이면 상류 스크립트를 건드리지 않고 등록이 끝난다.
 #   패키지 __init__ 은 gymnasium 과 spec 만 import 하고 entry_point 는 문자열이라
 #   Isaac Sim 을 끌어오지 않는다 → 기동 비용도 거의 없다.
-SITE_DIR="$(python -c 'import site; print(site.getsitepackages()[0])')"
+#   경로는 sysconfig 로 잡는다. site.getsitepackages()[0] 은 venv 안에서도
+#   베이스 파이썬의 site-packages 를 돌려줄 수 있는데, 거기에 쓰면 venv 실행 시
+#   로드되지 않아 조용히 아무 일도 일어나지 않는다.
+SITE_DIR="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 echo "import vla_isaac_tasks" > "${SITE_DIR}/vla_isaac_tasks.pth"
 info "gym 자동 등록: ${SITE_DIR}/vla_isaac_tasks.pth"
+
+# 실제로 먹었는지 확인. 여기서 걸러야 Day 1 오후에 record_demos.py 가
+# NameNotFound 로 죽는 것을 막는다.
+REGISTERED="$(python -c "import gymnasium as gym; print(len([k for k in gym.registry if k.startswith('VlaPick')]))")"
+if [[ "${REGISTERED}" == "4" ]]; then
+    info "gym 등록 확인: VlaPick 태스크 4종"
+else
+    warn "gym 자동 등록 실패 (VlaPick ${REGISTERED}종). 다음으로 원인을 확인할 것:
+       python -c 'import vla_isaac_tasks'          # 임포트 자체가 되는지
+       python -c 'import sysconfig; print(sysconfig.get_paths()[\"purelib\"])'"
+fi
 
 # =============================================================================
 STAGE="7. 의존성 충돌 정리"
