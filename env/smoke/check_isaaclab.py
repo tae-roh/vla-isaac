@@ -69,14 +69,24 @@ def main() -> int:
 
     check("torch 2.7.0 + CUDA", _torch)
 
-    # -- 3. Isaac Sim / Isaac Lab import -------------------------------------
+    # -- 3. Isaac Sim import -------------------------------------------------
+    # ★ 여기서 isaaclab 을 import 하면 안 된다.
+    #   isaaclab.envs 는 결국 isaaclab/utils/mesh.py 의 `from pxr import Usd` 로
+    #   내려가는데, pxr(OpenUSD 바인딩)은 SimulationApp 이 뜬 뒤에야 경로에 잡힌다.
+    #   AppLauncher 보다 먼저 import 하면 ModuleNotFoundError: No module named 'pxr'.
+    #   Isaac Lab 의 모든 스크립트가 AppLauncher 를 맨 위에 두는 이유가 이것이다.
+    #   → isaaclab 계열 검증은 아래 --full 경로(AppLauncher 이후)에서 한다.
     def _isaacsim_import():
         import isaacsim  # noqa: F401
-        import isaaclab  # noqa: F401
 
-        return f"isaaclab {getattr(__import__('isaaclab'), '__version__', 'unknown')}"
+        from importlib.metadata import version
 
-    check("isaacsim / isaaclab import", _isaacsim_import)
+        try:
+            return f"isaacsim {version('isaacsim')}"
+        except Exception:
+            return "isaacsim import OK"
+
+    check("isaacsim import", _isaacsim_import)
 
     # -- 3b. cuRobo (SkillGen) — 없어도 실패로 처리하지 않는다 ----------------
     # MimicGen 경로가 살아 있으므로 cuRobo 부재는 "기능 축소" 이지 "환경 파손" 이
@@ -114,6 +124,17 @@ def main() -> int:
     try:
         import gymnasium as gym
         import torch
+
+        # AppLauncher 이후라 이제 isaaclab 계열을 import 할 수 있다 (pxr 경로 확보됨).
+        def _isaaclab_import():
+            import isaaclab  # noqa: F401
+            import isaaclab_mimic.envs  # noqa: F401
+            import isaaclab_tasks  # noqa: F401
+
+            ver = getattr(isaaclab, "__version__", "unknown")
+            return f"isaaclab {ver} + isaaclab_tasks + isaaclab_mimic"
+
+        check("isaaclab / isaaclab_tasks / isaaclab_mimic import", _isaaclab_import)
 
         # 우리 태스크 패키지를 import 하면 gym.register 가 실행된다.
         import vla_isaac_tasks  # noqa: F401
