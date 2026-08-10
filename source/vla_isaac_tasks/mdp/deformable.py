@@ -93,7 +93,9 @@ def deformable_placed_signal(
     )
 
     # (4) 그리퍼 개방
-    released = gripper_pos(env, robot_cfg).sum(dim=-1) > SPEC.GRIPPER_OPEN_QPOS_SUM
+    # abs() 가 필요한 이유는 observations.placed_signal 의 같은 줄 주석을 볼 것 —
+    # gripper_pos 는 [f1, -f2] 를 돌려주므로 그냥 sum() 하면 항상 ≈0 이다.
+    released = gripper_pos(env, robot_cfg).abs().sum(dim=-1) > SPEC.GRIPPER_OPEN_QPOS_SUM
 
     return in_region & on_table & settled & released
 
