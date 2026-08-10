@@ -259,6 +259,14 @@ def placed_signal(
     settled = torch.linalg.norm(obj.data.root_lin_vel_w, dim=-1) < SPEC.SUCCESS_LIN_VEL_THRESHOLD
 
     # (4) 그리퍼 개방 — "놓았다"는 것까지 확인해야 픽앤플레이스가 완결된다
-    released = gripper_pos(env, robot_cfg).sum(dim=-1) > SPEC.GRIPPER_OPEN_QPOS_SUM
+    #
+    # ★ abs() 가 반드시 필요하다. Isaac Lab 의 gripper_pos 는 두 번째 손가락의
+    #   부호를 뒤집어 [f1, -f2] 를 돌려준다 (LIBERO/robosuite 의 Panda qpos 규약과
+    #   맞추기 위한 것이고, proprio 는 그 규약이 맞다). 그런데 Franka 의 두 손가락은
+    #   둘 다 0~+0.04 로 대칭 이동하므로 그냥 sum() 하면 f1 - f2 ≈ 0 이 되어
+    #   임계값 0.06 을 **영원히** 넘지 못한다 → 성공 판정이 항상 False.
+    #   그러면 텔레옵 녹화가 성공을 못 잡고, RFT 보상도 0 으로 고정되는데
+    #   에러가 나지 않아서 "커브가 오르지 않는다" 로만 드러난다.
+    released = gripper_pos(env, robot_cfg).abs().sum(dim=-1) > SPEC.GRIPPER_OPEN_QPOS_SUM
 
     return in_region & on_table & settled & released
