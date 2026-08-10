@@ -148,24 +148,41 @@ class PickPlaceMimicEnv(ManagerBasedRLMimicEnv):
     def get_subtask_term_signals(
         self, env_ids: Sequence[int] | None = None
     ) -> dict[str, torch.Tensor]:
-        """서브태스크 경계 시그널. --auto 어노테이션이 이 값을 읽는다.
-
-        종료 경계 1개 + 시작 경계 2개를 함께 반환한다.
-          - MimicGen 은 종료 경계만 쓴다 (시작 경계는 무시된다)
-          - SkillGen 은 **시작 경계가 필수**다. 없으면 데이터 생성이 실패한다.
-        둘을 모두 내보내면 분기 없이 양쪽을 지원할 수 있다.
+        """서브태스크 **종료** 시그널. --auto 어노테이션이 이 값을 읽는다.
 
         서브태스크가 2개이고 규약상 마지막 것은 종료 시그널이 없으므로
-        (SubTaskConfig.subtask_term_signal=None) 종료 항목은 1개다.
+        (SubTaskConfig.subtask_term_signal=None) 항목은 1개다.
+
+        시작 시그널은 여기 섞지 않는다 — Isaac Lab 에서 둘은 독립된 개념이고
+        각각 다른 메서드로 받아 간다 (아래 get_subtask_start_signals 참조).
+        """
+        if env_ids is None:
+            env_ids = slice(None)
+
+        subtask_terms = self.obs_buf["subtask_terms"]
+        return {"grasp_lift": subtask_terms["grasp_lift"][env_ids]}
+
+    # -------------------------------------------------------------------------
+    def get_subtask_start_signals(
+        self, env_ids: Sequence[int] | None = None
+    ) -> dict[str, torch.Tensor]:
+        """서브태스크 **시작** 시그널 — SkillGen 전용.
+
+        annotate_demos.py 를 `--annotate_subtask_start_signals` 와 함께 돌리면
+        이 메서드를 호출해 obs/datagen_info/subtask_start_signals/ 아래에 기록한다.
+        시작 경계가 없으면 SkillGen 데이터 생성이 실패한다.
+
+        MimicGen 만 쓸 때는 아무도 호출하지 않으므로 있어도 무해하다 —
+        덕분에 두 방식을 분기 없이 같은 환경으로 지원한다.
+
+        의미: 시작~종료 사이 = 사람 데모를 그대로 재생할 접촉 구간
+              서브태스크 사이   = cuRobo 가 충돌 회피 경로를 새로 까는 자유공간
         """
         if env_ids is None:
             env_ids = slice(None)
 
         subtask_terms = self.obs_buf["subtask_terms"]
         return {
-            # 종료 경계
-            "grasp_lift": subtask_terms["grasp_lift"][env_ids],
-            # 시작 경계 (SkillGen)
             "grasp_start": subtask_terms["grasp_start"][env_ids],
             "place_start": subtask_terms["place_start"][env_ids],
         }

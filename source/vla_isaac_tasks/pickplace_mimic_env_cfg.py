@@ -29,15 +29,21 @@ def _build_subtask_configs() -> list[SubTaskConfig]:
         → "파지 직후"가 아니라 "파지 후 들어올린 뒤"(grasp_lift).
       - num_interpolation_steps 는 5 전후에서 시작해 튜닝 (0=급격, 20=지연).
 
-    ★ subtask_start_signal 은 SkillGen 전용이다.
-      SkillGen 은 시작·종료 경계로 궤적을 셋으로 나눈다:
-          자유공간 접근  → [grasp_start] 파지 접촉구간 [grasp_lift] →
-          자유공간 운반  → [place_start] 배치 접촉구간 → 끝
-      접촉구간은 사람 데모를 재생하고, 자유공간은 cuRobo 가 충돌 회피 경로를 깐다.
-      MimicGen 에서는 이 필드가 무시되고 자유공간이 선형 보간으로 대체된다.
+    ★ 시작 경계(SkillGen 용)는 여기에 적지 않는다.
+      SubTaskConfig 에는 subtask_start_signal 같은 필드가 **없다**.
+      Isaac Lab 은 시작 신호를 환경의 별도 메서드로 받는다:
+          get_subtask_term_signals()   → 종료 경계 (MimicGen + SkillGen 공통)
+          get_subtask_start_signals()  → 시작 경계 (SkillGen 전용)
+      annotate_demos.py 가 --annotate_subtask_start_signals 와 함께 후자를 호출해
+      obs/datagen_info/subtask_start_signals/ 아래에 기록한다.
+      → 구현은 pickplace_mimic_env.py 에 있다.
 
-      즉 이 설정 하나로 두 방식을 모두 커버한다 — Day 1 에 cuRobo 가 막혀
-      MimicGen 으로 후퇴해도 환경을 고칠 필요가 없다.
+      SkillGen 은 그 경계로 궤적을 셋으로 나눈다:
+          자유공간 접근 → [grasp_start] 파지 접촉구간 [grasp_lift] →
+          자유공간 운반 → [place_start] 배치 접촉구간 → 끝
+      접촉구간은 사람 데모를 재생하고, 자유공간은 cuRobo 가 충돌 회피 경로를 깐다.
+      MimicGen 은 시작 신호를 무시하고 자유공간을 선형 보간으로 메운다.
+      → 이 cfg 하나로 두 방식을 다 커버한다. cuRobo 가 막혀도 고칠 것이 없다.
 
     마지막 서브태스크는 규약상 subtask_term_signal=None 이다.
     """
@@ -56,7 +62,6 @@ def _build_subtask_configs() -> list[SubTaskConfig]:
         #   시작 = eef 가 자재에 접근 완료 (여기부터 사람 데모)
         #   종료 = 파지 후 들어올림
         SubTaskConfig(
-            subtask_start_signal="grasp_start",
             subtask_term_signal="grasp_lift",
             # 시그널이 뜬 시점에서 10~20 스텝 뒤를 경계로 삼는다. 여유를 두면
             # 파지가 확실히 안정된 뒤에 구간이 끊겨 스티칭이 매끄럽다.
@@ -69,7 +74,6 @@ def _build_subtask_configs() -> list[SubTaskConfig]:
         #   시작 = 자재를 든 채로 목표 영역 위 도달 (여기부터 사람 데모)
         #   종료 = 없음 (마지막)
         SubTaskConfig(
-            subtask_start_signal="place_start",
             subtask_term_signal=None,
             subtask_term_offset_range=(0, 0),
             description="Move the material to the target zone and release",
