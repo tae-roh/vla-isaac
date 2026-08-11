@@ -1,10 +1,11 @@
 # =============================================================================
 # vla_isaac_tasks/pickplace_env_cfg.py
 #
-# 기본 태스크 환경 <VlaPick-v0> — 텔레옵 수집 · 재생 · 최종 정책 평가에 쓴다.
+# 기본 태스크 환경 <VlaPlace-v0> — 텔레옵 수집 · 재생 · 최종 정책 평가에 쓴다.
 # (Mimic 증강용 환경 2종은 pickplace_mimic_env_cfg.py 에서 이 클래스를 상속한다)
 #
-# 태스크: 형상이 랜덤한 자재를 집어 목표 영역으로 옮긴다.
+# 태스크 (개정 §2): 얕은 박스 안의 블록 3개 중 **지시문이 지정한 하나**를 꺼내
+#                   트레이의 **지시문이 지정한 포켓**에 안착시킨다.
 #
 # ★ 이 파일의 모든 수치는 configs/vla_spec.py 에서 온다.
 #   직접 상수를 박지 말 것 — SFT 데이터를 만든 설정이 곧 RFT 설정이어야 하고,
@@ -30,7 +31,7 @@ from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.utils import configclass
 
 from . import mdp
-from .materials import make_material_spawner
+from .scene_assets import apply_clearance, box_wall, make_block_cfg, tray_rail
 from .spec import SPEC
 
 ##
@@ -39,12 +40,21 @@ from .spec import SPEC
 from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG  # isort: skip
 
 
+# 아래 씬은 블록 3개를 필드로 명시 선언한다 (InteractiveSceneCfg 는 선언된
+# 필드만 씬에 올린다). 개수를 바꾸려면 필드도 함께 늘려야 한다.
+assert SPEC.NUM_BLOCKS == 3, (
+    f"SPEC.NUM_BLOCKS={SPEC.NUM_BLOCKS} 인데 씬에는 블록 필드가 3개뿐이다. "
+    "PickPlaceSceneCfg 의 block_* 필드를 함께 늘리고, BLOCK_COLORS / "
+    "BLOCK_ATTRS / SLOT_NAMES 도 같이 맞출 것."
+)
+
+
 # =============================================================================
 # 씬
 # =============================================================================
 @configclass
 class PickPlaceSceneCfg(InteractiveSceneCfg):
-    """Franka + 형상 랜덤 자재 + 목표 마커 + 3인칭 카메라."""
+    """Franka + 소스 박스(블록 3개) + 맞춤 포켓 트레이 + 3인칭 카메라."""
 
     robot: ArticulationCfg = FRANKA_PANDA_HIGH_PD_CFG.replace(
         prim_path="{ENV_REGEX_NS}/Robot"
@@ -79,33 +89,29 @@ class PickPlaceSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=1800.0),
     )
 
-    # 자재 — env 별로 6종 중 하나가 배정된다 (materials.py 참조).
-    object: RigidObjectCfg = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Object",
-        spawn=make_material_spawner(),
-        init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.5, -0.1, SPEC.TABLE_HEIGHT + 0.04), rot=(1.0, 0.0, 0.0, 0.0)
-        ),
-    )
+    # --- 블록 3개 (색만 다르고 형상·크기는 동일) ---
+    block_0: RigidObjectCfg = make_block_cfg(0)
+    block_1: RigidObjectCfg = make_block_cfg(1)
+    block_2: RigidObjectCfg = make_block_cfg(2)
 
-    # 목표 영역 — 시각 표시 전용. 충돌체가 없어야 자재가 걸리지 않는다.
-    goal_marker = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/GoalMarker",
-        spawn=sim_utils.CylinderCfg(
-            radius=SPEC.GOAL_REGION_RADIUS,
-            height=0.002,
-            visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.15, 0.85, 0.35), emissive_color=(0.05, 0.30, 0.10)
-            ),
-            collision_props=None,
-        ),
-        init_state=AssetBaseCfg.InitialStateCfg(
-            pos=(*SPEC.GOAL_REGION_CENTER, SPEC.TABLE_HEIGHT + 0.002)
-        ),
-    )
+    # --- 소스 박스: 벽 4장. 벽이 있어야 "밀어내기" 해가 막힌다 ---
+    box_x_pos = box_wall("box_x_pos")
+    box_x_neg = box_wall("box_x_neg")
+    box_y_pos = box_wall("box_y_pos")
+    box_y_neg = box_wall("box_y_neg")
+
+    # --- 트레이: 긴 레일 2장 + 포켓별 칸막이 2장 ---
+    # 클리어런스 split 은 apply_clearance() 가 이 필드들을 통째로 갈아끼운다.
+    tray_x_pos = tray_rail("tray_x_pos")
+    tray_x_neg = tray_rail("tray_x_neg")
+    pocket0_y_pos = tray_rail("pocket0_y_pos")
+    pocket0_y_neg = tray_rail("pocket0_y_neg")
+    pocket1_y_pos = tray_rail("pocket1_y_pos")
+    pocket1_y_neg = tray_rail("pocket1_y_neg")
+    pocket2_y_pos = tray_rail("pocket2_y_pos")
+    pocket2_y_neg = tray_rail("pocket2_y_neg")
 
     # 엔드이펙터 프레임 — Mimic 의 get_robot_eef_pose 가 이 값을 쓴다.
-    # 링크 이름과 오프셋은 전부 configs/vla_spec.py 의 embodiment 섹션에서 온다.
     ee_frame: FrameTransformerCfg = FrameTransformerCfg(
         prim_path=f"{{ENV_REGEX_NS}}/Robot/{SPEC.BASE_LINK_NAME}",
         debug_vis=False,
@@ -129,9 +135,11 @@ class PickPlaceSceneCfg(InteractiveSceneCfg):
         ],
     )
 
-    # 3인칭 단일 카메라. 손목캠은 넣지 않는다 (계획서 §2-1: 단일 뷰 스펙).
+    # 3인칭 단일 카메라. 손목캠은 넣지 않는다 (단일 뷰 스펙).
     # TiledCamera 를 쓰는 이유: 병렬 env 렌더가 CameraCfg 보다 크게 빠르다.
-    # Phase 2 의 야간 생성과 Phase 4 롤아웃이 모두 렌더 바운드라 이 차이가 일정에 직결된다.
+    # ★ 박스와 트레이가 **둘 다** 화각에 들어와야 한다. Day 1 에
+    #   dump_obs_reference.py 의 PNG 로 확인하고, 슬롯 좌우가 지시문의
+    #   left/right 와 맞는지도 같이 볼 것 (SPEC.SLOT_Y_SIGN).
     table_cam: TiledCameraCfg = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/table_cam",
         update_period=0.0,
@@ -214,10 +222,18 @@ class ObservationsCfg:
         # --- proprio (스펙에서 켤 때만 VLA 에 전달된다) ---
         proprio = ObsTerm(func=mdp.proprio_state)
 
+        # --- 타깃 (Mimic 의 get_object_poses + 지시문 생성) ---
+        # ★ target_ids 가 지시문의 유일한 출처다. 롤아웃 워커와 RLDS 변환이
+        #   같은 값에서 문장을 만들어야 SFT 와 RFT 의 지시문이 어긋나지 않는다.
+        target_pose = ObsTerm(func=mdp.target_block_pose)
+        pocket_pose = ObsTerm(func=mdp.target_pocket_pose)
+        target_ids = ObsTerm(func=mdp.target_ids)
+
+        # --- 진단 채널 (정책은 안 본다. 롤아웃 워커가 평균만 보고한다) ---
+        yaw_err = ObsTerm(func=mdp.yaw_error_obs)
+
         # --- 상태 기반 디버깅/평가용 ---
-        object_pose = ObsTerm(func=mdp.object_pose_in_env_frame)
-        object_pos_b = ObsTerm(func=mdp.object_position_in_robot_root_frame)
-        goal_pos = ObsTerm(func=mdp.goal_position_in_env_frame)
+        target_pos_b = ObsTerm(func=mdp.target_position_in_robot_root_frame)
         last_action = ObsTerm(func=mdp.last_action)
 
         def __post_init__(self):
@@ -228,44 +244,36 @@ class ObservationsCfg:
     class SubtaskCfg(ObsGroup):
         """Mimic/SkillGen 자동 어노테이션(--auto)용 휴리스틱 시그널.
 
-        계획서 §Phase1-6. 이게 없으면 annotate_demos.py 를 수동(B/N/S 키)으로
-        돌려야 하는데, 데모를 다시 수집할 때마다 반복 비용이 든다.
-
-        서브태스크는 2개로 압축했다 (§Phase1-5): 스티칭 구간이 적을수록
-        생성 성공률이 높다.
+        서브태스크는 2개다 (개정 §4-2). 가능한 한 적게 나눈다 — 구간을 선형
+        보간/플래닝으로 이어붙이므로 서브태스크가 많을수록 스티칭이 늘고
+        동작이 덜 부드러워지며 실패 데모가 늘어난다.
 
         ★ 종료 시그널 1개 + 시작 시그널 2개를 모두 등록한다.
-          MimicGen 은 종료 경계만 쓰지만, SkillGen 은 **시작 경계가 필수**다
-          (없으면 데이터 생성이 실패한다). 시작 시그널은 SkillGen 을 쓰지 않을 때
-          그냥 무시되므로, 둘을 다 두면 분기 코드 없이 양쪽을 지원할 수 있다.
-          Day 1 에 cuRobo 가 막혀 MimicGen 으로 후퇴하더라도 이 환경을 그대로 쓴다.
+          MimicGen 은 종료 경계만 쓰지만, SkillGen 은 **시작 경계가 필수**다.
+          시작 시그널은 MimicGen 에서 그냥 무시되므로, 둘을 다 두면 분기 코드
+          없이 양쪽을 지원할 수 있다.
         """
 
         # --- 종료 경계 (MimicGen + SkillGen 공통) ---
+        # 파지 직후가 아니라 "블록을 들어 박스 벽 위로 뺀 뒤"가 경계다.
         grasp_lift = ObsTerm(
             func=mdp.grasp_lift_signal,
             params={
                 "robot_cfg": SceneEntityCfg("robot"),
                 "ee_frame_cfg": SceneEntityCfg("ee_frame"),
-                "object_cfg": SceneEntityCfg("object"),
             },
         )
 
         # --- 시작 경계 (SkillGen 전용) ---
-        # 이 지점 이전의 자유공간은 cuRobo 가 계획하고, 이후는 사람 데모를 재생한다.
         grasp_start = ObsTerm(
             func=mdp.grasp_start_signal,
-            params={
-                "ee_frame_cfg": SceneEntityCfg("ee_frame"),
-                "object_cfg": SceneEntityCfg("object"),
-            },
+            params={"ee_frame_cfg": SceneEntityCfg("ee_frame")},
         )
         place_start = ObsTerm(
             func=mdp.place_start_signal,
             params={
                 "robot_cfg": SceneEntityCfg("robot"),
                 "ee_frame_cfg": SceneEntityCfg("ee_frame"),
-                "object_cfg": SceneEntityCfg("object"),
             },
         )
 
@@ -279,75 +287,60 @@ class ObservationsCfg:
 
 @configclass
 class EventCfg:
-    # 자재 크기 랜덤화 — PhysX 제약상 prestartup 에서만 가능하다.
-    randomize_scale = EventTerm(
-        func=mdp.randomize_rigid_body_scale,
-        mode="prestartup",
-        params={
-            "asset_cfg": SceneEntityCfg("object"),
-            "scale_range": {"x": (0.85, 1.25), "y": (0.85, 1.25), "z": (0.85, 1.25)},
-        },
-    )
+    """리셋. **랜덤 샘플링이 없다** (개정 §3).
+
+    블록 배치·타깃 블록·타깃 슬롯은 전부 초기 상태 뱅크에서 인덱스로 꺼낸다.
+    여기에 pose 랜덤화 항을 추가하면 "인덱스로 s₀ 를 지정한다"는 전제가 깨지고
+    GRPO advantage 가 다시 노이즈가 된다.
+    """
 
     reset_robot = EventTerm(
         func=mdp.reset_joints_by_offset,
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
+            # 팔 초기 자세까지 뱅크에 넣지는 않았다. 관절 노이즈는 씬 난이도가
+            # 아니라 시작 자세의 미세 변동이라 그룹 내 분산에 거의 기여하지
+            # 않는다. 완전 결정론이 필요하면 이 범위를 0 으로 둘 것.
             "position_range": (-0.05, 0.05),
             "velocity_range": (0.0, 0.0),
         },
     )
-
-    reset_material = EventTerm(
-        func=mdp.randomize_material_pose,
+    reset_scene = EventTerm(
+        func=mdp.reset_scene_from_bank,
         mode="reset",
-        params={"asset_cfg": SceneEntityCfg("object")},
+        params={"bank_name": "train"},
     )
-
-    reset_hold_counter = EventTerm(
-        func=mdp.reset_success_hold_counter,
-        mode="reset",
-        params={},
-    )
+    reset_buffers = EventTerm(func=mdp.reset_episode_buffers, mode="reset", params={})
 
 
 @configclass
 class RewardsCfg:
-    """RFT 의 0/1 보상. 계획서 §2-2 대로 shaping 없이 이진만 쓴다."""
+    """RFT 의 0/1 보상. shaping 없이 이진만 쓴다 (개정 §2-5)."""
 
     success = RewTerm(
         func=mdp.success_bonus,
         weight=1.0,
         params={
             "robot_cfg": SceneEntityCfg("robot"),
-            "object_cfg": SceneEntityCfg("object"),
-        },
-    )
-    # 진단 전용 — weight=0.0 이므로 학습 신호에 들어가지 않고 로그에만 남는다.
-    # 커브가 평평할 때 "접근·파지까지는 되는데 배치를 못 하는 것"인지 구분한다.
-    grasp_lift_diag = RewTerm(
-        func=mdp.grasp_lift_progress,
-        weight=0.0,
-        params={
-            "robot_cfg": SceneEntityCfg("robot"),
             "ee_frame_cfg": SceneEntityCfg("ee_frame"),
-            "object_cfg": SceneEntityCfg("object"),
         },
     )
+    # 진단은 여기 두지 않는다. RewardManager 는 로그에 남기는 값에도 weight 를
+    # 곱하므로 weight=0 인 항은 **로그도 0** 이다 — 진단이 되는 것처럼 보이지만
+    # 아무것도 알려주지 않는다. 진단 채널은 관측(yaw_err, subtask_terms/grasp_lift)
+    # 이고, 롤아웃 워커가 그 평균을 step 응답에 실어 보낸다.
 
 
 @configclass
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    object_dropped = DoneTerm(
-        func=mdp.object_dropped, params={"object_cfg": SceneEntityCfg("object")}
-    )
+    object_dropped = DoneTerm(func=mdp.object_dropped, params={})
     success = DoneTerm(
         func=mdp.task_success,
         params={
             "robot_cfg": SceneEntityCfg("robot"),
-            "object_cfg": SceneEntityCfg("object"),
+            "ee_frame_cfg": SceneEntityCfg("ee_frame"),
         },
     )
 
@@ -357,17 +350,14 @@ class TerminationsCfg:
 # =============================================================================
 @configclass
 class PickPlaceEnvCfg(ManagerBasedRLEnvCfg):
-    """<VlaPick-v0> — 텔레옵 수집 / 재생 / 정책 평가용."""
+    """<VlaPlace-v0> — 텔레옵 수집 / 재생 / 정책 평가용."""
 
     scene: PickPlaceSceneCfg = PickPlaceSceneCfg(
         num_envs=1,
         env_spacing=3.0,
-        # ★ 반드시 False.
-        #   MultiAssetSpawnerCfg 는 env 마다 다른 지오메트리를 만들기 때문에
-        #   PhysX 복제 최적화를 쓸 수 없다. True 로 두면 모든 env 가 같은 형상이
-        #   되는데 **에러가 나지 않아서**, 형상 랜덤화가 되고 있다고 착각한 채로
-        #   데이터를 전부 만들어 버리게 된다.
-        replicate_physics=False,
+        # 모든 env 의 지오메트리가 같으므로 PhysX 복제 최적화를 쓸 수 있다.
+        # (형상 랜덤 자재를 쓰던 시절에는 False 여야 했다 — 그 제약이 사라졌다)
+        replicate_physics=True,
     )
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
@@ -377,14 +367,23 @@ class PickPlaceEnvCfg(ManagerBasedRLEnvCfg):
     commands = None
     curriculum = None
 
+    # ★ 연속 난이도 축 (개정 §2-3b). 성공 판정 공차가 이 값에서 파생되므로
+    #   포켓 지오메트리와 반드시 함께 움직여야 한다 → set_clearance() 를 쓸 것.
+    pocket_clearance: float = SPEC.POCKET_CLEARANCE
+
+    def set_clearance(self, clearance: float) -> None:
+        """클리어런스 split 을 만든다. 포켓 레일과 판정 공차를 함께 바꾼다."""
+        self.pocket_clearance = clearance
+        apply_clearance(self.scene, clearance)
+
     def __post_init__(self):
         self.decimation = SPEC.DECIMATION
         self.episode_length_s = SPEC.EPISODE_LENGTH_S
         self.sim.dt = SPEC.SIM_DT
         self.sim.render_interval = SPEC.DECIMATION
 
-        # 파지 안정성에 직결되는 솔버 설정. 자재가 미끄러지면 Mimic 생성 성공률이
-        # 떨어지고, 그러면 Day 1 야간 배치가 헛돈다.
+        # 파지 안정성에 직결되는 솔버 설정. 블록이 미끄러지면 Mimic 생성
+        # 성공률이 떨어지고, 그러면 야간 배치가 헛돈다.
         self.sim.physx.bounce_threshold_velocity = 0.2
         self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
         self.sim.physx.gpu_total_aggregate_pairs_capacity = 16 * 1024
@@ -403,7 +402,7 @@ class PickPlaceEnvCfg(ManagerBasedRLEnvCfg):
         self.gripper_threshold = SPEC.GRIPPER_STATUS_THRESHOLD
 
         # ---------------------------------------------------------------
-        # 텔레옵 장치 (계획서 §2-4: SpaceMouse 없이 키보드/게임패드)
+        # 텔레옵 장치
         # ---------------------------------------------------------------
         # ★ 여기를 None 으로 두면 record_demos.py 가 죽는다.
         #   그 스크립트의 setup_teleop_device() 는 이렇게 판정한다:
@@ -411,25 +410,22 @@ class PickPlaceEnvCfg(ManagerBasedRLEnvCfg):
         #          args_cli.teleop_device in env_cfg.teleop_devices.devices:
         #   teleop_devices=None 이면 hasattr 는 True 를 돌려주고, 곧바로
         #   None.devices 에 접근해 AttributeError 가 난다.
-        #   "설정 안 함" 이 아니라 "속성은 있는데 None" 이라는 상태가 문제다.
         #
-        # ★ 게임패드는 여기에 등록하지 않으면 아예 못 쓴다.
-        #   위 판정이 실패했을 때의 폴백 경로는 keyboard 와 spacemouse 만 만들고,
-        #   그 외 값이면 에러를 찍고 종료한다. 계획서 §2-4 가 게임패드를
-        #   "데모 품질이 크게 다르다" 며 강력 권장하므로 반드시 등록해 둔다.
+        # ★ 게임패드는 여기에 등록하지 않으면 아예 못 쓴다 (폴백 경로는
+        #   keyboard/spacemouse 만 만든다).
         self.teleop_devices = DevicesCfg(
             devices={
                 # 키보드: 감도를 낮게 잡는다. 크면 한 번 누를 때마다 팔이 튀어
-                # 궤적에 계단이 생기고, 그건 Mimic 생성 성공률을 직접 깎는다.
+                # 궤적에 계단이 생긴다.
+                # ★ SkillGen 전제에서는 계단이 transit 구간에선 무의미하다
+                #   (플래너가 새로 깐다). 품질이 중요한 건 접촉 구간 두 곳뿐이다.
                 "keyboard": Se3KeyboardCfg(
                     pos_sensitivity=0.05,
                     rot_sensitivity=0.05,
                     sim_device=self.sim.device,
                 ),
                 # 게임패드: 아날로그 스틱이라 연속 조작이 되므로 감도를 키워도
-                # 궤적이 매끄럽다. dead_zone 은 스틱 중립에서의 드리프트를 막는다 —
-                # 이게 없으면 손을 떼도 팔이 천천히 흐르면서 "일시정지 없는 데모"
-                # 체크리스트를 만족시키기 어려워진다.
+                # 궤적이 매끄럽다. dead_zone 은 스틱 중립에서의 드리프트를 막는다.
                 "gamepad": Se3GamepadCfg(
                     pos_sensitivity=1.0,
                     rot_sensitivity=1.6,
@@ -445,8 +441,8 @@ class PickPlaceVisuomotorEnvCfg(PickPlaceEnvCfg):
     """카메라 관측을 반드시 켜야 하는 변형. `--enable_cameras` 와 함께 쓴다.
 
     현재는 기본 cfg 도 카메라를 포함하고 있어 내용이 같지만, 클래스를 분리해 둔다:
-    나중에 상태 기반 생성(계획서 §3-3 선택지 B)으로 전환할 때 기본 cfg 에서
-    카메라를 떼어내는 것이 이 구조라면 한 줄로 끝난다.
+    나중에 상태 기반 생성으로 전환할 때 기본 cfg 에서 카메라를 떼어내는 것이
+    이 구조라면 한 줄로 끝난다.
     """
 
     pass

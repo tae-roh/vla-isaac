@@ -118,7 +118,7 @@ def main() -> int:
             isaaclab_python=args.isaaclab_python,
             worker_script=REPO_ROOT / "rft" / "isaaclab_rollout_worker.py",
             num_envs=args.num_envs,
-            task="VlaPick-v0",
+            task="VlaPlace-v0",
             startup_timeout=args.timeout,
         )
         t0 = time.time()

@@ -141,9 +141,9 @@ def main() -> int:
 
         def _registered():
             expected = [
-                "VlaPick-v0",
-                "VlaPick-Mimic-v0",
-                "VlaPick-Visuomotor-Mimic-v0",
+                "VlaPlace-v0",
+                "VlaPlace-Mimic-v0",
+                "VlaPlace-Visuomotor-Mimic-v0",
             ]
             missing = [t for t in expected if t not in gym.registry]
             if missing:
@@ -162,9 +162,9 @@ def main() -> int:
             from isaaclab_tasks.utils import parse_env_cfg
 
             env_cfg = parse_env_cfg(
-                "VlaPick-Visuomotor-Mimic-v0", device="cuda:0", num_envs=2
+                "VlaPlace-Visuomotor-Mimic-v0", device="cuda:0", num_envs=2
             )
-            env = gym.make("VlaPick-Visuomotor-Mimic-v0", cfg=env_cfg)
+            env = gym.make("VlaPlace-Visuomotor-Mimic-v0", cfg=env_cfg)
             env_holder["env"] = env
             return f"num_envs=2, action_space={env.action_space.shape}"
 
@@ -172,7 +172,7 @@ def main() -> int:
         def _teleop_devices():
             from isaaclab_tasks.utils import parse_env_cfg
 
-            cfg = parse_env_cfg("VlaPick-v0", device="cuda:0", num_envs=1)
+            cfg = parse_env_cfg("VlaPlace-v0", device="cuda:0", num_envs=1)
             devices = getattr(cfg, "teleop_devices", None)
             if devices is None:
                 raise AssertionError(
@@ -226,7 +226,20 @@ def main() -> int:
                     raise AssertionError(
                         f"카메라 관측 shape {tuple(img.shape)} — 기대 (N, {expected})"
                     )
-                return f"obs['{cam_key}'] {tuple(img.shape)}, dtype={img.dtype}"
+                # 타깃 지정이 실제로 들어왔는가. 이게 없으면 지시문을 만들 수
+                # 없고, 그대로 데이터를 만들면 언어 채널이 통째로 죽는다.
+                if "target_ids" not in policy_obs:
+                    raise AssertionError(
+                        "관측에 target_ids 가 없다. EventCfg 의 "
+                        "reset_scene_from_bank 와 ObservationsCfg 의 target_ids "
+                        f"항을 확인할 것. 있는 키: {list(policy_obs.keys())}"
+                    )
+                ids = policy_obs["target_ids"].detach().cpu().numpy().astype(int)
+                instr = [spec.instruction_for(b, s) for b, s in ids]
+                return (
+                    f"obs['{cam_key}'] {tuple(img.shape)}, dtype={img.dtype} / "
+                    f"지시문 예: {instr}"
+                )
 
             check("리셋·1스텝·카메라 관측 shape", _step_and_check_obs)
 

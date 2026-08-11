@@ -44,9 +44,16 @@ OpenVLA 규약(224×224 / 단일 3인칭 뷰 / uint8 / center crop 0.9 / 7·8·8
 
 ## 프로젝트 한 줄 요약
 
-Isaac Lab에서 형상 랜덤화된 자재를 집어 목표 영역으로 옮기는 태스크를 만들고,
-OpenVLA-OFT를 SFT한 뒤 GRPO로 RFT까지 3~4일 안에 완주한다. Franka Emika Panda.
-전체 실행 순서는 `docs/RUNBOOK.md`.
+Isaac Lab에서 **얕은 박스 안의 블록 3개 중 지시문이 지정한 하나를 꺼내 지정된
+맞춤 포켓에 안착**시키는 태스크를 만들고, OpenVLA-OFT를 SFT한 뒤 GRPO로 RFT까지
+완주한다. Franka Emika Panda. 핵심 결과물은 포켓 클리어런스를 조여 가며 그린
+`SR_SFT(c)` vs `SR_SFT+RL(c)` 곡선. 전체 실행 순서는 `docs/RUNBOOK.md`.
+
+> 태스크는 `vla-project-revisions.md` 로 한 번 개정되었다. 옛 태스크 이름
+> (`VlaPick-*`)과 형상 랜덤 자재(`materials.py`)는 사라졌다. 스모크 테스트에서
+> 처음 보게 될 새 항목은 초기 상태 뱅크(`datasets/init_states/*.npz`)와
+> 관측의 `target_ids` 다 — 뱅크 파일이 없으면 `train` 은 자동 생성되지만
+> 평가용 `eval_base` 는 `scripts/make_init_states.py` 로 만들어야 한다.
 
 ## 환경
 

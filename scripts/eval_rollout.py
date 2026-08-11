@@ -8,14 +8,21 @@ Isaac Sim 은 rft/ipc_bridge.py 를 통해 별도 프로세스로 돌아간다.
   맞다는 뜻이고, 그때부터 RFT 는 GRPO 루프를 붙이는 배선 작업이 된다.
   여기서 막히면 계획서의 fallback 트리거를 당길 근거가 된다.
 
-사용 예:
-    # SFT 베이스라인 (강체)
-    python scripts/eval_rollout.py --checkpoint runs/sft/step-20000 \
-        --task VlaPick-v0 --num-envs 8 --num-episodes 32
+평가 프로토콜 (개정 §6): 홀드아웃 초기 상태를 **시드가 아니라 뱅크 인덱스로**
+고정한다. 같은 파일을 쓰는 한 SFT 와 RFT 가 정확히 같은 씬에서 비교된다.
 
-    # 변형체 (out-of-distribution)
+사용 예:
+    # Base split — 기본 클리어런스
     python scripts/eval_rollout.py --checkpoint runs/sft/step-20000 \
-        --task VlaPick-Deformable-v0 --num-envs 4 --num-episodes 16
+        --task VlaPlace-v0 --num-envs 8 --num-episodes 64
+
+    # Tolerance split — 클리어런스 곡선의 점 하나 (태스크 이름이 공차를 담는다)
+    python scripts/eval_rollout.py --checkpoint runs/sft/step-20000 \
+        --task VlaPlace-c1mm-v0 --num-episodes 64
+
+    # Language split — 지시문 rephrase (씬은 그대로)
+    python scripts/eval_rollout.py --checkpoint runs/sft/step-20000 \
+        --rephrase 0 --num-episodes 64
 
     # 정책 없이 브리지만 검증 (랜덤 액션)
     python scripts/eval_rollout.py --random-policy --num-episodes 4
@@ -50,7 +57,7 @@ def load_policy(args):
     if args.random_policy:
         rng = np.random.default_rng(0)
 
-        def predict(images: np.ndarray) -> np.ndarray:
+        def predict(images: np.ndarray, instructions: list[str]) -> np.ndarray:
             n = images.shape[0]
             a = rng.uniform(
                 -0.3, 0.3, size=(n, SPEC.NUM_ACTIONS_CHUNK, SPEC.ACTION_DIM)
@@ -86,11 +93,13 @@ def load_policy(args):
             "SFT 때와 다르면 액션이 통째로 어긋난다 — 반드시 확인할 것."
         )
 
-    prompt = SPEC.build_prompt()
-
-    def predict(images: np.ndarray) -> np.ndarray:
+    def predict(images: np.ndarray, instructions: list[str]) -> np.ndarray:
+        # ★ 프롬프트는 env 마다 다르다. 타깃 블록·슬롯이 env 마다 다르기 때문이다.
+        #   지시문 문자열은 환경이 관측으로 내려 준다 (obs["instruction"]) —
+        #   여기서 따로 만들면 SFT 데이터의 문장과 어긋날 여지가 생긴다.
         chunks = []
         for i in range(images.shape[0]):
+            prompt = SPEC.build_prompt(instructions[i])
             # center crop 포함 (학습이 --image_aug True 이므로 필수).
             pil = SPEC.prepare_image_for_vla(images[i])
             inputs = processor(prompt, pil).to(args.device, dtype=torch.bfloat16)
@@ -125,9 +134,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--random-policy", action="store_true")
-    parser.add_argument("--task", default="VlaPick-v0")
+    parser.add_argument("--task", default="VlaPlace-v0")
     parser.add_argument("--num-envs", type=int, default=8)
-    parser.add_argument("--num-episodes", type=int, default=32)
+    parser.add_argument("--num-episodes", type=int, default=SPEC.EVAL_HOLDOUT_SIZE)
+    parser.add_argument(
+        "--bank", default="eval_base",
+        help="초기 상태 뱅크 이름. 평가는 반드시 홀드아웃 뱅크를 쓴다 "
+             "(scripts/make_init_states.py 로 생성).",
+    )
+    parser.add_argument(
+        "--rephrase", type=int, default=None,
+        help="Language split: SPEC.INSTRUCTION_TEMPLATES_EVAL 의 인덱스",
+    )
     parser.add_argument("--max-steps", type=int, default=SPEC.MAX_EPISODE_STEPS)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--unnorm-key", default="vla_pick")
@@ -162,15 +180,33 @@ def main() -> int:
     episode_lengths: list[int] = []
     t_start = time.time()
 
+    template = (
+        None if args.rephrase is None
+        else SPEC.INSTRUCTION_TEMPLATES_EVAL[args.rephrase]
+    )
+    if template:
+        print(f"[eval] Language split — 지시문 템플릿: {template!r}")
+
     try:
         for rnd in range(num_rounds):
-            obs = client.reset(seeds=[rnd * 1000])
+            # 홀드아웃을 순서대로 훑는다. 시드가 아니라 인덱스로 고정하므로
+            # 재실행·다른 체크포인트에서도 **정확히 같은 씬**이 나온다.
+            indices = [
+                (rnd * args.num_envs + i) % SPEC.EVAL_HOLDOUT_SIZE
+                for i in range(args.num_envs)
+            ]
+            obs = client.reset(
+                init_indices=indices,
+                bank=args.bank,
+                instruction_template=template,
+                seeds=[rnd * 1000],
+            )
             done = np.zeros(args.num_envs, dtype=bool)
             reward = np.zeros(args.num_envs, dtype=np.float32)
             steps_taken = 0
 
             for _ in range(steps_per_round):
-                chunk = predict(obs["image"])
+                chunk = predict(obs["image"], obs["instruction"])
                 obs, reward, done = client.step(chunk)
                 steps_taken += SPEC.NUM_ACTIONS_CHUNK
                 if bool(done.all()):
@@ -201,17 +237,18 @@ def main() -> int:
     print(f"{'=' * 60}")
 
     # 완료 기준 대비 해석을 같이 찍어 준다 — 숫자만 보고 넘어가지 않게.
+    # 개정 §5 의 게이트: SFT 성공률이 낮으면 RL 이 아무것도 개선하지 못한다.
     if not args.random_policy:
-        if args.task == "VlaPick-v0":
-            if success_rate >= 0.6:
-                print("→ 계획서 완료 기준(강체 ≥60~70%) 충족. RFT 로 진행 가능.")
-            elif success_rate > 0:
-                print(f"→ 완료 기준(60%)에 못 미치지만 0 은 아니다. "
-                      "SimpleVLA-RL 은 데모 1개 SFT(17.3%)에서도 RL 로 91.7% 까지 올렸다 "
-                      "— RFT 진행 가치가 있다.")
-            else:
-                print("→ 성공률 0. RFT 를 시작해도 학습 신호가 없다. "
-                      "SFT 데이터/설정을 먼저 점검할 것 (관측 스펙 대조부터).")
+        if success_rate >= 0.30:
+            print("→ RL 게이트(≥30%) 통과. 이 split 에서 RFT 를 돌릴 수 있다.")
+        elif success_rate > 0.05:
+            print(f"→ 성공률 {success_rate:.1%} — 게이트(30%) 미만이다. "
+                  "이 split 에서 RL 을 돌리면 개선폭이 나오지 않을 공산이 크다. "
+                  "더 헐거운 클리어런스부터 곡선을 그릴 것.")
+        else:
+            print("→ 성공률 5% 미만. RL 에 학습 신호가 없다 "
+                  "(개정 §5 임계값). 헐거운 공차 split 으로 내려가거나 "
+                  "SFT 데이터/스펙부터 점검할 것.")
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -220,6 +257,10 @@ def main() -> int:
                 {
                     "task": args.task,
                     "checkpoint": args.checkpoint,
+                    # split 을 특정하는 세 값. 이게 없으면 나중에 곡선을 그릴 때
+                    # 각 점이 무슨 조건이었는지 알 수 없다.
+                    "bank": args.bank,
+                    "rephrase": args.rephrase,
                     "num_episodes": len(successes),
                     "success_rate": success_rate,
                     "successes": successes,

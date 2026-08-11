@@ -14,11 +14,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.assets import RigidObject
 from isaaclab.managers import SceneEntityCfg
 
 from ..spec import SPEC
-from .observations import placed_signal
+from .observations import placed_signal, target_block_pose
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -29,7 +28,7 @@ _HOLD_COUNTER_ATTR = "_vla_success_hold_counter"
 def task_success(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
     hold_steps: int = SPEC.SUCCESS_HOLD_STEPS,
 ) -> torch.Tensor:
     """성공 조건이 hold_steps 연속으로 유지되면 True. Shape (num_envs,).
@@ -44,11 +43,11 @@ def task_success(
 
       부수 효과로 "물체를 놓자마자 굴러 나가는" 가짜 성공도 걸러진다.
 
-    카운터는 조건이 깨지면 0 으로 돌아간다. 에피소드 리셋 시 자재는 목표 영역
-    밖에 스폰되므로(이벤트의 pose_range 가 목표와 겹치지 않게 잡혀 있다)
-    첫 스텝에서 조건이 False 가 되어 카운터가 자연히 초기화된다.
+    카운터는 조건이 깨지면 0 으로 돌아간다. 에피소드 리셋 시 블록은 전부 박스
+    안에 스폰되고 grasped_during_lift 래치도 꺼져 있으므로, 첫 스텝에서 조건이
+    False 가 되어 카운터가 자연히 초기화된다.
     """
-    cond = placed_signal(env, robot_cfg=robot_cfg, object_cfg=object_cfg)
+    cond = placed_signal(env, robot_cfg=robot_cfg, ee_frame_cfg=ee_frame_cfg)
 
     counter = getattr(env, _HOLD_COUNTER_ATTR, None)
     if counter is None or counter.shape[0] != env.num_envs:
@@ -63,14 +62,15 @@ def task_success(
 
 def object_dropped(
     env: "ManagerBasedRLEnv",
-    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
     minimum_height: float = -0.05,
 ) -> torch.Tensor:
-    """자재가 테이블 아래로 떨어졌으면 True — 에피소드를 조기 종료한다.
+    """타깃 블록이 테이블 아래로 떨어졌으면 True — 에피소드를 조기 종료한다.
 
     떨어진 뒤에도 계속 굴리면 롤아웃 시간만 낭비된다. RFT 에서는 이 조기 종료가
     스텝당 비용을 눈에 띄게 줄여 준다.
+
+    타깃이 아닌 블록이 떨어지는 것은 종료 사유가 아니다 — 성공 술어가 타깃만
+    보므로 그 에피소드는 그대로 실패로 끝난다. 굳이 다른 종료 경로를 만들면
+    "왜 끝났는지" 해석만 늘어난다.
     """
-    obj: RigidObject = env.scene[object_cfg.name]
-    z_local = obj.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
-    return z_local < (SPEC.TABLE_HEIGHT + minimum_height)
+    return target_block_pose(env)[:, 2] < (SPEC.TABLE_HEIGHT + minimum_height)

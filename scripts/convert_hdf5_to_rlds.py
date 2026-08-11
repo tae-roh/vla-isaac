@@ -54,6 +54,7 @@ def inspect_hdf5(paths: list[Path]) -> dict:
     all_actions: list[np.ndarray] = []
     lengths: list[int] = []
     total_demos = 0
+    instructions: list[str] = []
 
     for path in paths:
         with h5py.File(path, "r") as f:
@@ -67,6 +68,9 @@ def inspect_hdf5(paths: list[Path]) -> dict:
                 all_actions.append(actions)
                 lengths.append(len(actions))
                 total_demos += 1
+                if "target_ids" in demo["obs"]:
+                    tb, ts = np.asarray(demo["obs"]["target_ids"])[0][:2]
+                    instructions.append(SPEC.instruction_for(int(tb), int(ts)))
 
             if demo_keys:
                 sample = data[demo_keys[0]]
@@ -94,6 +98,23 @@ def inspect_hdf5(paths: list[Path]) -> dict:
         print("  [WARN] 궤적이 전반적으로 길다. 계획서 §Phase2 품질 체크리스트의 "
               "'궤적이 짧은가 / 일시정지가 없는가' 를 다시 볼 것 — "
               "긴 궤적은 RFT 스텝 시간을 그대로 늘린다.")
+
+    # 지시문 분포 — 언어 채널이 살아 있는지 여기서 본다.
+    # 한 문장만 나오면 모델은 지시문을 무시하는 법을 배운다. 증강이 원본 데모의
+    # 타깃만 따라가면 이런 데이터가 나온다 (SubTaskConfig.object_ref 확인).
+    if not instructions:
+        print("\n  [WARN] obs 에 target_ids 가 없다 — 개정 이전 데이터셋이다. "
+              "RLDS 변환이 거부하므로 다시 생성할 것.")
+    else:
+        import collections
+
+        counts = collections.Counter(instructions)
+        print(f"\n  지시문 {len(counts)}종 / 데모 {len(instructions)}개")
+        for text, c in counts.most_common(10):
+            print(f"    {c:5d}× {text}")
+        if len(counts) < 2:
+            print("  [WARN] 지시문이 한 종류뿐이다. 이 데이터로 학습하면 정책이 "
+                  "언어를 무시해도 손해가 없다 — 증강 설정을 다시 볼 것.")
 
     if stacked.shape[-1] != SPEC.ACTION_DIM:
         raise ValueError(

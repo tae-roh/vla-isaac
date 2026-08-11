@@ -9,8 +9,8 @@
 |---|---|---|
 | 1 | 1× L40S (포트 개방) | 환경 3종 동작 + 데모 12~15개 + 야간 증강 배치 |
 | 2 | L40S 유지 + H100 신규 | RLDS 데이터셋 / SFT 착수 ∥ RFT 인프라 |
-| 3 | RFT 인스턴스 (2~4× L40S) | SFT 베이스라인 + 강체 RFT 착수 |
-| 4 | 동일 | **강체 RFT 개선 커브 (핵심 결과)** + 변형체 스트레치 |
+| 3 | RFT 인스턴스 (2~4× L40S) | split 별 SFT 베이스라인 + RFT 착수 |
+| 4 | 동일 | **클리어런스 곡선 SR_SFT(c) vs SR_SFT+RL(c) (핵심 결과)** |
 
 **Day 2 부터는 두 인스턴스가 동시에 돈다.** SFT 가 도는 동안 L40S 에서 RFT
 인프라를 만드는 것이 3~4일이 성립하는 이유다 — SFT 를 기다리지 않는다.
@@ -63,39 +63,56 @@ cd "$(git -C ~/workspace/vla-isaac rev-parse --show-toplevel 2>/dev/null || echo
 
 ### 1-2. 씬 확인 + 카메라 확정 (~1시간) ★ 되돌릴 수 없는 결정
 
+먼저 **초기 상태 뱅크**를 만든다 (개정 §3). Isaac Sim 없이 몇 초면 끝나지만,
+나중에 붙이면 그 전 실험 결과가 전부 재현 불가가 되므로 여기서 한다.
+
+```bash
+python scripts/make_init_states.py --name train
+python scripts/make_init_states.py --name eval_base      # 평가 홀드아웃 64개
+git add datasets/init_states && git commit -m "초기 상태 뱅크"
+```
+
 ```bash
 export PUBLIC_IP=$(curl -s ifconfig.me)
-python scripts/dump_obs_reference.py --task VlaPick-v0 --save \
+python scripts/dump_obs_reference.py --task VlaPlace-v0 --save \
     --out datasets/obs_reference --num-frames 8 --livestream 2
 ```
 
+> 저장소에 커밋된 `datasets/obs_reference/*.png` 는 **태스크 개정 전** 씬이다
+> (자재 1개 + 목표 원판). 위 명령으로 덮어써서 새 씬 레퍼런스를 만들어야 하고,
+> Phase 4 스펙 대조는 새로 만든 것과 해야 한다.
+
 저장된 PNG 를 **반드시 눈으로 볼 것**:
-- [ ] 자재와 목표 영역이 모두 화면 안에 있는가
+- [ ] 박스(블록 3개)와 포켓 트레이가 **둘 다** 화면 안에 있는가
+- [ ] 블록 3색이 서로 구분되는가 (구분이 안 되면 언어 채널이 죽는다)
+- [ ] **슬롯 좌우가 지시문의 left/right 와 맞는가** — 카메라가 로봇을 마주 보므로
+      화면 좌우가 뒤집혀 보일 수 있다. 어긋나면 `SPEC.SLOT_Y_SIGN` 을 -1 로.
+      에러 없이 언어 채널만 조용히 망가지는 종류의 문제다.
 - [ ] 파지 순간이 로봇 팔에 가려지지 않는가
 - [ ] 이미지가 뒤집혀 있지 않은가 (뒤집혔으면 `configs/vla_spec.py` 의 `ROTATE_IMAGE_180`)
 
 맞지 않으면 `configs/vla_spec.py` 의 `CAMERA_POS` / `CAMERA_ROT` 을 고치고 다시.
 **여기서 확정한 카메라 설정이 곧 RFT 설정이다. Phase 2 이후에는 바꿀 수 없다.**
 
-> **확정 완료** (2026-08-10): `CAMERA_POS=(1.2, 0.0, 0.8)`,
+> **카메라 확정 완료** (2026-08-10): `CAMERA_POS=(1.2, 0.0, 0.8)`,
 > `CAMERA_ROT=(0.32818, -0.66487, -0.6017, 0.297)`. 초기값은 시선이 작업공간이 아니라
 > 로봇 베이스를 향해 목표 영역 중심이 프레임 밖(u=225.0)이었다. focal·해상도·
 > center crop 등 OpenVLA 규약 항목은 건드리지 않았고 위치와 조준만 바꿨다.
 >
-> 이제 `configs/vla_spec.py` 의 `assert_workspace_visible()` 이 스펙 자체 검사로
-> "자재 스폰 범위 + 목표 영역이 center crop 후에도 화면 안" 을 확인한다. Isaac Sim
-> 없이 도는 순수 계산이라 `python configs/vla_spec.py` 만으로도 즉시 검증된다 —
-> 카메라를 다시 만질 일이 생기면 렌더 전에 이걸 먼저 볼 것.
+> `configs/vla_spec.py` 의 `assert_workspace_visible()` 이 스펙 자체 검사로
+> "작업공간이 center crop 후에도 화면 안" 을 확인한다. Isaac Sim 없이 도는 순수
+> 계산이라 `python configs/vla_spec.py` 만으로 즉시 검증된다 — 카메라를 다시 만질
+> 일이 생기면 렌더 전에 이걸 먼저 볼 것.
+>
+> **태스크 개정 후 검사 대상이 바뀌었다**: 자재 스폰 범위 + 목표 영역 → **소스
+> 박스 내부 + 포켓 트레이 + 리프트 높이**. 카메라 값은 그대로 두고 ROI 만 새
+> 지오메트리로 옮겼으며, 같은 검사를 통과한다.
 
-### 1-3. 변형체 예비 테스트 (15~20분, 타임박스 엄수)
+### 1-3. 변형체 — 지금은 하지 않는다
 
-```bash
-python scripts/test_deformable_grasp.py --headless --youngs 5e5 1e5 5e4
-```
-
-권장 영률만 받아 적고 `source/vla_isaac_tasks/deformable_env_cfg.py` 에 반영한 뒤 **넘어간다.**
-여기서 물리 튜닝에 빠지면 일정이 무너진다. 어떤 값에서도 파지가 안 되면
-변형체는 스트레치에서 제외하고 강체에 집중한다.
+개정 §8 로 변형체는 후속 확장으로 밀렸고, 시작점도 체적 FEM 이 아니라 **박막(2D)**
+으로 바뀌었다. `deformable_env_cfg.py` 는 등록조차 하지 않았다 (파일 머리말 참조).
+이 시간은 §1-4 데모 수집에 쓴다.
 
 ### 1-4. 텔레옵 데모 수집 (~2시간)
 
@@ -104,10 +121,10 @@ python scripts/test_deformable_grasp.py --headless --youngs 5e5 1e5 5e4
 `.pth` 자동 등록이 없으면 `NameNotFound` 로 죽는다.
 
 ```bash
-python -c "import gymnasium as gym; print([k for k in gym.registry if k.startswith('VlaPick')])"
-# 4개가 나와야 한다. 비어 있으면 먼저 어느 쪽 문제인지 가른다:
-#   python -c "import vla_isaac_tasks; import gymnasium as gym; print([k for k in gym.registry if k.startswith('VlaPick')])"
-#     → 4개 나오면 .pth 만 안 걸린 것 / 에러 나면 패키지 설치 문제
+python -c "import gymnasium as gym; print([k for k in gym.registry if k.startswith('VlaPlace')])"
+# 15개가 나와야 한다 (기본 3종 + 클리어런스 4단계 x 3종). 비어 있으면 먼저 어느 쪽 문제인지 가른다:
+#   python -c "import vla_isaac_tasks; import gymnasium as gym; print([k for k in gym.registry if k.startswith('VlaPlace')])"
+#     → 이쪽에서 나오면 .pth 만 안 걸린 것 / 에러 나면 패키지 설치 문제
 #
 # .pth 재설치 (경로는 반드시 sysconfig 로 — site.getsitepackages()[0] 은
 # venv 안에서도 베이스 파이썬 경로를 돌려줄 수 있어 조용히 무시된다):
@@ -118,7 +135,7 @@ python -c "import gymnasium as gym; print([k for k in gym.registry if k.startswi
 ```bash
 mkdir -p datasets
 python $ISAACLAB_DIR/scripts/tools/record_demos.py \
-    --task VlaPick-v0 --teleop_device keyboard --enable_cameras \
+    --task VlaPlace-v0 --teleop_device keyboard --enable_cameras \
     --dataset_file ./datasets/source.hdf5 --num_demos 15 \
     --step_hz 24 --livestream 2
 ```
@@ -141,7 +158,7 @@ python $ISAACLAB_DIR/scripts/tools/record_demos.py \
 
 ```bash
 python $ISAACLAB_DIR/scripts/tools/record_demos.py \
-    --task VlaPick-v0 --teleop_device gamepad --enable_cameras \
+    --task VlaPlace-v0 --teleop_device gamepad --enable_cameras \
     --dataset_file ./datasets/source.hdf5 --num_demos 15 \
     --step_hz 24 --livestream 2
 ```
@@ -153,7 +170,7 @@ python $ISAACLAB_DIR/scripts/tools/record_demos.py \
 ```bash
 # 재생 검증 — 물리 비결정성으로 일부는 실패한다. 넉넉히 수집했으면 정상.
 python $ISAACLAB_DIR/scripts/tools/replay_demos.py \
-    --task VlaPick-v0 --enable_cameras --dataset_file ./datasets/source.hdf5
+    --task VlaPlace-v0 --enable_cameras --dataset_file ./datasets/source.hdf5
 ```
 
 ### 1-5. 어노테이션 + 시험 생성 (~1시간) ★ 조기 경보 지점
@@ -174,13 +191,13 @@ python -c "import curobo; print('SkillGen 사용 가능')"
 # 어노테이션 — SkillGen 은 시작 경계가 필수다.
 # --annotate_subtask_start_signals 를 빼면 생성이 실패한다.
 python $ISAACLAB_DIR/scripts/imitation_learning/isaaclab_mimic/annotate_demos.py \
-    --task VlaPick-Visuomotor-Mimic-v0 --auto --enable_cameras \
+    --task VlaPlace-Visuomotor-Mimic-v0 --auto --enable_cameras \
     --annotate_subtask_start_signals \
     --input_file ./datasets/source.hdf5 --output_file ./datasets/annotated.hdf5
 
 # 소량 시험 생성 — 성공률을 여기서 본다
 python $ISAACLAB_DIR/scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
-    --task VlaPick-Visuomotor-Mimic-v0 --enable_cameras --use_skillgen \
+    --task VlaPlace-Visuomotor-Mimic-v0 --enable_cameras --use_skillgen \
     --num_envs 10 --generation_num_trials 20 \
     --input_file ./datasets/annotated.hdf5 --output_file ./datasets/generated_small.hdf5
 ```
@@ -191,12 +208,12 @@ python $ISAACLAB_DIR/scripts/imitation_learning/isaaclab_mimic/generate_dataset.
 
 ```bash
 python $ISAACLAB_DIR/scripts/imitation_learning/isaaclab_mimic/annotate_demos.py \
-    --task VlaPick-Visuomotor-Mimic-v0 --auto --enable_cameras \
+    --task VlaPlace-Visuomotor-Mimic-v0 --auto --enable_cameras \
     --input_file ./datasets/source.hdf5 --output_file ./datasets/annotated.hdf5
 #   ↑ --annotate_subtask_start_signals 없음
 
 python $ISAACLAB_DIR/scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
-    --task VlaPick-Visuomotor-Mimic-v0 --enable_cameras \
+    --task VlaPlace-Visuomotor-Mimic-v0 --enable_cameras \
     --num_envs 10 --generation_num_trials 20 \
     --input_file ./datasets/annotated.hdf5 --output_file ./datasets/generated_small.hdf5
 #   ↑ --use_skillgen 없음
@@ -224,7 +241,7 @@ Isaac Sim 6.0 API 를 기대하는 것이다(문서가 6.0.0 기준, 우리는 5
 ```bash
 tmux new -s gen
 python $ISAACLAB_DIR/scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
-    --task VlaPick-Visuomotor-Mimic-v0 --enable_cameras --headless --use_skillgen \
+    --task VlaPlace-Visuomotor-Mimic-v0 --enable_cameras --headless --use_skillgen \
     --num_envs 30 --generation_num_trials 3000 \
     --input_file ./datasets/annotated.hdf5 --output_file ./datasets/generated.hdf5
 ```
@@ -299,16 +316,21 @@ python env/smoke/check_rft.py --full
 이게 통과하면 남은 RFT 작업은 GRPO 루프 배선뿐이다. 통과하지 못하면
 `rft/README.md` 의 "흔한 실패와 해석" 표부터 볼 것.
 
-### 2-4. [L40S, 선택] 변형체 데모 수집
+### 2-4. [L40S, 선택] 타이트한 split 의 생성 수율 측정
 
-강체 RFT 가 우선이다. 시간이 남을 때만:
+시간이 남으면 클리어런스를 조인 split 에서 **소량 생성**을 돌려 수율을 잰다.
+수율은 그 자체로 난이도의 사전 지표다 (개정 §4-4) — 조일수록 떨어지므로,
+Day 4 에 그 split 을 쓰려면 시도 횟수를 얼마나 늘려야 하는지 여기서 역산한다.
 
 ```bash
-python $ISAACLAB_DIR/scripts/tools/record_demos.py \
-    --task VlaPick-Deformable-v0 --teleop_device keyboard --enable_cameras \
-    --dataset_file ./datasets/deformable_source.hdf5 --num_demos 20 \
-    --step_hz 24 --livestream 2
+python $ISAACLAB_DIR/scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
+    --task VlaPlace-c1mm-Visuomotor-Mimic-v0 --enable_cameras --headless --use_skillgen \
+    --num_envs 10 --generation_num_trials 20 \
+    --input_file ./datasets/annotated.hdf5 --output_file ./datasets/gen_c1mm_small.hdf5
 ```
+
+> 어노테이션 파일은 공유해도 된다. 클리어런스는 포켓 레일 지오메트리만 바꾸므로
+> 사람 데모의 서브태스크 경계는 그대로 유효하다.
 
 ---
 
@@ -336,26 +358,39 @@ python scripts/dump_obs_reference.py --compare datasets/obs_reference \
 라이브 뷰포트로는 검출할 수 없는 종류의 불일치다. 여기서 잡지 않으면
 "RFT 커브가 오르지 않는다" 는 형태로만 드러나고 원인 추적에 며칠이 든다.
 
-### 3-3. 베이스라인 성공률
+### 3-3. 베이스라인 성공률 — 클리어런스 곡선의 SFT 쪽 절반
 
 ```bash
-python scripts/eval_rollout.py --checkpoint ckpt/sft \
-    --task VlaPick-v0 --num-episodes 32 --out logs/baseline_rigid.json
-
-python scripts/eval_rollout.py --checkpoint ckpt/sft \
-    --task VlaPick-Deformable-v0 --num-episodes 16 --out logs/baseline_deformable.json
+for T in c5mm c2mm c1mm c0p5mm; do
+  python scripts/eval_rollout.py --checkpoint ckpt/sft \
+      --task VlaPlace-${T}-v0 --out logs/sft_${T}.json
+done
 ```
 
-해석: 강체 60% 이상이면 계획대로. 60% 미만이어도 **0 이 아니면 진행한다** —
-SimpleVLA-RL 은 데모 1개 SFT(17.3%)에서 RL 로 91.7% 까지 올렸다.
-0 이면 RFT 에 학습 신호가 없으므로 데이터/스펙부터 다시 본다.
+평가는 `eval_base` 홀드아웃 64개를 **인덱스 순서대로** 돈다. 시드가 아니라
+파일이라, 나중에 RFT 체크포인트를 재면 정확히 같은 씬에서 비교된다.
+
+해석 (개정 §5 게이트):
+- **≥30%** → 그 split 에서 RL 을 돌린다
+- 5~30% → RL 개선폭이 나오기 어렵다. 더 헐거운 split 부터 곡선을 그린다
+- <5% → 학습 신호가 없다. 데이터/스펙부터 본다
+
+**모든 split 이 0 이면** 공차 문제가 아니라 파이프라인 문제다. 진단항
+`grasp_lift_diag` (파지·리프트까지는 되는가) 와 `yaw_diag` (각도) 를 먼저 볼 것.
+
+추가로 Language split 도 여기서 한 번 재 둔다 (씬은 그대로, 문장만 바꾼다):
+
+```bash
+python scripts/eval_rollout.py --checkpoint ckpt/sft --rephrase 0 \
+    --out logs/sft_lang0.json
+```
 
 ### 3-4. ⚠ Fallback 트리거 — 정오 판단
 
 **정오까지 어댑터로 롤아웃 1회가 안 돌면 자작 GRPO 로 전환한다.**
 환경·보상·브리지·평가가 전부 재사용되므로 전환 비용은 RL 루프뿐이다.
 
-### 3-5. 강체 RFT 착수
+### 3-5. RFT 착수 (게이트를 통과한 split 부터)
 
 ```bash
 tmux new -s rft
@@ -375,28 +410,33 @@ ssh -L 6006:localhost:6006 <서버>
 
 ## Day 4 — 결과 확보
 
-### 4-1. 커브 확인 + 개선폭 측정
+### 4-1. 클리어런스 곡선 — 이 프로젝트의 핵심 결과물
+
+RL 을 돌린 split 마다 같은 홀드아웃으로 다시 잰다:
 
 ```bash
-python scripts/eval_rollout.py --checkpoint logs/grpo_rigid/checkpoint-<N> \
-    --task VlaPick-v0 --num-episodes 32 --out logs/rft_rigid.json
+python scripts/eval_rollout.py --checkpoint logs/grpo_c5mm/checkpoint-<N> \
+    --task VlaPlace-c5mm-v0 --out logs/rft_c5mm.json
 ```
 
-`logs/baseline_rigid.json` 과 비교한 것이 **이 프로젝트의 핵심 결과**다.
+`logs/sft_c*.json` 과 나란히 놓은 것이 `SR_SFT(c)` vs `SR_SFT+RL(c)` 다.
+**실패 구간도 결과다** — 공차가 너무 빡빡해 SFT 가 바닥이면 RL 도 실패한다는
+임계값 현상이 같은 그래프에 담긴다. 점이 3개만 있어도 곡선은 성립한다.
 
 ### 4-2. 커브가 오르지 않을 때
 
 로그의 `무신호그룹` 비율부터 본다:
-- ~100% → `temperature` 를 1.4 → 1.6 으로 (그룹이 전멸/전승으로 쏠림)
-- 낮은데도 평평 → `grasp_lift_diag` 진단항으로 파지까지는 되는지 확인
+- ~100% → `temperature` 를 올린다(1.6 → 1.8). 그룹이 전멸/전승으로 쏠린 것
+  — 전멸 쪽이면 애초에 그 split 이 게이트(30%)를 못 넘긴 것일 수 있다
+- 낮은데도 평평 → 진단항으로 어디서 막혔는지 가른다:
+  `grasp_lift_diag` 가 낮으면 박스에서 꺼내지를 못하는 것,
+  높은데 성공률이 낮으면 배치 정밀도 — `yaw_diag` 로 각도 문제인지 본다
 - 발산 → `learning_rate` 를 1e-6 → 3e-7, 또는 `kl_coef` 를 0.01 로
 
-### 4-3. 변형체 스트레치 (강체 커브 확보 + 변형체 베이스라인 > 0 일 때만)
+### 4-3. 후속 확장 (지금은 하지 않는다)
 
-```bash
-python rft/grpo_fallback.py --config rft/configs/grpo_deformable.yaml \
-    --checkpoint logs/grpo_rigid/checkpoint-<N>
-```
+embodiment 축(팔만 교체)과 변형체 박막 split. 개정 §8 참조 — 강체 곡선을
+확보한 뒤의 이야기다.
 
 ### 4-4. 마무리
 
@@ -415,6 +455,9 @@ git add -A && git commit -m "Day 4 결과" && git push
 ```bash
 # 스펙 확인 (어느 venv 에서든)
 python configs/vla_spec.py
+
+# 초기 상태 뱅크 확인
+python scripts/make_init_states.py --show eval_base
 
 # SkillGen 사용 가능 여부
 python -c "import curobo; print('SkillGen 사용 가능')"
@@ -439,6 +482,8 @@ python scripts/upload_hub.py --verify <경로>
 - `pip check` 통과를 검증 기준으로 — 이 스택에서는 불가능. 기준은 스모크 테스트
 - Phase 2 이후 `configs/vla_spec.py` 의 카메라/액션/청크 변경 — SFT 데이터를 다시 만들어야 한다
 - 시험 생성 성공률 <10% 인데 야간 배치 강행 — 밤을 통째로 날린다
+- 초기 상태 뱅크를 다시 만들고 이전 결과와 비교 — 씬이 달라져 비교가 성립하지 않는다
+- SFT 성공률 30% 미만인 split 에서 RL 돌리기 — 개선폭이 안 나온다 (개정 5절)
 - SkillGen 을 쓰면서 `--annotate_subtask_start_signals` 누락 — 시작 경계가 없으면
   생성이 실패한다. 어노테이션과 생성의 플래그는 **한 쌍으로** 맞춰야 한다
 - cuRobo 가 안 된다고 Day 1 을 통째로 쓰기 — MimicGen 후퇴는 플래그 2개다.

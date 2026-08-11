@@ -155,7 +155,7 @@ class RolloutClient:
         isaaclab_python: Path | str,
         worker_script: Path | str,
         num_envs: int = 8,
-        task: str = "VlaPick-v0",
+        task: str = "VlaPlace-v0",
         device: str = "cuda:0",
         seed: int = 0,
         startup_timeout: float = 900.0,
@@ -170,6 +170,7 @@ class RolloutClient:
         self.startup_timeout = startup_timeout
         self.extra_args = extra_args or []
         self._proc: subprocess.Popen | None = None
+        self.last_diag: dict = {}
 
     # -- 수명 관리 ----------------------------------------------------------
     def start(self) -> None:
@@ -230,13 +231,41 @@ class RolloutClient:
         self.close()
 
     # -- 명령 ---------------------------------------------------------------
-    def reset(self, seeds: list[int] | None = None, env_ids: list[int] | None = None):
+    def reset(
+        self,
+        seeds: list[int] | None = None,
+        env_ids: list[int] | None = None,
+        init_index: int | None = None,
+        init_indices: list[int] | None = None,
+        bank: str | None = None,
+        instruction_template: str | None = None,
+    ):
         """환경을 리셋하고 관측을 받는다.
 
+        Args:
+            init_index: 초기 상태 뱅크 인덱스 하나. **전 env 가 같은 s₀ 로
+                시작한다 — GRPO 그룹은 반드시 이 경로를 쓸 것.** 시드만으로는
+                배치 안의 env 들이 서로 다른 배치를 받아, advantage 가
+                "정책이 잘했는가"가 아니라 "이 env 가 쉬웠는가"를 재게 된다.
+            init_indices: env 별 인덱스. 평가 홀드아웃을 순서대로 돌 때.
+            bank: 초기 상태 뱅크 이름 (평가 split 전환).
+            instruction_template: Language split 용 rephrase 템플릿.
+
         Returns:
-            dict — {"image": (N,H,W,3) uint8, "state": (N,8) float32}
+            dict — {"image": (N,H,W,3) uint8, "state": (N,8) float32,
+                    "instruction": [N개 문자열]}
         """
-        reply = self._request({"cmd": "reset", "seeds": seeds, "env_ids": env_ids})
+        reply = self._request(
+            {
+                "cmd": "reset",
+                "seeds": seeds,
+                "env_ids": env_ids,
+                "init_index": init_index,
+                "init_indices": init_indices,
+                "bank": bank,
+                "instruction_template": instruction_template,
+            }
+        )
         return reply["obs"]
 
     def step(self, action_chunk):
@@ -251,8 +280,14 @@ class RolloutClient:
               obs    — 청크 실행 후의 관측
               reward — (N,) float32. 청크 구간 중 성공이 한 번이라도 있었으면 1.0
               done   — (N,) bool
+
+        진단값은 `self.last_diag` 에 남긴다 (보상에 섞으면 0/1 이 아니게 되어
+        GRPO 의 그룹 정규화가 망가진다):
+          lifted  — 박스에서 꺼내는 데까지 성공한 env 비율
+          yaw_err — 타깃 블록의 (대칭 접힌) yaw 오차 평균 [rad]
         """
         reply = self._request({"cmd": "step", "action_chunk": action_chunk})
+        self.last_diag = reply.get("diag", {})
         return reply["obs"], reply["reward"], reply["done"]
 
     def get_success(self):

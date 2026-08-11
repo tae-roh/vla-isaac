@@ -140,14 +140,16 @@ torchrun --standalone --nnodes 1 --nproc-per-node "${NUM_GPUS}" \
 log "SFT 완료. 다음 단계:"
 cat <<NEXT
 
-  1) 베이스라인 성공률 측정 (강체 — in-distribution)
+  1) 베이스라인 성공률 (Base split, 기본 클리어런스)
      python scripts/eval_rollout.py --checkpoint ${RUN_ROOT}/<run>/  \\
-         --task VlaPick-v0 --num-episodes 32 --out logs/baseline_rigid.json
+         --task VlaPlace-v0 --out logs/baseline_c5mm.json
 
-  2) 변형체 성공률 (out-of-distribution — RFT 개선폭의 출발점)
-     python scripts/eval_rollout.py --checkpoint ${RUN_ROOT}/<run>/  \\
-         --task VlaPick-Deformable-v0 --num-episodes 16 \\
-         --out logs/baseline_deformable.json
+  2) 클리어런스 곡선의 SFT 쪽 점들 — 이게 핵심 결과의 절반이다
+     for T in c5mm c2mm c1mm c0p5mm; do
+       python scripts/eval_rollout.py --checkpoint ${RUN_ROOT}/<run>/ \\
+           --task VlaPlace-\${T}-v0 --out logs/sft_\${T}.json
+     done
+     ★ 성공률 30% 이상인 split 에서만 RFT 를 돌린다 (개정 §5 게이트).
 
   3) 체크포인트 + 설정 업로드
      python scripts/upload_hub.py --path ${RUN_ROOT}/<run> \\

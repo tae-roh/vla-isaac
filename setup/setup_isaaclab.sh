@@ -177,7 +177,7 @@ pip install -c "${CONSTRAINTS}" -e "${REPO_ROOT}/source"
 # ★ gym 자동 등록.
 #   Isaac Lab 의 도구 스크립트들(record_demos / replay_demos / annotate_demos /
 #   generate_dataset)은 `import isaaclab_tasks` 와 `import isaaclab_mimic.envs` 만
-#   한다. 우리 패키지는 아무도 import 하지 않으므로 gym.make("VlaPick-v0") 이
+#   한다. 우리 패키지는 아무도 import 하지 않으므로 gym.make("VlaPlace-v0") 이
 #   NameNotFound 로 죽는다.
 #   .pth 파일에 적힌 `import` 줄은 인터프리터 기동 시 site 모듈이 실행해 준다
 #   (stdlib 표준 동작). 이 한 줄이면 상류 스크립트를 건드리지 않고 등록이 끝난다.
@@ -192,11 +192,12 @@ info "gym 자동 등록: ${SITE_DIR}/vla_isaac_tasks.pth"
 
 # 실제로 먹었는지 확인. 여기서 걸러야 Day 1 오후에 record_demos.py 가
 # NameNotFound 로 죽는 것을 막는다.
-REGISTERED="$(python -c "import gymnasium as gym; print(len([k for k in gym.registry if k.startswith('VlaPick')]))")"
-if [[ "${REGISTERED}" == "4" ]]; then
-    info "gym 등록 확인: VlaPick 태스크 4종"
+REGISTERED="$(python -c "import gymnasium as gym; print(len([k for k in gym.registry if k.startswith('VlaPlace')]))")"
+# 기본 3종 + 클리어런스 사다리 4단계 × 3종 = 15종.
+if [[ "${REGISTERED}" -ge 3 ]]; then
+    info "gym 등록 확인: VlaPlace 태스크 ${REGISTERED}종"
 else
-    warn "gym 자동 등록 실패 (VlaPick ${REGISTERED}종). 다음으로 원인을 확인할 것:
+    warn "gym 자동 등록 실패 (VlaPlace ${REGISTERED}종). 다음으로 원인을 확인할 것:
        python -c 'import vla_isaac_tasks'          # 임포트 자체가 되는지
        python -c 'import sysconfig; print(sysconfig.get_paths()[\"purelib\"])'"
 fi
@@ -320,7 +321,7 @@ cat <<DONE
 
  다음 단계 (Day 1) — 씬을 눈으로 확인:
    export PUBLIC_IP=\$(curl -s ifconfig.me)
-   python scripts/dump_obs_reference.py --task VlaPick-v0 --save --livestream 2
+   python scripts/dump_obs_reference.py --task VlaPlace-v0 --save --livestream 2
 
  FULL_SMOKE=1 로 돌리지 않았다면, 태스크 코드 작업 전에 한 번은 실행할 것:
    python env/smoke/check_isaaclab.py --full

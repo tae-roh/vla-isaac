@@ -17,7 +17,7 @@
 
 사용 예:
     # Phase 1 — 레퍼런스 저장 (라이브로 보면서 카메라 확정)
-    python scripts/dump_obs_reference.py --task VlaPick-v0 --save \
+    python scripts/dump_obs_reference.py --task VlaPlace-v0 --save \
         --out datasets/obs_reference --num-frames 8 --livestream 2
 
     # Phase 4 — 어댑터 관측과 대조
@@ -40,7 +40,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", default="VlaPick-v0")
+    parser.add_argument("--task", default="VlaPlace-v0")
     parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--num-frames", type=int, default=8,
                         help="저장할 프레임 수. 리셋을 반복하며 서로 다른 형상을 담는다.")
@@ -212,7 +212,10 @@ def run_save(args: argparse.Namespace) -> int:
                     "rotate_image_180": SPEC.ROTATE_IMAGE_180,
                     "action_dim": SPEC.ACTION_DIM,
                     "num_actions_chunk": SPEC.NUM_ACTIONS_CHUNK,
-                    "instruction": SPEC.TASK_INSTRUCTION,
+                    "instruction_template": SPEC.INSTRUCTION_TEMPLATE,
+                    "block_attrs": list(SPEC.BLOCK_ATTRS),
+                    "slot_names": list(SPEC.SLOT_NAMES),
+                    "pocket_clearance": SPEC.POCKET_CLEARANCE,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -222,8 +225,11 @@ def run_save(args: argparse.Namespace) -> int:
 
         print(f"\n레퍼런스 {saved}장 + spec.json → {args.out}")
         print("★ 이 PNG 들을 반드시 눈으로 확인할 것:")
-        print("   - 자재와 목표 영역이 모두 화면 안에 있는가")
-        print("   - 그리퍼가 자재에 닿는 순간이 가려지지 않는가")
+        print("   - 박스(블록 3개)와 포켓 트레이가 둘 다 화면 안에 있는가")
+        print("   - 블록 3색이 서로 구분되는가")
+        print("   - 슬롯 좌우가 지시문의 left/right 와 맞는가 "
+              "(어긋나면 SPEC.SLOT_Y_SIGN 을 -1 로)")
+        print("   - 그리퍼가 블록에 닿는 순간이 가려지지 않는가")
         print("   - 이미지가 뒤집혀 있지 않은가 (뒤집혀 있으면 "
               "configs/vla_spec.py 의 ROTATE_IMAGE_180 을 켤 것)")
         print("   - Phase 3·4 로 반드시 함께 가져갈 것 (부록 A 체크리스트)")

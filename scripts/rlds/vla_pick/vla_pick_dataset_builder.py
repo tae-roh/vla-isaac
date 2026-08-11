@@ -40,10 +40,19 @@ _spec_mod.loader.exec_module(SPEC)
 
 
 class VlaPick(tfds.core.GeneratorBasedBuilder):
-    """형상 랜덤화 자재 픽앤플레이스 — Isaac Lab Mimic 증강 데이터셋."""
+    """지시문 조건부 블록 배치 — Isaac Lab Mimic 증강 데이터셋.
 
-    VERSION = tfds.core.Version("1.0.0")
-    RELEASE_NOTES = {"1.0.0": "최초 릴리스 (강체 증강 + 변형체 원본)."}
+    데이터셋 이름(vla_pick)은 그대로 둔다. openvla-oft 등록명·unnorm_key·
+    허브 저장소 이름까지 함께 바뀌는 값이라, 태스크가 개정됐다는 이유만으로
+    건드릴 값이 아니다. 내용의 변화는 VERSION 으로 표시한다.
+    """
+
+    VERSION = tfds.core.Version("2.0.0")
+    RELEASE_NOTES = {
+        "1.0.0": "최초 릴리스 (형상 랜덤 자재 픽앤플레이스).",
+        "2.0.0": "태스크 개정 — 박스에서 지시문이 지정한 블록을 꺼내 "
+                 "지정된 포켓에 안착. 에피소드마다 지시문이 다르다.",
+    }
 
     def _info(self) -> tfds.core.DatasetInfo:
         return self.dataset_info_from_configs(
@@ -142,6 +151,20 @@ class VlaPick(tfds.core.GeneratorBasedBuilder):
 
         state = self._build_state(obs, num_steps)
 
+        # 지시문은 에피소드마다 다르다 — 타깃 블록·슬롯이 다르기 때문이다.
+        # ★ 환경이 기록한 target_ids 에서 만든다. 여기서 문자열을 지어내면
+        #   롤아웃(rft/isaaclab_rollout_worker.py)이 만드는 문장과 어긋나고,
+        #   증상은 "SFT 는 되는데 RFT 를 켜니 무너진다" 로만 나타난다.
+        if "target_ids" in obs:
+            tb, ts = np.asarray(obs["target_ids"])[0][:2]
+            instruction = SPEC.instruction_for(int(tb), int(ts))
+        else:
+            raise ValueError(
+                f"{path.name}/{demo_key}: 관측에 target_ids 가 없다. "
+                "태스크 개정(블록 3개 + 지시문) 이전에 만든 데이터셋이다 — "
+                "다시 생성할 것. 지시문 없이 학습하면 언어 채널이 통째로 죽는다."
+            )
+
         steps = []
         for t in range(num_steps):
             steps.append(
@@ -155,7 +178,7 @@ class VlaPick(tfds.core.GeneratorBasedBuilder):
                     "is_first": t == 0,
                     "is_last": t == num_steps - 1,
                     "is_terminal": t == num_steps - 1,
-                    "language_instruction": SPEC.TASK_INSTRUCTION,
+                    "language_instruction": instruction,
                 }
             )
 

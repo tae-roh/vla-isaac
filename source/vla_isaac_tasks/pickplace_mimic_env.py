@@ -128,21 +128,29 @@ class PickPlaceMimicEnv(ManagerBasedRLMimicEnv):
 
     # -------------------------------------------------------------------------
     def get_object_poses(self, env_ids: Sequence[int] | None = None):
-        """씬 오브젝트들의 포즈를 4x4 행렬 dict 로.
+        """Mimic 이 궤적을 변환 재배치할 기준 프레임들. 4x4 행렬 dict.
 
-        Mimic 은 이 포즈를 기준으로 원본 데모의 오브젝트 중심 구간을 새 씬으로
-        변환 재배치한다 — 증강의 핵심 입력이다.
+        ★ 키가 씬 엔티티 이름이 아니라 **역할 이름**인 것이 이 태스크의 핵심이다.
+          타깃 블록과 타깃 포켓은 env 마다 다르다 (지시문이 정한다). 씬 엔티티
+          이름(block_0…)으로 고정하면 증강된 궤적이 전부 같은 블록·같은 포켓으로
+          가고, 그러면 데이터에서 언어 조건이 사라진다 — 모델이 지시문을 무시해도
+          만점이 나오는 데이터셋이 만들어진다.
 
-        오브젝트가 하나뿐이라 dict 항목도 하나다. 키 "object" 는
-        SubTaskConfig.object_ref 와 일치해야 한다.
+          "target" : 지시문이 지정한 블록의 현재 pose  → 서브태스크 1(파지) 기준
+          "pocket" : 지시문이 지정한 포켓의 pose       → 서브태스크 2(배치) 기준
+
+        SubTaskConfig.object_ref 가 이 키와 일치해야 한다.
         """
         if env_ids is None:
             env_ids = slice(None)
 
-        pose7 = self.obs_buf["policy"]["object_pose"][env_ids]   # (N, 7) pos+quat
-        pos = pose7[..., :3]
-        rot = PoseUtils.matrix_from_quat(pose7[..., 3:7])
-        return {"object": PoseUtils.make_pose(pos, rot)}
+        out = {}
+        for key, obs_key in (("target", "target_pose"), ("pocket", "pocket_pose")):
+            pose7 = self.obs_buf["policy"][obs_key][env_ids]   # (N, 7) pos+quat
+            out[key] = PoseUtils.make_pose(
+                pose7[..., :3], PoseUtils.matrix_from_quat(pose7[..., 3:7])
+            )
+        return out
 
     # -------------------------------------------------------------------------
     def get_subtask_term_signals(
@@ -198,23 +206,21 @@ class PickPlaceMimicEnv(ManagerBasedRLMimicEnv):
         만들어 **들고 있는 자재가 테이블이나 목표 마커를 뚫고 지나가는** 궤적이 나온다.
 
         우리 서브태스크 구성:
-          index 0 (파지) → None      아직 아무것도 안 들었다
-          index 1 (배치) → "object"  앞 서브태스크에서 파지했으므로 들고 있다
+          index 0 (파지) → None        아직 아무것도 안 들었다
+          index 1 (배치) → "block_0"   앞 서브태스크에서 파지했으므로 들고 있다
 
-        레퍼런스(FrankaCubeStackIKRelMimicEnv)는 서브태스크 이름을 문자열로 검사해
-        추론하지만, 우리는 서브태스크가 2개로 고정이라 인덱스로 직접 판정하는 편이
-        명확하고 오작동 여지가 없다.
+        # ponytail: 들고 있는 것이 실제로는 env 마다 다른 블록인데 여기서는
+        #   항상 block_0 을 돌려준다. 이 메서드에는 env_id 가 없어 env 별로
+        #   다른 이름을 줄 수 없기 때문이다. 블록 3개의 **지오메트리가 동일**하므로
+        #   플래너의 충돌체로서는 완전히 같은 결과가 나온다. 블록마다 크기를
+        #   다르게 만드는 순간 이 근사는 깨진다 — 그때는 SkillGen 쪽에
+        #   env 별 attach 경로가 필요하다.
         """
         if eef_name not in env_cfg.subtask_configs:
             return None
-
-        subtask_configs = env_cfg.subtask_configs[eef_name]
-        if not (0 <= subtask_index < len(subtask_configs)):
+        if not (0 <= subtask_index < len(env_cfg.subtask_configs[eef_name])):
             return None
-
         # 첫 서브태스크(파지) 시작 시점에는 빈손이다.
         if subtask_index == 0:
             return None
-
-        # 그 이후는 파지를 마친 뒤이므로 자재를 들고 있다.
-        return subtask_configs[subtask_index].object_ref
+        return "block_0"

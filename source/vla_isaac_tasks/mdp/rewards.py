@@ -24,28 +24,26 @@ import torch
 
 from isaaclab.managers import SceneEntityCfg
 
-from .observations import grasp_lift_signal, placed_signal
+from .observations import placed_signal
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+# ★ 진단 항목을 "가중치 0 인 보상 항" 으로 두지 않는다.
+#   Isaac Lab 의 RewardManager 는 로그에 남기는 값도 weight 를 곱한 뒤라
+#   (episode_sums += func() * weight * dt), weight=0 이면 **로그도 0 이다.**
+#   진단이 되는 것처럼 보이지만 아무것도 알려주지 않는다.
+#   → 진단은 관측(yaw_err, subtask_terms/grasp_lift)으로 내보내고, 롤아웃
+#     워커가 그 평균을 보고한다 (rft/isaaclab_rollout_worker.py 의 diag).
+
+
 def success_bonus(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
 ) -> torch.Tensor:
     """태스크 성공 시 1.0, 아니면 0.0. RFT 의 유일한 학습 신호다."""
-    return placed_signal(env, robot_cfg=robot_cfg, object_cfg=object_cfg).float()
+    return placed_signal(env, robot_cfg=robot_cfg, ee_frame_cfg=ee_frame_cfg).float()
 
 
-def grasp_lift_progress(
-    env: "ManagerBasedRLEnv",
-    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
-    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
-) -> torch.Tensor:
-    """진단용 — 파지 후 들어올림 성공 여부. 가중치 0 으로 등록해 로그로만 본다."""
-    return grasp_lift_signal(
-        env, robot_cfg=robot_cfg, ee_frame_cfg=ee_frame_cfg, object_cfg=object_cfg
-    ).float()

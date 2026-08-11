@@ -63,7 +63,7 @@ python scripts/eval_rollout.py --random-policy --num-episodes 4
 
 # 4. SFT 정책 베이스라인
 python scripts/eval_rollout.py --checkpoint <ckpt> --num-episodes 32 \
-    --out logs/baseline_rigid.json
+    --out logs/sft_c5mm.json
 
 # 5. RFT 본 학습
 python rft/grpo_fallback.py --config rft/configs/grpo_rigid.yaml \

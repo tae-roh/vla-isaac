@@ -222,8 +222,40 @@ ROTATE_IMAGE_180 = False
 # SimpleVLA-RL 의 process_input() 이 만드는 프롬프트 형식과 정확히 일치시킨다:
 #     "In: What action should the robot take to {task}?\nOut:"
 # 아래는 그 {task} 자리에 들어갈 문자열이다.
-TASK_INSTRUCTION = "pick up the material and place it in the target zone"
+#
+# ★ 설계 원칙 (개정 §2-4): 시각적 유일성만으로 타깃이 결정되면 안 된다.
+#   블록 3개는 **색만 다르고 형상·크기가 같다.** "하나만 튀는" 구성이 아니므로
+#   지시문을 읽지 않으면 타깃을 고를 수 없다. 포켓도 마찬가지로 3개가 동일해서
+#   블록–슬롯 대응이 오직 지시문으로만 결정된다.
+#   → 색만으로 부족하다 싶으면 BLOCK_ATTRS 를 "small/large" 같은 크기 속성으로
+#     바꾸고 blocks.py 의 BLOCK_SIZES 를 함께 손대면 된다 (한 쌍이다).
 PROMPT_TEMPLATE = "In: What action should the robot take to {task}?\nOut:"
+INSTRUCTION_TEMPLATE = "put the {attr} block into the {slot} slot"
+
+# 사전학습 어휘에 흔한 일반 형용사만 쓴다. 사내 자재명 금지.
+BLOCK_ATTRS = ("red", "blue", "green")
+SLOT_NAMES = ("left", "middle", "right")
+
+
+# Language split (§6) 전용 rephrase. **학습에는 쓰지 않는다** — 학습 지시문은
+# 위 템플릿 하나로 고정하고, 평가에서만 이 문장들로 바꿔 언어 일반화를 잰다.
+INSTRUCTION_TEMPLATES_EVAL = (
+    "place the {attr} block in the {slot} slot",
+    "put the block that is {attr} into the {slot} pocket",
+    "move the {attr} one to the {slot} slot",
+)
+
+
+def instruction_for(block_idx: int, slot_idx: int, template: str | None = None) -> str:
+    """(타깃 블록, 타깃 슬롯) → 지시문 문자열."""
+    return (template or INSTRUCTION_TEMPLATE).format(
+        attr=BLOCK_ATTRS[int(block_idx)], slot=SLOT_NAMES[int(slot_idx)]
+    )
+
+
+# 대표 예시 하나. 프롬프트 기본값·문서 출력용이며, 실제 롤아웃은 env 별로
+# instruction_for() 로 만든 문자열을 쓴다.
+TASK_INSTRUCTION = instruction_for(0, 0)
 
 
 def build_prompt(instruction: str = TASK_INSTRUCTION) -> str:
@@ -280,21 +312,116 @@ SIM_DT = 1.0 / 120.0
 DECIMATION = 5                       # → 정책 주기 24Hz
 EPISODE_LENGTH_S = MAX_EPISODE_STEPS * SIM_DT * DECIMATION
 
+# =============================================================================
+# 씬 지오메트리 — 박스 → 맞춤 포켓 (개정 §2)
+# =============================================================================
+# 태스크: 얕은 박스 안의 블록 N개 중 지시문이 지정한 하나를 꺼내, 트레이의
+#        지정된 포켓에 안착시킨다.
+#
+# 난이도 손잡이는 두 개다:
+#   (a) 대칭 차수 — 이산. 정육면체(4) / 2:1 직육면체(2) / L자(1)
+#       BLOCK_SYMMETRY_ORDER 로 표현되고, yaw 오차를 접는 주기가 된다.
+#   (b) 클리어런스 — 연속. POCKET_CLEARANCE 를 5mm → 0.5mm 로 조인다.
+#       SR_SFT(c) vs SR_SFT+RL(c) 곡선이 이 프로젝트의 핵심 결과물이므로,
+#       이 값 하나만 바꿔 split 을 만들 수 있어야 한다 (환경 변형 클래스가
+#       이 상수만 덮어쓴다 — pickplace_env_cfg.py 참조).
+
+TABLE_HEIGHT = 0.0                   # 테이블 상면 z (env 로컬 기준) [m]
+
+# --- 블록 ---------------------------------------------------------------------
+# 구·원통을 쓰지 않는다: 회전 대칭이면 정렬 축이 사라져 6-DoF 문제가 3-DoF 위치
+# 회귀로 붕괴하고, 곡면 때문에 포켓에 자기 중심화되어 **클리어런스를 조여도
+# 실패율이 오르지 않는다** — 난이도 손잡이가 작동하지 않는다.
+NUM_BLOCKS = 3
+# 2:1 직육면체가 기본 split. 짧은 변(0.030)으로 잡으므로 그리퍼 8cm 안에 든다.
+BLOCK_SIZE = (0.060, 0.030, 0.030)   # [m]
+# 허용 yaw 자세 수. 2:1 직육면체는 180도 회전이 같은 자세라 2.
+#   정육면체 4 / 2:1·4:1 직육면체 2 / L자·D컷 1
+BLOCK_SYMMETRY_ORDER = 2
+BLOCK_MASS = 0.05                    # [kg]
+
+# --- 소스 박스 (얕은 상자) -----------------------------------------------------
+# 벽이 있어야 "밀어내기" 해가 막힌다. 벽 모서리로 끌어 넘기는 해는 성공 술어의
+# grasped_during_lift 항이 막는다.
+# ★ y=-0.16 은 카메라 화각에 맞춘 값이다. -0.20 으로 두면 박스의 먼 귀퉁이
+#   (0.56, -0.31) 이 center crop 이후 프레임 밖(u=10.5 < 12)으로 나간다.
+#   assert_workspace_visible() 이 잡아 준다 — 값을 바꾸면 반드시 다시 돌릴 것.
+BOX_CENTER = (0.45, -0.16)           # 로봇 베이스 기준 xy [m]
+BOX_INNER_SIZE = (0.20, 0.20)        # 안쪽 가로·세로 [m]
+BOX_WALL_THICKNESS = 0.010
+BOX_WALL_HEIGHT = 0.045              # 블록(0.030)보다 높아야 "꺼낸다"가 성립한다
+
+# --- 트레이 (맞춤 포켓 N개) ----------------------------------------------------
+# 포켓은 파내지 않고 **레일로 둘러싼다** — 바닥은 테이블 상면 그대로다.
+# 프리미티브 콜라이더만 쓰므로 시뮬 비용이 최저이고, 얇은 메시의 convex hull
+# cooking 실패(GPU→CPU 폴백) 위험도 없다.
+TRAY_CENTER = (0.45, 0.22)
+POCKET_CLEARANCE = 0.005             # ★ 연속 난이도 축. 기본 split = 5mm
+# 곡선을 그릴 split 사다리. 각 값마다 태스크가 하나씩 등록된다
+# (VlaPlace-c5mm-v0 … c0p5mm). 실패 구간도 결과다 — SFT 성공률이 바닥이면
+# RL 도 실패한다는 임계값 현상까지 같은 그래프에 담긴다.
+CLEARANCE_LADDER = (0.005, 0.002, 0.001, 0.0005)
+
+
+def clearance_tag(clearance: float) -> str:
+    """0.0005 → 'c0p5mm'. 태스크 이름에 쓰는 꼬리표."""
+    return "c" + f"{clearance * 1000:g}".replace(".", "p") + "mm"
+POCKET_DEPTH = 0.020                 # 레일 높이 [m]
+POCKET_RAIL_THICKNESS = 0.008
+POCKET_PITCH = 0.055                 # 포켓 중심 간격 (y 방향) [m]
+# 슬롯 이름(left/middle/right)이 +y / 0 / -y 중 어느 쪽에 붙는가.
+# ★ Day 1 에 dump_obs_reference.py 의 PNG 를 보고 확정할 것. 카메라가 로봇을
+#   마주 보므로 화면 좌우가 뒤집혀 보일 수 있고, 그러면 지시문의 "left" 가
+#   그림의 오른쪽을 가리키게 된다 — 에러 없이 언어 채널만 조용히 망가진다.
+SLOT_Y_SIGN = +1.0
+
+
+def pocket_center(slot_idx: int) -> tuple[float, float]:
+    """슬롯 인덱스 → 포켓 중심 xy (로봇 베이스 기준)."""
+    tx, ty = TRAY_CENTER
+    offset = (slot_idx - (len(SLOT_NAMES) - 1) / 2.0) * POCKET_PITCH
+    return (tx, ty + SLOT_Y_SIGN * offset)
+
+
+def pocket_inner_size(clearance: float | None = None) -> tuple[float, float]:
+    """포켓 안치수 = 블록 단면 + 클리어런스.
+
+    clearance 를 인자로 받는 이유: 클리어런스는 **split 마다 다른 유일한 값**이다
+    (개정 §2-3b). 모듈 상수는 기본 split 값일 뿐이고, 실제 환경은 자기
+    `env.cfg.pocket_clearance` 를 넘긴다. 여기서 상수를 직접 읽어 버리면
+    타이트한 split 을 만들어도 포켓만 좁아지고 성공 판정 공차는 그대로여서,
+    곡선이 조용히 틀어진다.
+    """
+    c = POCKET_CLEARANCE if clearance is None else clearance
+    return (BLOCK_SIZE[0] + c, BLOCK_SIZE[1] + c)
+
+
 # -----------------------------------------------------------------------------
 # 성공 판정 (Mimic 서브태스크 시그널 + RFT 0/1 보상이 공유)
 # -----------------------------------------------------------------------------
-# 자재 스폰 범위 (리셋마다 이 안에서 무작위 배치). mdp/events.py 의
-# randomize_material_pose 가 이 값을 읽는다 — 두 곳에 적지 않는다.
-# ★ 카메라 화각이 이 범위와 목표 영역을 모두 덮어야 한다.
-#   assert_workspace_visible() 이 그것을 검사한다.
-MATERIAL_SPAWN_X_RANGE = (0.38, 0.60)
-MATERIAL_SPAWN_Y_RANGE = (-0.22, 0.05)
+# success = in_pocket AND yaw_aligned AND settled AND grasped_during_lift
+#
+# dense shaping 금지 (개정 §2-5). 거리 항은 "밀기/끌기"를 적극적으로 보상해
+# 파지 없는 정책으로 수렴시킨다. 마지막 항이 그 pushcut 방지책이다.
 
-# 목표 영역: 테이블 위 원기둥 형태 영역 (중심 xy + 반경).
-GOAL_REGION_CENTER = (0.45, 0.35)    # 로봇 베이스 기준 xy [m]
-GOAL_REGION_RADIUS = 0.09            # [m]
-GOAL_HEIGHT_TOLERANCE = 0.06         # 목표 z 로부터 허용 편차 [m]
-TABLE_HEIGHT = 0.0                   # 테이블 상면 z (env 로컬 기준) [m]
+# in_pocket: 블록 중심이 포켓 중심에서 이만큼 안. 클리어런스에 연동한다 —
+# 물리적으로 안착하면 최대 편차가 clearance/2 이고, 여유 4mm 는 "테두리에
+# 걸친 상태"와 구분할 정도만 준다.
+POCKET_XY_MARGIN = 0.004
+# 안착 높이: 블록 중심이 레일 상단보다 아래여야 한다 (얹혀 있는 것과 구분).
+POCKET_SEAT_Z_MARGIN = 0.005
+# yaw 정렬 허용 오차 [rad]. 대칭 차수로 접은 뒤의 오차에 적용한다.
+SUCCESS_YAW_TOLERANCE = 0.20         # 약 11.5도
+
+
+def pocket_xy_tolerance(clearance: float | None = None) -> float:
+    c = POCKET_CLEARANCE if clearance is None else clearance
+    return 0.5 * c + POCKET_XY_MARGIN
+
+
+def pocket_seat_z_max() -> float:
+    """성공으로 인정할 블록 중심 z 상한 (env 로컬)."""
+    return TABLE_HEIGHT + 0.5 * BLOCK_SIZE[2] + POCKET_SEAT_Z_MARGIN
 
 # "정지" 판정 속도 임계값 [m/s]. 물체가 굴러가는 중에 성공이 뜨는 것을 막는다.
 SUCCESS_LIN_VEL_THRESHOLD = 0.03
@@ -302,8 +429,12 @@ SUCCESS_LIN_VEL_THRESHOLD = 0.03
 GRIPPER_OPEN_QPOS_SUM = 0.06
 # 파지 판정: eef 와 물체 중심 거리 [m].
 GRASP_DISTANCE_THRESHOLD = 0.06
-# 들어올림 판정: 테이블면으로부터의 높이 [m]. 서브태스크 1 의 종료 신호에 쓰인다.
-LIFT_HEIGHT_THRESHOLD = 0.10
+# 들어올림 판정: 테이블면으로부터의 높이 [m].
+#   서브태스크 1 의 종료 신호이자 grasped_during_lift 래치의 조건이다.
+#   ★ 박스 벽보다 확실히 위여야 한다 (개정 §4-2): 경계를 파지 직후가 아니라
+#     "블록을 들어 박스 벽 위로 뺀 뒤"에 두어야 플래너가 이어붙일 구간에
+#     충돌 위험이 없다.
+LIFT_HEIGHT_THRESHOLD = BOX_WALL_HEIGHT + 0.030
 
 # -----------------------------------------------------------------------------
 # 서브태스크 "시작" 경계 (SkillGen 전용)
@@ -325,15 +456,38 @@ LIFT_HEIGHT_THRESHOLD = 0.10
 # 정렬·하강하는 구간까지 사람 데모를 써야 파지가 재현된다.
 APPROACH_START_DISTANCE = 0.15
 
-# 배치 시작: 자재를 든 채로 목표 영역 중심에서 이 반경 안에 들어오면 배치 구간 시작 [m].
-# 목표 반경(0.09)보다 커야 한다 — 영역 위에 정확히 도달한 뒤가 아니라,
-# 그 위로 접근해 내려놓기 시작하는 지점부터가 사람 데모가 필요한 구간이다.
-PLACE_START_RADIUS = 0.20
+# 배치 시작: 블록을 든 채로 타깃 포켓 중심에서 이 반경 안에 들어오면 배치 구간 시작 [m].
+# 포켓 크기보다 훨씬 커야 한다 — 포켓 바로 위에 도달한 뒤가 아니라, 그 위로
+# 접근해 정렬·하강을 시작하는 지점부터가 사람 데모가 필요한 구간이다.
+PLACE_START_RADIUS = 0.12
 
 # 성공 후 녹화를 바로 끊지 않고 유지할 스텝 수.
 # 계획서 §Phase1-3 경고: 성공 시점에 녹화가 즉시 끊기면 replay 에서 성공 조건이
 # 재트리거되지 않아 데모가 통째로 버려진다.
 SUCCESS_HOLD_STEPS = 10
+
+# -----------------------------------------------------------------------------
+# 시드 재현성 / 초기 상태 뱅크 (개정 §3) — RL 코드보다 먼저 만들어야 하는 인프라
+# -----------------------------------------------------------------------------
+# GRPO 는 **동일한 s₀ 에서 G개 궤적**을 뽑는 것을 전제한다. 리셋마다 배치가
+# 달라지면 Â_i = (R_i − mean(R))/std(R) 가 "정책이 잘했는가"가 아니라
+# "이번 리스폰이 쉬웠는가"를 측정하게 되어 보상 신호가 노이즈가 된다.
+#
+# 그래서 초기 상태를 런타임에 샘플링하지 않는다. 미리 만들어 **직렬화해 둔
+# 뱅크**에서 인덱스로 꺼내 쓴다 (LIBERO 의 set_init_state 와 같은 발상).
+# 뱅크 한 줄의 레이아웃:
+#     [x, y, yaw] × NUM_BLOCKS  +  [target_block_idx, target_slot_idx]
+INIT_STATE_DIM = 3 * NUM_BLOCKS + 2
+INIT_STATE_DIR = "datasets/init_states"      # 저장소 루트 기준
+EVAL_HOLDOUT_SIZE = 64                       # 태스크당 평가용 고정 초기 상태 수
+TRAIN_BANK_SIZE = 4096                       # 학습/생성용 뱅크 크기
+
+# 스폰 제약 (개정 §2-6): 겹침 없는 배치부터 시작한다.
+# 블록 대각선이 sqrt(0.060² + 0.030²) ≈ 0.067 이므로 그보다 큰 간격을 요구하면
+# yaw 와 무관하게 겹치지 않는다 — 겹침 판정을 회전까지 정확히 할 필요가 없다.
+BLOCK_MIN_SEPARATION = 0.070
+# 박스 안쪽 벽에서 이만큼 떨어뜨려 스폰한다 (블록 대각선 절반 + 여유).
+BLOCK_SPAWN_WALL_MARGIN = 0.038
 
 
 # -----------------------------------------------------------------------------
@@ -356,7 +510,51 @@ def assert_consistent() -> None:
     )
     assert NUM_IMAGES_IN_INPUT == 1, "SimpleVLA-RL 판 OpenVLA-OFT 는 3인칭 단일 뷰다."
     assert IMAGE_HEIGHT == IMAGE_WIDTH == 224, "OpenVLA 입력 해상도는 224x224 고정."
-    assert GOAL_REGION_RADIUS > 0 and GOAL_HEIGHT_TOLERANCE > 0
+
+    # --- 태스크 지오메트리 ---
+    assert NUM_BLOCKS == len(BLOCK_ATTRS) == len(SLOT_NAMES), (
+        f"블록 {NUM_BLOCKS}개 / 속성어 {len(BLOCK_ATTRS)}개 / 슬롯 "
+        f"{len(SLOT_NAMES)}개가 어긋났다. 지시문을 만들 수 없다."
+    )
+    # 짧은 변으로 잡는다. 이걸 넘기면 텔레옵 데모 자체가 안 만들어진다.
+    assert min(BLOCK_SIZE[:2]) < GRIPPER_MAX_WIDTH, (
+        f"블록 최소 파지폭 {min(BLOCK_SIZE[:2]) * 100:.1f}cm 가 그리퍼 한계 "
+        f"{GRIPPER_MAX_WIDTH * 100:.1f}cm 이상이다."
+    )
+    assert BLOCK_SYMMETRY_ORDER in (1, 2, 4), (
+        "대칭 차수는 1(L자/D컷) / 2(직육면체) / 4(정육면체) 중 하나다."
+    )
+    if BLOCK_SYMMETRY_ORDER == 2:
+        assert abs(BLOCK_SIZE[0] - BLOCK_SIZE[1]) > 1e-6, (
+            "대칭 차수 2 는 단면이 정사각형이 아닐 때만 성립한다. "
+            "x·y 가 같으면 실제 차수는 4 이고, yaw 판정이 실제보다 엄격해진다."
+        )
+    # 포켓에 실제로 들어가야 한다.
+    assert POCKET_CLEARANCE > 0, "클리어런스가 0 이면 물리적으로 들어가지 않는다."
+    assert POCKET_DEPTH < BLOCK_SIZE[2], (
+        f"포켓 깊이 {POCKET_DEPTH} 가 블록 높이 {BLOCK_SIZE[2]} 이상이면 "
+        "블록이 레일에 파묻혀 그리퍼가 놓을 수 없다."
+    )
+    # 포켓이 서로 겹치지 않아야 한다 (레일 두께 포함).
+    _pw = pocket_inner_size()[1] + 2 * POCKET_RAIL_THICKNESS
+    assert POCKET_PITCH > _pw, (
+        f"포켓 간격 {POCKET_PITCH} 가 포켓 외폭 {_pw:.3f} 이하다 — 레일이 겹친다."
+    )
+    # 성공 판정 공차가 클리어런스와 함께 움직이는지 (연동을 끊으면 곡선이 무의미해진다).
+    assert pocket_xy_tolerance() < 0.5 * BLOCK_SIZE[1], (
+        "in_pocket 공차가 블록 반폭보다 크면 포켓 밖에 놓아도 성공이 된다."
+    )
+    # 리프트 경계가 박스 벽 위여야 스티칭 구간에 충돌 위험이 없다.
+    assert LIFT_HEIGHT_THRESHOLD > BOX_WALL_HEIGHT, (
+        "리프트 임계가 박스 벽보다 낮으면 서브태스크 경계가 박스 안에 생긴다."
+    )
+    # 블록이 박스 안에 겹치지 않고 들어가는가 (뱅크 샘플링이 무한 루프에 빠지는 것 방지).
+    _span = min(BOX_INNER_SIZE) - 2 * BLOCK_SPAWN_WALL_MARGIN
+    assert _span > BLOCK_MIN_SEPARATION, (
+        f"스폰 가능 영역 {_span:.3f}m 가 블록 최소 간격 {BLOCK_MIN_SEPARATION}m "
+        "이하다. 박스를 키우거나 여백을 줄일 것."
+    )
+    assert INIT_STATE_DIM == 3 * NUM_BLOCKS + 2
 
     # --- embodiment ↔ 액션 스펙 교차 검증 ---
     # 7차원 = 델타 포즈 6 (위치3 + 회전3) + 그리퍼 1.
@@ -382,16 +580,15 @@ def assert_consistent() -> None:
     )
     assert CONTROL_FRAME in ("robot_base", "world", "eef")
 
-    # 자재 스폰 범위가 목표 영역과 겹치면 아무것도 안 해도 성공으로 잡힌다
-    # (mdp/events.py 의 randomize_material_pose 주석 참조).
-    gx, gy = GOAL_REGION_CENTER
-    assert not (
-        MATERIAL_SPAWN_X_RANGE[0] - GOAL_REGION_RADIUS <= gx <= MATERIAL_SPAWN_X_RANGE[1] + GOAL_REGION_RADIUS
-        and MATERIAL_SPAWN_Y_RANGE[0] - GOAL_REGION_RADIUS <= gy <= MATERIAL_SPAWN_Y_RANGE[1] + GOAL_REGION_RADIUS
-    ), (
-        f"자재 스폰 범위 x{MATERIAL_SPAWN_X_RANGE} y{MATERIAL_SPAWN_Y_RANGE} 가 "
-        f"목표 영역(중심 {GOAL_REGION_CENTER}, 반경 {GOAL_REGION_RADIUS})과 겹친다. "
-        "리셋 직후 성공이 뜨는 에피소드가 생겨 RFT 보상이 오염된다."
+    # 박스와 트레이가 겹치면 리셋 직후 블록이 포켓 안에 있는 에피소드가 생긴다
+    # (아무것도 안 해도 성공 → RFT 보상 오염).
+    _box_y_hi = BOX_CENTER[1] + 0.5 * BOX_INNER_SIZE[1] + BOX_WALL_THICKNESS
+    _tray_y_lo = min(pocket_center(i)[1] for i in range(len(SLOT_NAMES))) - (
+        0.5 * pocket_inner_size()[1] + POCKET_RAIL_THICKNESS
+    )
+    assert _box_y_hi < _tray_y_lo, (
+        f"소스 박스(y≤{_box_y_hi:.3f})와 포켓 트레이(y≥{_tray_y_lo:.3f})가 겹친다. "
+        "BOX_CENTER / TRAY_CENTER 를 떨어뜨릴 것."
     )
 
     # 카메라가 작업공간 전체를 담고 있는지 — 에러 없이 성능만 깎는 불일치를 막는다.
@@ -450,24 +647,48 @@ def center_crop_bounds() -> tuple[float, float]:
 
 
 def workspace_roi_points() -> list:
-    """정책이 반드시 봐야 하는 점들 — 자재가 놓일 수 있는 곳 + 목표 영역 + 운반 높이."""
-    x0, x1 = MATERIAL_SPAWN_X_RANGE
-    y0, y1 = MATERIAL_SPAWN_Y_RANGE
-    gx, gy = GOAL_REGION_CENTER
-    r = GOAL_REGION_RADIUS
+    """정책이 반드시 봐야 하는 점들.
+
+    태스크 개정으로 대상이 바뀌었다: 자재 스폰 범위 + 목표 영역 →
+    **소스 박스(벽 윗면까지) + 포켓 트레이 + 리프트 높이**.
+    카메라 값은 Day 1 에 확정한 것을 그대로 쓰고, ROI 만 새 지오메트리로 옮겼다.
+
+    포켓이 프레임을 벗어나면 정책은 "어느 슬롯에 넣어야 하는지" 를 볼 수 없고,
+    그건 에러 없이 언어 채널만 죽인다 — 이 검사가 존재하는 이유 그대로다.
+    """
+    bx, by = BOX_CENTER
+    hx = 0.5 * BOX_INNER_SIZE[0] + BOX_WALL_THICKNESS
+    hy = 0.5 * BOX_INNER_SIZE[1] + BOX_WALL_THICKNESS
     pts = []
-    # 자재 정지 위치 (테이블면 ~ 자재 높이)
-    for x in (x0, x1):
-        for y in (y0, y1):
-            for z in (TABLE_HEIGHT, TABLE_HEIGHT + 0.08):
-                pts.append((x, y, z))
-    # 목표 영역 원주
-    for i in range(16):
-        a = 2.0 * math.pi * i / 16.0
-        pts.append((gx + r * math.cos(a), gy + r * math.sin(a), TABLE_HEIGHT))
-    # 운반 중 자재 (스폰 위 / 목표 위)
-    for x, y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1), (gx, gy), (gx, gy + r)):
-        pts.append((x, y, TABLE_HEIGHT + 0.20))
+
+    # 박스 네 귀퉁이 — 바닥면과 벽 윗면 둘 다 (벽 위로 빼는 동작이 보여야 한다)
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            for z in (TABLE_HEIGHT, TABLE_HEIGHT + BOX_WALL_HEIGHT):
+                pts.append((bx + sx * hx, by + sy * hy, z))
+
+    # 포켓 — 각 슬롯의 네 귀퉁이 (레일 포함)
+    px, py = pocket_inner_size()
+    for i in range(len(SLOT_NAMES)):
+        cx, cy = pocket_center(i)
+        for sx in (-1, 1):
+            for sy in (-1, 1):
+                pts.append(
+                    (
+                        cx + sx * (0.5 * px + POCKET_RAIL_THICKNESS),
+                        cy + sy * (0.5 * py + POCKET_RAIL_THICKNESS),
+                        TABLE_HEIGHT + POCKET_DEPTH,
+                    )
+                )
+
+    # 운반 중 블록 — 리프트 높이에서 박스 위 / 포켓 위
+    z_lift = TABLE_HEIGHT + LIFT_HEIGHT_THRESHOLD + 0.05
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            pts.append((bx + sx * hx, by + sy * hy, z_lift))
+    for i in range(len(SLOT_NAMES)):
+        cx, cy = pocket_center(i)
+        pts.append((cx, cy, z_lift))
     return pts
 
 
@@ -479,7 +700,9 @@ def assert_workspace_visible(margin_px: float = 6.0) -> None:
       프레임 밖**(u=225.0 / 224px)이었다. 에러는 전혀 나지 않는다 — 씬도 만들어지고
       관측 shape 도 맞고 스모크도 통과한다. 정책이 "어디에 놓아야 하는지" 를 못 보는
       것뿐이고, 그건 SFT 를 다 돌린 뒤 "성능이 안 나온다" 로만 드러난다.
-      카메라·목표·스폰 범위는 서로 다른 파일에 있어서 한쪽만 바뀌기 쉽다.
+      카메라와 씬 지오메트리는 서로 다른 파일에 있어서 한쪽만 바뀌기 쉽다.
+      태스크가 개정되면서 검사 대상도 박스·포켓으로 옮겼다 —
+      같은 함정을 새 지오메트리에서 다시 밟지 않기 위해서다.
     """
     lo, hi = center_crop_bounds()
     lo, hi = lo + margin_px, hi - margin_px
@@ -498,7 +721,7 @@ def assert_workspace_visible(margin_px: float = 6.0) -> None:
             f"작업공간이 카메라 화각을 벗어난다 (crop 후 허용 {lo:.1f}~{hi:.1f}px, "
             f"{len(bad)}개 지점 실패):\n{lines}\n"
             "  CAMERA_POS / CAMERA_ROT / CAMERA_FOCAL_LENGTH 와 "
-            "GOAL_REGION_CENTER / MATERIAL_SPAWN_*_RANGE 중 하나가 어긋났다.\n"
+            "BOX_CENTER / TRAY_CENTER / POCKET_PITCH 중 하나가 어긋났다.\n"
             "  이건 에러 없이 조용히 성능만 깎는 종류의 불일치다 — 반드시 맞출 것."
         )
 
@@ -517,8 +740,15 @@ def summary() -> str:
         f"  정규화    : {ACTION_PROPRIO_NORMALIZATION_TYPE}\n"
         f"  에피소드  : 최대 {MAX_EPISODE_STEPS}스텝 ({EPISODE_LENGTH_S:.1f}s), "
         f"제어 {1.0 / (SIM_DT * DECIMATION):.0f}Hz\n"
-        f"  instruction: {TASK_INSTRUCTION!r}\n"
-        f"  목표영역  : 중심 {GOAL_REGION_CENTER}, 반경 {GOAL_REGION_RADIUS}m\n"
+        f"  instruction: {TASK_INSTRUCTION!r} (env 별로 달라진다)\n"
+        f"  블록      : {NUM_BLOCKS}개 {BLOCK_SIZE}, 대칭차수 "
+        f"{BLOCK_SYMMETRY_ORDER}, 속성 {BLOCK_ATTRS}\n"
+        f"  박스      : 중심 {BOX_CENTER}, 안치수 {BOX_INNER_SIZE}, "
+        f"벽높이 {BOX_WALL_HEIGHT * 100:.1f}cm\n"
+        f"  포켓      : {SLOT_NAMES}, 클리어런스 "
+        f"{POCKET_CLEARANCE * 1000:.1f}mm → xy공차 "
+        f"{pocket_xy_tolerance() * 1000:.1f}mm, yaw공차 "
+        f"{SUCCESS_YAW_TOLERANCE:.2f}rad\n"
     )
 
 

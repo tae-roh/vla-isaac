@@ -1,7 +1,10 @@
 # vla-isaac
 
 Isaac Lab 환경에서 VLA(OpenVLA-OFT)를 **SFT → RFT** 하는 프로젝트.
-태스크: 형상이 랜덤화되는 자재를 집어 목표 영역으로 옮기기 (Franka Panda).
+태스크: **얕은 박스 안의 블록 3개 중 지시문이 지정한 하나를 꺼내, 지시문이
+지정한 맞춤 포켓에 안착** (Franka Panda). 난이도 손잡이는 두 개 — 블록의
+**대칭 차수**(이산)와 포켓 **클리어런스**(연속 5mm→0.5mm)다.
+핵심 결과물은 클리어런스 곡선 `SR_SFT(c)` vs `SR_SFT+RL(c)`.
 
 전체 실행 순서는 **[docs/RUNBOOK.md](docs/RUNBOOK.md)** 를 볼 것.
 설계 근거는 상위 디렉토리의 `vla-sft-rft-project-plan.md`.
@@ -16,7 +19,7 @@ Isaac Lab 환경에서 VLA(OpenVLA-OFT)를 **SFT → RFT** 하는 프로젝트.
 3. **핵심 결과를 강체 RFT 커브로 잡는다.** 변형체는 스트레치 — FEM 튜닝이
    일정을 잡아먹는 가장 큰 변수라, 결과 보장을 물리 디버깅에 걸지 않는다.
 
-## 네 가지 설계 결정
+## 설계 결정
 
 ### 0. Embodiment: Franka Emika Panda
 
@@ -62,7 +65,41 @@ GRPO 는 `log π(a|s)` 와 정책 ratio 가 필요하다. 연속 L1 회귀 헤�
 `--use_l1_regression False` 로 이산 토큰 + cross-entropy 를 쓴다.
 이 한 줄이 "SFT 를 왜 이렇게 하는가" 의 절반이다.
 
-### 3. 데이터 증강은 SkillGen 기본, MimicGen 은 한 플래그로 후퇴
+### 3. 초기 상태를 시드가 아니라 **뱅크 인덱스**로 지정한다
+
+GRPO 는 같은 s₀ 에서 G개 궤적을 뽑는 것을 전제한다. 리셋마다 배치가 달라지면
+
+```
+Â_i = (R_i − mean(R)) / std(R)
+```
+
+가 "정책이 잘했는가" 가 아니라 "이번 리스폰이 쉬웠는가" 를 재게 되어 보상이
+노이즈가 된다. 시드만 맞추는 것으로는 부족하다 — 배치 안의 env 들이 여전히
+서로 다른 배치를 받기 때문이다.
+
+그래서 초기 배치·타깃 블록·타깃 슬롯을 미리 만들어 `datasets/init_states/*.npz`
+로 굳혀 두고, 리셋 때 **인덱스로 꺼낸다.** 정수 하나를 주면 전 env 가 같은
+s₀ 에서 출발한다 (`client.reset(init_index=…)`).
+
+- 학습/생성: `train` 뱅크를 순회
+- 평가: `eval_base` 홀드아웃 64개를 인덱스 순서대로 (시드 12345, 학습과 분리)
+- **RL 코드보다 먼저 만들었다.** 나중에 붙이면 그 전 실험이 전부 재현 불가가 된다.
+
+### 4. 언어 채널이 죽지 않게 만든다
+
+블록 3개는 **색만 다르고 형상·크기가 같다.** "하나만 튀는" 구성이면 모델이
+지시문을 무시하고 "튀는 색으로 가라" 만 배워도 만점이 나온다. 포켓 3개도 동일
+규격이라, 블록–슬롯 대응은 **오직 지시문으로만** 결정된다.
+
+같은 이유로 Mimic 의 `object_ref` 는 씬 엔티티 이름이 아니라 역할 이름
+(`target` / `pocket`)이다. 고정 엔티티로 두면 증강 궤적이 전부 같은 블록·같은
+포켓으로 가고, 데이터에서 언어 조건이 사라진다.
+
+지시문 문자열의 출처는 관측의 `target_ids` 하나다 — 롤아웃 워커와 RLDS 변환이
+같은 값에서 문장을 만든다. 두 곳에서 따로 만들면 SFT 와 RFT 의 지시문이
+어긋나고, 증상은 "RFT 를 켜니 성능이 무너진다" 로만 나타난다.
+
+### 5. 데이터 증강은 SkillGen 기본, MimicGen 은 한 플래그로 후퇴
 
 두 방식의 차이는 **서브태스크 사이의 자유공간을 어떻게 잇는가** 하나다.
 
@@ -85,7 +122,7 @@ GRPO 는 `log π(a|s)` 와 정책 ratio 가 필요하다. 연속 L1 회귀 헤�
 → 후퇴할 때 고칠 코드가 없다. `--use_skillgen` 과
 `--annotate_subtask_start_signals` 두 플래그만 빼면 된다.
 
-### 4. RFT 는 프로세스 분리 (계획서의 순서를 뒤집음)
+### 6. RFT 는 프로세스 분리 (계획서의 순서를 뒤집음)
 
 계획서는 "단일 venv 통합을 먼저 시도, 실패하면 프로세스 분리" 였다. 그런데
 SimpleVLA-RL 의 `rob_rollout.py` 를 실제로 읽어 보면 LIBERO 를
@@ -103,12 +140,15 @@ env/                         의존성 정의 + 스모크 테스트 (코드보�
   constraints*.txt             환경별 버전 핀 — 모든 pip install 에 -c 로 건다
   smoke/check_*.py             ★ 유일한 환경 검증 기준 (pip check 아님)
 setup/setup_*.sh             환경 구축 (멱등, 스모크 자동 실행, lock 박제)
-source/vla_isaac_tasks/      Isaac Lab 태스크 — gym 등록 4종
-  pickplace_env_cfg.py         VlaPick-v0            텔레옵·재생·평가
-  pickplace_mimic_env*.py      VlaPick-*-Mimic-v0    Mimic 증강 (헬퍼 6종)
-  deformable_env_cfg.py        VlaPick-Deformable-v0 스트레치
-  materials.py                 자재 6종 (형상 랜덤화)
+source/vla_isaac_tasks/      Isaac Lab 태스크 — gym 등록 15종
+  pickplace_env_cfg.py         VlaPlace-v0             텔레옵·재생·평가
+  pickplace_mimic_env*.py      VlaPlace-*-Mimic-v0     Mimic 증강 (헬퍼 6종)
+                               VlaPlace-c{5,2,1,0p5}mm-*  클리어런스 split
+  scene_assets.py              블록 3개 + 소스 박스 + 포켓 트레이 (전부 프리미티브)
+  init_states.py               ★ 초기 상태 뱅크 — s0 를 인덱스로 지정한다
+  deformable_env_cfg.py        보류 (등록 안 됨. 후속 확장에서 박막부터 재개)
 scripts/                     데이터 파이프라인 + 평가
+  make_init_states.py          ★ 초기 상태 뱅크 생성 — RL 코드보다 먼저 돌린다
   dump_obs_reference.py        ★ 관측 PNG 덤프/대조 — 스펙 불일치의 유일한 검출 수단
   convert_hdf5_to_rlds.py      HDF5 → RLDS + 정규화 통계
   eval_rollout.py              성공률 측정

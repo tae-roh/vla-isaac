@@ -31,7 +31,7 @@ def log(msg: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", default="VlaPick-v0")
+    parser.add_argument("--task", default="VlaPlace-v0")
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=0)
@@ -59,7 +59,12 @@ def main() -> int:
     import vla_isaac_tasks  # noqa: F401  — gym.register
     from isaaclab_tasks.utils import parse_env_cfg
     from rft.ipc_bridge import PROTOCOL_VERSION, recv_message, send_message
+    from vla_isaac_tasks.mdp import set_forced_indices, use_bank
     from vla_isaac_tasks.spec import SPEC
+
+    # 평가 split 마다 지시문 템플릿을 바꿀 수 있게 둔다 (Language split, §6).
+    # None 이면 학습에 쓴 기본 템플릿.
+    instruction_template = {"value": None}
 
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
@@ -83,6 +88,9 @@ def main() -> int:
         # 두지 않으면 다음 관측이 이미 새 에피소드 것이라 놓친다.
         success_latch = torch.zeros(num_envs, dtype=torch.bool, device=device)
         done_latch = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        # 진단 래치: "박스에서 꺼내는 것까지는 됐는가".
+        # 커브가 평평할 때 파지 실패인지 배치 정밀도 문제인지 가르는 값이다.
+        lift_latch = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
         # ---------------------------------------------------------------
         def extract_obs(obs_dict) -> dict:
@@ -107,6 +115,18 @@ def main() -> int:
             out = {"image": img}
             if state is not None:
                 out["state"] = state
+
+            # 지시문. env 마다 타깃 블록·슬롯이 다르므로 문장도 env 마다 다르다.
+            # ★ 여기가 롤아웃 쪽 지시문의 유일한 출처다. 정책 프롬프트를 다른
+            #   곳에서 따로 만들면 SFT 데이터의 문장과 어긋나고, 증상은
+            #   "RFT 를 켜니 성능이 무너진다" 로만 나타난다.
+            ids = policy.get("target_ids")
+            if ids is not None:
+                ids = ids.detach().cpu().numpy().astype(int)
+                out["instruction"] = [
+                    SPEC.instruction_for(b, s, instruction_template["value"])
+                    for b, s in ids
+                ]
             return out
 
         def send_ok(payload: dict) -> None:
@@ -135,14 +155,29 @@ def main() -> int:
                     })
 
                 elif cmd == "reset":
+                    # ★ 초기 상태는 시드가 아니라 **뱅크 인덱스**로 지정한다
+                    #   (개정 §3). 시드만으로는 배치 안의 env 들이 서로 다른
+                    #   s₀ 를 갖게 되어, GRPO 가 "같은 상태에서 G개" 라는 전제를
+                    #   만족하지 못한다. 정수 하나를 주면 전 env 가 동일한 s₀ 다.
+                    if msg.get("bank"):
+                        use_bank(str(msg["bank"]))
+                    if "instruction_template" in msg:
+                        instruction_template["value"] = msg["instruction_template"]
+                    if msg.get("init_index") is not None:
+                        set_forced_indices(int(msg["init_index"]))
+                    elif msg.get("init_indices") is not None:
+                        set_forced_indices(list(msg["init_indices"]))
+                    else:
+                        set_forced_indices(None)
+
                     seeds = msg.get("seeds")
                     if seeds:
-                        # 그룹 롤아웃에서 같은 초기 상태를 재현하려면 시드가 필요하다
-                        # (GRPO 는 같은 상태에서 여러 번 굴려 그룹을 만든다).
+                        # 시드는 팔 관절 노이즈 등 뱅크 밖의 잔여 랜덤만 지배한다.
                         env.unwrapped.seed(int(seeds[0]))
                     obs_dict, _ = env.reset()
                     success_latch.zero_()
                     done_latch.zero_()
+                    lift_latch.zero_()
                     send_ok({"obs": extract_obs(obs_dict)})
 
                 elif cmd == "step":
@@ -173,16 +208,28 @@ def main() -> int:
                         obs_dict, reward, terminated, truncated, _ = env.step(
                             actions[:, t, :]
                         )
+                        sub = obs_dict.get("subtask_terms")
+                        if sub is not None and "grasp_lift" in sub:
+                            lift_latch |= sub["grasp_lift"].bool()
                         # 성공은 reward>0 으로 판정한다. RewardsCfg 의 success 항이
                         # weight=1.0 인 유일한 항이므로 reward 가 곧 0/1 성공이다.
                         # (진단용 grasp_lift_diag 는 weight=0 이라 섞이지 않는다)
                         success_latch |= reward > 0.5
                         done_latch |= terminated | truncated
 
+                    # 진단값은 reward 와 분리해 보낸다. 보상에 섞으면 0/1 이
+                    # 아니게 되어 GRPO 의 그룹 정규화와 무신호 판정이 망가진다.
+                    yaw = obs_dict["policy"].get("yaw_err")
                     send_ok({
                         "obs": extract_obs(obs_dict),
                         "reward": success_latch.float().cpu().numpy(),
                         "done": done_latch.cpu().numpy(),
+                        "diag": {
+                            "lifted": float(lift_latch.float().mean()),
+                            "yaw_err": (
+                                float(yaw.mean()) if yaw is not None else float("nan")
+                            ),
+                        },
                     })
 
                 elif cmd == "success":

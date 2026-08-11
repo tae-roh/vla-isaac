@@ -54,7 +54,7 @@ from rft.ipc_bridge import RolloutClient  # noqa: E402
 @dataclass
 class GRPOConfig:
     checkpoint: str = ""
-    task: str = "VlaPick-v0"
+    task: str = "VlaPlace-v0"
     isaaclab_python: str = str(Path.home() / "env_isaaclab" / "bin" / "python")
 
     # 롤아웃
@@ -62,11 +62,16 @@ class GRPOConfig:
     num_envs: int = 8             # 워커의 배치 크기. group_size 와 같게 두면 한 라운드 = 한 그룹
     groups_per_step: int = 2      # 한 업데이트에 쓸 그룹 수
     max_steps_per_episode: int = SPEC.MAX_EPISODE_STEPS
-    temperature: float = 1.4      # 계획서 §Phase4b-5 권장 1.2~1.6
+    temperature: float = 1.6      # 개정 §5: SimpleVLA-RL 설정값
+    # 초기 상태 뱅크 (개정 §3). 학습용 뱅크를 쓰고, 평가는 별도 홀드아웃을 쓴다.
+    bank: str = "train"
 
     # 최적화
     learning_rate: float = 1e-6
     clip_eps: float = 0.2
+    # clip-higher (DAPO). 상한을 넓혀 저확률 토큰의 상승 여지를 준다 —
+    # 대칭 클리핑은 엔트로피를 빠르게 죽여 탐색이 멎는다. 개정 §5: [0.8, 1.28]
+    clip_eps_high: float = 0.28
     kl_coef: float = 0.0          # 0 = KL 항 없음 (SimpleVLA-RL 기본)
     max_grad_norm: float = 1.0
     total_steps: int = 300
@@ -163,7 +168,6 @@ class GRPOTrainer:
               f"전체 {sum(p.numel() for p in self.model.parameters()) / 1e9:.1f}B")
 
         self.optimizer = torch.optim.AdamW(trainable, lr=cfg.learning_rate)
-        self.prompt = SPEC.build_prompt()
 
         # 액션 디토크나이저 구간. SFT 가 만든 것과 같은 파일을 읽어야 한다 —
         # 다르면 같은 토큰이 다른 물리량을 뜻하게 되어 정책이 통째로 어긋난다.
@@ -193,7 +197,7 @@ class GRPOTrainer:
             self.writer = wandb
 
     # -------------------------------------------------------------------------
-    def _sample_actions(self, images: np.ndarray):
+    def _sample_actions(self, images: np.ndarray, instructions):
         """관측 배치 → (액션 청크, 샘플된 토큰, behavior log-prob).
 
         수집 단계는 그래디언트 없이 돈다. **업데이트 때 같은 (이미지, 토큰) 쌍으로
@@ -213,7 +217,8 @@ class GRPOTrainer:
             # center crop 포함. _recompute_logp 와 반드시 같은 전처리여야 한다 —
             # 다르면 ratio 가 전처리 차이까지 반영해 버려 학습이 망가진다.
             inputs = self.processor(
-                self.prompt, SPEC.prepare_image_for_vla(images[i])
+                SPEC.build_prompt(instructions[i]),
+                SPEC.prepare_image_for_vla(images[i]),
             ).to(self.cfg.device, dtype=torch.bfloat16)
             with torch.no_grad():
                 out = self.model.generate(
@@ -235,7 +240,7 @@ class GRPOTrainer:
 
         return np.stack(actions), torch.stack(tokens), torch.stack(logps)
 
-    def _recompute_logp(self, images: np.ndarray, tokens):
+    def _recompute_logp(self, images: np.ndarray, tokens, instructions):
         """저장해 둔 (이미지, 토큰) 으로 현재 정책의 log-prob 을 **그래디언트와 함께** 계산.
 
         teacher forcing 이다 — 샘플링을 다시 하는 게 아니라, 이미 샘플된 토큰열의
@@ -246,7 +251,8 @@ class GRPOTrainer:
         logps = []
         for i in range(images.shape[0]):
             inputs = self.processor(
-                self.prompt, SPEC.prepare_image_for_vla(images[i])
+                SPEC.build_prompt(instructions[i]),
+                SPEC.prepare_image_for_vla(images[i]),
             ).to(self.cfg.device, dtype=torch.bfloat16)
             action_tokens = tokens[i].unsqueeze(0)
             full = torch.cat([inputs["input_ids"], action_tokens], dim=1)
@@ -291,30 +297,36 @@ class GRPOTrainer:
         return action.astype(np.float32)
 
     # -------------------------------------------------------------------------
-    def collect_group(self, seed: int):
-        """한 그룹(같은 초기 상태에서 num_envs 개 궤적)을 수집한다.
+    def collect_group(self, init_index: int):
+        """한 그룹(**같은 초기 상태**에서 num_envs 개 궤적)을 수집한다.
 
-        업데이트에 필요한 (이미지, 토큰) 쌍을 함께 들고 나온다 — 그래야
-        _recompute_logp 로 ratio 를 만들 수 있다.
+        ★ 초기 상태는 시드가 아니라 뱅크 인덱스로 지정한다 (개정 §3).
+          시드만 맞추면 배치 안의 env 들이 서로 다른 배치를 받아, advantage 가
+          "정책이 잘했는가"가 아니라 "이 env 가 쉬웠는가"를 재게 된다.
+          정수 하나를 넘기면 전 env 가 동일한 s₀ 에서 출발한다 — GRPO 의 전제.
+
+        업데이트에 필요한 (이미지, 토큰, 지시문) 을 함께 들고 나온다 — 그래야
+        _recompute_logp 로 ratio 를 만들 수 있다. 지시문이 빠지면 프롬프트가
+        수집 때와 달라져 ratio 가 무의미해진다.
 
         메모리 주의: 궤적당 스텝 수 × num_envs 개의 224² 이미지를 들고 있게 된다.
         max_steps_per_episode 를 키우면 여기가 먼저 터진다.
         """
-        obs = self.client.reset(seeds=[seed])
+        obs = self.client.reset(init_index=init_index, bank=self.cfg.bank)
         steps = int(np.ceil(self.cfg.max_steps_per_episode / SPEC.NUM_ACTIONS_CHUNK))
 
-        transitions = []      # [(images, tokens, behavior_logp), ...]
+        transitions = []      # [(images, tokens, behavior_logp, instructions), ...]
         rewards = np.zeros(self.cfg.num_envs, dtype=np.float32)
 
         for _ in range(steps):
-            images = obs["image"]
-            chunk, tokens, logp = self._sample_actions(images)
-            transitions.append((images, tokens, logp.detach()))
+            images, instr = obs["image"], obs["instruction"]
+            chunk, tokens, logp = self._sample_actions(images, instr)
+            transitions.append((images, tokens, logp.detach(), instr))
             obs, rewards, done = self.client.step(chunk)
             if bool(done.all()):
                 break
 
-        return rewards, transitions
+        return rewards, transitions, dict(self.client.last_diag)
 
     # -------------------------------------------------------------------------
     def train(self) -> int:
@@ -325,11 +337,16 @@ class GRPOTrainer:
         torch = self.torch
 
         for step in range(cfg.total_steps):
-            group_rewards, group_transitions = [], []
+            group_rewards, group_transitions, group_diags = [], [], []
             for g in range(cfg.groups_per_step):
-                r, transitions = self.collect_group(seed=step * 1000 + g)
+                # 뱅크 인덱스로 s₀ 를 지정한다. 스텝마다 다른 씬을 쓰되,
+                # 한 그룹 안에서는 전 env 가 동일한 s₀ 다 (GRPO 전제).
+                r, transitions, diag = self.collect_group(
+                    init_index=step * cfg.groups_per_step + g
+                )
                 group_rewards.append(r)
                 group_transitions.append(transitions)
+                group_diags.append(diag)
 
             rewards = np.stack(group_rewards)                      # (그룹수, num_envs)
             advantages = compute_group_advantages(rewards)
@@ -352,12 +369,15 @@ class GRPOTrainer:
                 if float(adv_row.abs().max()) < 1e-8:
                     continue
 
-                for images, tokens, behavior_logp in transitions:
-                    new_logp = self._recompute_logp(images, tokens)
+                for images, tokens, behavior_logp, instructions in transitions:
+                    new_logp = self._recompute_logp(images, tokens, instructions)
                     ratio = torch.exp(new_logp - behavior_logp.to(new_logp.dtype))
                     unclipped = ratio * adv_row
                     clipped = (
-                        torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * adv_row
+                        torch.clamp(
+                            ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps_high
+                        )
+                        * adv_row
                     )
                     loss = -torch.min(unclipped, clipped).mean()
 
@@ -387,6 +407,14 @@ class GRPOTrainer:
                 "success_rate": success_rate,
                 "loss": mean_loss,
                 "degenerate_group_frac": degen,
+                # 진단: 성공률이 낮을 때 "박스에서 못 꺼내는 것"인지
+                # "포켓에 못 넣는 것"인지 가른다 (보상에는 섞지 않는다).
+                "lifted_frac": float(
+                    np.mean([d.get("lifted", np.nan) for d in group_diags])
+                ),
+                "yaw_err": float(
+                    np.mean([d.get("yaw_err", np.nan) for d in group_diags])
+                ),
                 "updated_terms": num_terms,
                 "elapsed_min": elapsed / 60,
             }
@@ -394,6 +422,7 @@ class GRPOTrainer:
             print(
                 f"[grpo] step {step:4d} | 성공률 {success_rate:.1%} | "
                 f"loss {mean_loss:+.4f} | 무신호그룹 {degen:.0%} | "
+                f"리프트 {record['lifted_frac']:.0%} | "
                 f"{elapsed / 60:.1f}분"
             )
             if degen > 0.9:

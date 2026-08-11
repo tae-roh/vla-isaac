@@ -1,99 +1,168 @@
 # =============================================================================
 # vla_isaac_tasks/mdp/events.py
 #
-# 리셋 시 랜덤화. "리스폰마다 형태가 조금씩 달라지는 자재" 를 강체로 근사하는
-# 세 축이 여기서 만들어진다:
+# 리셋 시 씬 초기화. **랜덤 샘플링을 하지 않는다** (개정 §3).
 #
-#   축 1. 형상 — MultiAssetSpawnerCfg 가 env 별로 6종 중 하나를 배정 (materials.py)
-#   축 2. 크기 — prestartup 스케일 랜덤화 (아래)
-#   축 3. 자세 — reset 마다 위치/yaw 랜덤화 (아래)
+# 초기 배치·타깃 블록·타깃 슬롯은 전부 미리 만들어 둔 초기 상태 뱅크에서
+# 인덱스로 꺼낸다. 이유는 init_states.py 머리말 참조 — 한 줄로 요약하면
+# "GRPO 는 같은 s₀ 에서 G개를 굴려야 하고, 그러려면 s₀ 를 지정할 수 있어야 한다".
 #
-# 축 1·2 는 스폰 시점에 고정된다 (PhysX 가 런타임 지오메트리 변경을 지원하지 않음).
-# 축 3 만 매 리셋 바뀐다. 따라서 데이터 다양성은 num_envs 를 키워서 얻는다 —
-# Phase 2 에서 --num_envs 20~40 을 쓰라는 지침이 속도뿐 아니라 다양성 문제인 이유다.
+# 인덱스를 정하는 두 경로:
+#   1) 순회(기본)   — 뱅크를 순서대로 돈다. 데이터 생성·SFT 학습용.
+#   2) 강제 지정    — set_forced_indices() 로 못 박는다.
+#                     GRPO 그룹(전 env 동일 인덱스)과 평가 홀드아웃이 이걸 쓴다.
 # =============================================================================
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from isaaclab.assets import RigidObject
 from isaaclab.managers import SceneEntityCfg
 
+from .. import init_states
+from ..scene_assets import block_name
 from ..spec import SPEC
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
+# 런타임 상태. 프로세스 하나에 환경 하나라는 전제다 (Isaac Sim 이 그렇다).
+_BANK: dict = {"name": None, "states": None, "cursor": 0, "forced": None}
 
-def randomize_material_pose(
-    env: "ManagerBasedEnv",
-    env_ids: torch.Tensor,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
-    # 스펙에서 온다 — 카메라 화각 검사(assert_workspace_visible)가 같은 값을 쓰므로
-    # 여기에 숫자를 박으면 둘이 어긋난 채로 조용히 굴러간다.
-    x_range: tuple[float, float] = SPEC.MATERIAL_SPAWN_X_RANGE,
-    y_range: tuple[float, float] = SPEC.MATERIAL_SPAWN_Y_RANGE,
-    z_offset: float = 0.03,
-    yaw_range: tuple[float, float] = (-math.pi, math.pi),
-) -> None:
-    """자재를 테이블 위 무작위 위치·yaw 로 재배치한다.
 
-    ★ y_range 상한이 0.05 인 것은 의도된 값이다.
-      목표 영역 중심이 y=+0.35 (SPEC.GOAL_REGION_CENTER) 이므로, 스폰 범위를
-      목표에서 충분히 떨어뜨려 **자재가 이미 목표 안에 놓인 채로 시작하는 일이
-      없도록** 한다. 그런 에피소드는 아무것도 안 해도 성공으로 잡혀서
-      RFT 보상을 오염시키고, 성공 판정 유지 카운터의 자연 초기화도 깨뜨린다.
-      SPEC.GOAL_REGION_CENTER 를 바꾸면 이 범위도 함께 검토할 것.
+# -----------------------------------------------------------------------------
+# 뱅크 선택 / 인덱스 강제
+# -----------------------------------------------------------------------------
+def use_bank(name: str) -> np.ndarray:
+    """활성 뱅크를 바꾼다. 평가 split 을 갈아끼울 때 쓴다."""
+    _BANK["states"] = init_states.load_bank(name)
+    _BANK["name"] = name
+    _BANK["cursor"] = 0
+    _BANK["forced"] = None
+    return _BANK["states"]
 
-    z 는 자재 크기가 6종마다 달라 정확한 안착 높이를 미리 알 수 없으므로,
-    조금 띄워 놓고 물리로 떨어뜨린다 (z_offset).
+
+def set_forced_indices(indices) -> None:
+    """다음 리셋부터 쓸 뱅크 인덱스를 못 박는다.
+
+    - int 하나  → 모든 env 가 같은 초기 상태. **GRPO 그룹이 이 경로다.**
+    - 리스트    → env 별 인덱스. 평가 홀드아웃을 순서대로 돌 때 쓴다.
+    - None      → 순회 모드로 되돌린다.
     """
-    asset: RigidObject = env.scene[asset_cfg.name]
+    if indices is None:
+        _BANK["forced"] = None
+    elif isinstance(indices, (int, np.integer)):
+        _BANK["forced"] = int(indices)
+    else:
+        _BANK["forced"] = [int(i) for i in indices]
+
+
+def active_bank_name() -> str | None:
+    return _BANK["name"]
+
+
+def _rows_for(
+    env_ids: torch.Tensor, bank_name: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """이번 리셋에 쓸 뱅크 행들과 그 인덱스를 고른다."""
+    if _BANK["states"] is None or _BANK["name"] != bank_name:
+        # 학습용 뱅크는 없으면 만들어 준다 — 첫 실행이 파일 없음으로 죽지 않게.
+        # 평가 홀드아웃은 scripts/make_init_states.py 로 명시 생성해 커밋한다.
+        _BANK["states"] = init_states.ensure_bank(
+            bank_name, SPEC.TRAIN_BANK_SIZE, seed=0
+        )
+        _BANK["name"] = bank_name
+        _BANK["cursor"] = 0
+
+    states = _BANK["states"]
+    k = len(states)
     n = len(env_ids)
-    device = env.device
+    forced = _BANK["forced"]
 
-    def _uniform(lo: float, hi: float) -> torch.Tensor:
-        return torch.rand(n, device=device) * (hi - lo) + lo
+    if isinstance(forced, int):
+        idx = np.full(n, forced % k, dtype=np.int64)
+    elif forced is not None:
+        env_np = env_ids.detach().cpu().numpy()
+        idx = np.asarray([forced[int(e) % len(forced)] for e in env_np]) % k
+    else:
+        idx = (_BANK["cursor"] + np.arange(n)) % k
+        _BANK["cursor"] = int((_BANK["cursor"] + n) % k)
 
-    root_states = asset.data.default_root_state[env_ids].clone()
-
-    root_states[:, 0] = _uniform(*x_range)
-    root_states[:, 1] = _uniform(*y_range)
-    root_states[:, 2] = SPEC.TABLE_HEIGHT + z_offset
-
-    # yaw 만 랜덤화한다. roll/pitch 까지 흔들면 원뿔·캡슐이 굴러가 버려
-    # 텔레옵 데모를 만들기가 지나치게 어려워진다.
-    yaw = _uniform(*yaw_range)
-    half = yaw * 0.5
-    root_states[:, 3] = torch.cos(half)   # w
-    root_states[:, 4] = 0.0               # x
-    root_states[:, 5] = 0.0               # y
-    root_states[:, 6] = torch.sin(half)   # z
-
-    # 속도는 0 으로. 남은 속도가 있으면 리셋 직후 물체가 튀어 나간다.
-    root_states[:, 7:] = 0.0
-
-    # 월드 좌표로 올린다.
-    root_states[:, :3] += env.scene.env_origins[env_ids]
-
-    asset.write_root_pose_to_sim(root_states[:, :7], env_ids=env_ids)
-    asset.write_root_velocity_to_sim(root_states[:, 7:], env_ids=env_ids)
+    return states[idx], idx
 
 
-def reset_success_hold_counter(
+# -----------------------------------------------------------------------------
+# 리셋 이벤트
+# -----------------------------------------------------------------------------
+def reset_scene_from_bank(
     env: "ManagerBasedEnv",
     env_ids: torch.Tensor,
+    bank_name: str = "train",
 ) -> None:
-    """성공 유지 카운터를 리셋한다 (terminations.task_success 가 쓰는 버퍼).
+    """블록 배치 + 타깃(블록·슬롯)을 초기 상태 뱅크에서 복원한다.
 
-    카운터는 조건이 깨지면 스스로 0 이 되지만, 리셋 직후 첫 판정 전에 이전
-    에피소드의 값이 남아 있으면 한 스텝짜리 가짜 성공이 뜰 수 있다.
-    명시적으로 지워 두는 편이 안전하다.
+    ★ 이 함수가 초기 상태의 **유일한** 출처다. 여기 말고 다른 곳에서 블록을
+      흔들면 (예: 별도의 pose 랜덤화 이벤트) 인덱스로 s₀ 를 지정한다는 전제가
+      깨지고, GRPO 의 advantage 가 다시 노이즈가 된다.
     """
-    counter = getattr(env, "_vla_success_hold_counter", None)
-    if counter is not None:
-        counter[env_ids] = 0
+    rows, idx = _rows_for(env_ids, bank_name)
+    device = env.device
+    rows_t = torch.as_tensor(rows, dtype=torch.float32, device=device)
+
+    for b in range(SPEC.NUM_BLOCKS):
+        asset: RigidObject = env.scene[block_name(b)]
+        root = asset.data.default_root_state[env_ids].clone()
+
+        root[:, 0] = rows_t[:, 3 * b + 0]
+        root[:, 1] = rows_t[:, 3 * b + 1]
+        # 블록 반높이만큼 띄워 정확히 테이블 위에 놓는다. 모두 같은 크기라
+        # 예전처럼 "조금 띄워 놓고 떨어뜨리는" 보정이 필요 없다 —
+        # 낙하 시간이 없으니 리셋 직후 관측이 곧바로 안정 상태다.
+        root[:, 2] = SPEC.TABLE_HEIGHT + 0.5 * SPEC.BLOCK_SIZE[2]
+
+        yaw = rows_t[:, 3 * b + 2]
+        half = 0.5 * yaw
+        root[:, 3] = torch.cos(half)   # w
+        root[:, 4] = 0.0
+        root[:, 5] = 0.0
+        root[:, 6] = torch.sin(half)   # z
+        root[:, 7:] = 0.0
+
+        root[:, :3] += env.scene.env_origins[env_ids]
+        asset.write_root_pose_to_sim(root[:, :7], env_ids=env_ids)
+        asset.write_root_velocity_to_sim(root[:, 7:], env_ids=env_ids)
+
+    # 타깃 지정 — 관측·성공판정·지시문이 모두 이 두 버퍼를 읽는다.
+    tgt_block = rows_t[:, 3 * SPEC.NUM_BLOCKS].long()
+    tgt_slot = rows_t[:, 3 * SPEC.NUM_BLOCKS + 1].long()
+    _buffer(env, "_vla_target_block", torch.long)[env_ids] = tgt_block
+    _buffer(env, "_vla_target_slot", torch.long)[env_ids] = tgt_slot
+    _buffer(env, "_vla_init_index", torch.long)[env_ids] = torch.as_tensor(
+        idx, dtype=torch.long, device=device
+    )
+
+
+def reset_episode_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor) -> None:
+    """에피소드 래치·카운터를 지운다.
+
+    - `_vla_grasp_lift_latch` : 리프트 중 파지했는가 (pushcut 방지 항)
+    - `_vla_success_hold_counter` : 성공 유지 스텝 수
+
+    래치는 조건이 성립할 때만 켜지므로 이전 에피소드 값이 남으면 **밀어서
+    넣은 궤적이 성공으로 잡힌다.** 성공 판정의 핵심 항이라 반드시 지운다.
+    """
+    _buffer(env, "_vla_grasp_lift_latch", torch.bool)[env_ids] = False
+    _buffer(env, "_vla_success_hold_counter", torch.long)[env_ids] = 0
+
+
+def _buffer(env, attr: str, dtype: torch.dtype) -> torch.Tensor:
+    """env 에 붙은 (num_envs,) 버퍼를 가져오거나 만든다."""
+    buf = getattr(env, attr, None)
+    if buf is None or buf.shape[0] != env.num_envs or buf.dtype != dtype:
+        buf = torch.zeros(env.num_envs, dtype=dtype, device=env.device)
+        setattr(env, attr, buf)
+    return buf
