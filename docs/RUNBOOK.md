@@ -156,15 +156,31 @@ mkdir -p datasets
 VLA_ANNOUNCE_TARGET=1 python $ISAACLAB_DIR/scripts/tools/record_demos.py \
     --task VlaPlace-v0 --teleop_device keyboard --enable_cameras \
     --dataset_file ./datasets/source.hdf5 --num_demos 15 \
-    --step_hz 24 --livestream 2
+    --step_hz 24 --num_success_steps 1 --livestream 2
 ```
 
 `--enable_cameras` 는 필수다 — 씬에 `TiledCamera` 가 있어 없으면 센서 초기화가 실패한다.
 `--step_hz 24` 는 우리 제어 주기(decimation 5 × dt 1/120 = 24Hz)에 맞춘 값이다.
-`--num_success_steps` 는 기본 10 이고 `SPEC.SUCCESS_HOLD_STEPS` 와 같으므로 건드리지 않는다.
+
+**`--num_success_steps 1` 을 반드시 넘길 것.** 유지 시간은 환경이 이미 센다
+(`SPEC.SUCCESS_HOLD_STEPS` = 48스텝 = 2초). `record_demos.py` 는 그 위에서 또
+`--num_success_steps` 만큼 연속 성공을 세므로, 기본값 10 을 그대로 두면 총
+57스텝(2.4초)을 요구하게 된다. 1 로 두면 정확히 2초다.
+
+> **에피소드는 시간으로 끝나지 않는다.** `record_demos.py` 가
+> `env_cfg.terminations.time_out = None` 으로 타임아웃을 꺼 버린다("목표에
+> 도달할 때까지 무한히 돌린다"). 그래서 12.5초가 지나도 리셋되지 않는 것이
+> **정상**이다. 녹화 중 종료 조건은 성공 판정과 `object_dropped` 둘뿐이다.
+> 다만 12.5초(300스텝)는 평가·RFT 롤아웃에서는 실제로 잘리는 예산이므로,
+> 데모가 그보다 길면 정책이 따라 할 시간이 없다는 뜻이다 — 짧게 만들 것.
+
+> **녹화는 리스폰 즉시 시작된다.** 움직이기 시작할 때가 아니다
+> (`running_recording_instance` 가 처음부터 True). 리셋 직후 멍하니 있는
+> 시간도 그대로 데이터에 들어가므로, 지시문을 확인했으면 바로 움직일 것.
 
 **품질 체크리스트 — 생성 성공률에 직결된다:**
 - [ ] **안내에 찍힌 색의 블록을 집었는가** ← 틀리면 그 에피소드는 저장되지 않는다
+- [ ] 트레이에 넣은 뒤 **2초는 그대로 둘 것** — 유지 조건을 못 채우면 성공이 안 뜬다
 - [ ] 궤적이 짧은가 (불필요한 이동 최소화)
 - [ ] 직선 경로인가 (축 단위로 나눠 움직이지 말 것)
 - [ ] **일시정지가 없는가** ← 키보드 조작의 최대 함정. 멈춤은 정책이 학습하기 어렵다
@@ -180,18 +196,39 @@ VLA_ANNOUNCE_TARGET=1 python $ISAACLAB_DIR/scripts/tools/record_demos.py \
 VLA_ANNOUNCE_TARGET=1 python $ISAACLAB_DIR/scripts/tools/record_demos.py \
     --task VlaPlace-v0 --teleop_device gamepad --enable_cameras \
     --dataset_file ./datasets/source.hdf5 --num_demos 15 \
-    --step_hz 24 --livestream 2
+    --step_hz 24 --num_success_steps 1 --livestream 2
 ```
 
 두 장치 모두 `pickplace_env_cfg.py` 의 `teleop_devices` 에 등록되어 있다
 (키보드 감도 0.05 / 게임패드 1.0·1.6 + dead_zone 0.01).
 감도가 안 맞으면 그 값을 조정한다.
 
+### 재생 검증 + 품질 선별
+
+데모는 **한 파일에** `demo_0, demo_1, ...` 로 쌓인다. 성공했다고 품질이 좋은 것은
+아니므로, 나쁜 것을 골라내고 간다 — 궤적이 길거나 중간에 멈춘 데모는 Mimic 생성
+성공률을 직접 깎는다.
+
 ```bash
-# 재생 검증 — 물리 비결정성으로 일부는 실패한다. 넉넉히 수집했으면 정상.
+# 1) 무엇이 들어 있나 (길이·정지구간 통계, 의심 후보에 ←? 표시)
+python scripts/filter_demos.py --inspect datasets/source.hdf5
+
+# 2) 전체 재생 — 물리 비결정성으로 일부는 실패한다. 넉넉히 수집했으면 정상.
 python $ISAACLAB_DIR/scripts/tools/replay_demos.py \
     --task VlaPlace-v0 --enable_cameras --dataset_file ./datasets/source.hdf5
+
+# 3) 의심스러운 것만 골라 다시 재생 (--select_episodes 는 Isaac Lab 기본 기능)
+python $ISAACLAB_DIR/scripts/tools/replay_demos.py \
+    --task VlaPlace-v0 --enable_cameras \
+    --dataset_file ./datasets/source.hdf5 --select_episodes 3 7 11
+
+# 4) 좋은 것만 남긴다 (원본은 그대로 둔다)
+python scripts/filter_demos.py --input datasets/source.hdf5 \
+    --output datasets/source_clean.hdf5 --drop 3 7 11
 ```
+
+이후 §1-5 어노테이션의 `--input_file` 을 `source_clean.hdf5` 로 바꿔 쓴다.
+재생 성공률만 자동으로 보고 싶으면 `--validate_success_rate` 를 붙이면 된다.
 
 ### 1-5. 어노테이션 + 시험 생성 (~1시간) ★ 조기 경보 지점
 

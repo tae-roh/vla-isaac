@@ -296,8 +296,11 @@ def place_start_signal(
 # -----------------------------------------------------------------------------
 # 성공 술어 (sparse binary) — 개정 §2-5
 # -----------------------------------------------------------------------------
-#   success = in_tray AND settled AND grasped_during_lift
-#             (+ yaw_aligned 은 SPEC.SUCCESS_REQUIRE_YAW 가 True 일 때만)
+#   success = (블록 바닥면이 트레이 영역과 겹침) AND (레일 위가 아님)
+#             [+ settled / grasped_during_lift / yaw_aligned 은 각각의
+#              SPEC.SUCCESS_REQUIRE_* 플래그가 True 일 때만]
+#   → 이 조건을 SPEC.SUCCESS_HOLD_STEPS(2초) 연속 유지해야 종료된다
+#     (terminations.task_success).
 #
 # dense shaping 은 넣지 않는다. 목표까지의 거리 항은 "밀기/끌기"를 적극적으로
 # 보상해 파지 없는 정책으로 수렴시킨다.
@@ -346,6 +349,43 @@ def grasped_during_lift(
     return latch
 
 
+def block_overlaps_tray(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """타깃 블록의 바닥면이 트레이 안쪽 영역과 겹치는가. Shape (num_envs,) bool.
+
+    "블록의 한 점이라도 트레이 영역 안" 을 그대로 구현한 것이다. 중심이 어디에
+    있는지, yaw 가 얼마인지는 묻지 않는다 — 두 사각형(축정렬 트레이 × 회전한
+    블록)이 조금이라도 겹치면 True.
+
+    ★ 분리축 정리(SAT). 볼록 다각형 둘은 **어떤 축에서도 분리되지 않을 때만**
+      겹친다. 사각형 둘이면 후보 축은 각자의 변 법선 4개뿐이라 이 4개만 보면
+      정확한 판정이 된다 (근사가 아니다).
+
+      축 a 에 대해:
+        트레이 반폭 = ht·(|aₓ| + |a_y|)      (정사각이라 두 변 반폭이 같다)
+        블록 반폭   = hbw·|a·u| + hbh·|a·v|   (u, v = 블록의 두 변 방향)
+        겹침 ⟺ |중심차·a| ≤ 트레이반폭 + 블록반폭
+    """
+    pose = target_block_pose(env)
+    tray = target_tray_pose(env)
+
+    d = pose[:, :2] - tray[:, :2]                       # 중심차 (N, 2)
+    _, _, yaw = math_utils.euler_xyz_from_quat(pose[:, 3:7])
+    c, s = torch.cos(yaw), torch.sin(yaw)               # 블록 축 u=(c,s), v=(-s,c)
+
+    ht = SPEC.tray_half_extent()
+    hbw, hbh = SPEC.block_half_extents()
+    ac, as_ = c.abs(), s.abs()
+
+    # 축 1·2: 트레이의 변 법선 (1,0) 과 (0,1)
+    sep_x = d[:, 0].abs() > ht + (hbw * ac + hbh * as_)
+    sep_y = d[:, 1].abs() > ht + (hbw * as_ + hbh * ac)
+    # 축 3·4: 블록의 변 법선 u, v
+    sep_u = (d[:, 0] * c + d[:, 1] * s).abs() > ht * (ac + as_) + hbw
+    sep_v = (-d[:, 0] * s + d[:, 1] * c).abs() > ht * (as_ + ac) + hbh
+
+    return ~(sep_x | sep_y | sep_u | sep_v)
+
+
 def placed_signal(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -357,26 +397,26 @@ def placed_signal(
     "보상과 평가 기준이 같은 코드에서 나온다"는 것이 중요하다. 따로 구현하면
     RFT 가 최적화하는 것과 우리가 측정하는 것이 미묘하게 달라진다.
     """
-    block = target_block_pose(env)
-    tray = target_tray_pose(env)
+    # (1) 트레이와 겹침 — 블록의 **한 점이라도** 트레이 영역 안이면 인정한다.
+    ok = block_overlaps_tray(env)
 
-    # (1) 트레이 안 — 정사각이라 축별(체비셰프) 판정이 지오메트리에 맞는다.
-    #     반지름 원으로 재면 트레이 모서리 밖도 통과해 버린다.
-    d = (block[:, :2] - tray[:, :2]).abs()
-    in_tray = d.amax(dim=-1) < SPEC.tray_xy_tolerance()
     # 레일 위에 걸쳐 있는 상태와 구분한다. xy 만 보면 얹혀 있어도 성공이 된다.
-    in_tray &= block[:, 2] < SPEC.tray_seat_z_max()
+    # 겹침 판정이 매우 관대해졌으므로 이 z 검사가 "정말 안에 들어갔는가" 를
+    # 지탱하는 축이다 — 레일에 걸친 블록은 중심 z 가 레일 높이만큼 올라간다.
+    ok &= target_block_pose(env)[:, 2] < SPEC.tray_seat_z_max()
 
-    # (2) 정지 — 굴러가거나 튀는 중에 성공이 뜨는 것을 막는다.
-    settled = (
-        torch.linalg.norm(target_block_lin_vel(env), dim=-1)
-        < SPEC.SUCCESS_LIN_VEL_THRESHOLD
-    )
+    # (2) 정지 — 굴러 지나가는 중에 성공이 뜨는 것을 막는다.
+    if SPEC.SUCCESS_REQUIRE_SETTLED:
+        ok &= (
+            torch.linalg.norm(target_block_lin_vel(env), dim=-1)
+            < SPEC.SUCCESS_LIN_VEL_THRESHOLD
+        )
 
-    # (3) 리프트 구간 동안 파지 — 밀기·끌기 배제.
-    lifted = grasped_during_lift(env, robot_cfg=robot_cfg, ee_frame_cfg=ee_frame_cfg)
-
-    ok = in_tray & settled & lifted
+    # (3) 리프트 구간 동안 파지 — 밀기·끌기 배제 (pushcut).
+    if SPEC.SUCCESS_REQUIRE_GRASP_LIFT:
+        ok &= grasped_during_lift(
+            env, robot_cfg=robot_cfg, ee_frame_cfg=ee_frame_cfg
+        )
 
     # (4) yaw 정렬 — 기본은 **끈다**. 넓은 정사각 트레이는 블록 대각선보다 커서
     #     yaw 를 물리적으로 강제하지 못한다. 물리가 돕지 않는 조건을 판정에만

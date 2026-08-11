@@ -416,14 +416,26 @@ SUCCESS_YAW_TOLERANCE = 0.20         # 약 11.5도
 SUCCESS_REQUIRE_YAW = False
 
 
-def tray_xy_tolerance() -> float:
-    """블록 중심이 트레이 중심에서 이만큼 안이면 "트레이 안" 으로 본다 [m].
+# ★ 파지-리프트 래치를 성공 조건에 넣을 것인가 (pushcut 방지).
+#   True  = 에피소드 중 한 번은 "쥔 채로 박스 벽 위까지" 들어올렸어야 한다.
+#           사람에게는 부담이 아니다 — 박스 벽이 45mm 라 끌어서는 못 빼낸다.
+#           끄면 RFT 가 "밀어서 트레이까지 굴리기" 로 수렴할 여지가 생긴다.
+#   False = 어떻게 넣었는지 묻지 않는다.
+SUCCESS_REQUIRE_GRASP_LIFT = True
 
-    축별(체비셰프) 판정이다 — 트레이가 정사각이므로 반지름 원보다 지오메트리에
-    맞는다. 레일이 물리적으로 막아 주므로 값 자체는 "안에 들어갔는가" 를
-    가르는 용도이고, 얹혀 있는 상태는 tray_seat_z_max() 가 따로 걸러낸다.
-    """
+# ★ 블록이 정지해 있어야 하는가. 2초 유지 조건이 이미 대부분 걸러내지만,
+#   "굴러 지나가는 중" 을 성공으로 세지 않으려면 켜 두는 편이 안전하다.
+SUCCESS_REQUIRE_SETTLED = True
+
+
+def tray_half_extent() -> float:
+    """트레이 안쪽 영역의 반폭 [m]. 정사각이라 x·y 가 같다."""
     return 0.5 * TRAY_INNER_SIZE
+
+
+def block_half_extents() -> tuple[float, float]:
+    """블록 바닥면(가로, 세로) 반폭 [m]. 겹침 판정의 나머지 절반."""
+    return (0.5 * BLOCK_SIZE[0], 0.5 * BLOCK_SIZE[1])
 
 
 def tray_seat_z_max() -> float:
@@ -468,10 +480,22 @@ APPROACH_START_DISTANCE = 0.15
 # 접근해 정렬·하강을 시작하는 지점부터가 사람 데모가 필요한 구간이다.
 PLACE_START_RADIUS = 0.12
 
-# 성공 후 녹화를 바로 끊지 않고 유지할 스텝 수.
+# 성공 조건을 이만큼 **연속으로** 유지해야 성공으로 친다.
+#
 # 계획서 §Phase1-3 경고: 성공 시점에 녹화가 즉시 끊기면 replay 에서 성공 조건이
-# 재트리거되지 않아 데모가 통째로 버려진다.
-SUCCESS_HOLD_STEPS = 10
+# 재트리거되지 않아 데모가 통째로 버려진다. 유지 구간이 그 완충이다.
+#
+# ★ 2초로 잡았다 (24Hz × 48). "트레이에 스치고 지나갔다" 를 배제하려는 것이다 —
+#   겹침 판정을 "블록의 한 점이라도 트레이 영역과 겹치면" 으로 크게 완화했기
+#   때문에, 판정을 지탱하는 축이 정밀도에서 **지속시간**으로 옮겨 갔다.
+#
+# ★ record_demos.py 와 이중으로 걸리지 않게 할 것.
+#   그 스크립트는 terminations.success 를 떼어내 자기가 직접 평가하면서
+#   `--num_success_steps` 만큼 연속 성공을 또 센다. task_success 가 이미 여기서
+#   48스텝을 세므로, 총 요구치는 (48 + num_success_steps - 1) 이 된다.
+#   그래서 RUNBOOK 은 `--num_success_steps 1` 을 넘긴다.
+SUCCESS_HOLD_SECONDS = 2.0
+SUCCESS_HOLD_STEPS = round(SUCCESS_HOLD_SECONDS / (SIM_DT * DECIMATION))  # 48
 
 # -----------------------------------------------------------------------------
 # 시드 재현성 / 초기 상태 뱅크 (개정 §3) — RL 코드보다 먼저 만들어야 하는 인프라
@@ -555,9 +579,12 @@ def assert_consistent() -> None:
         f"트레이 레일 높이 {TRAY_DEPTH} 가 블록 높이 {BLOCK_SIZE[2]} 이상이면 "
         "블록이 레일에 파묻혀 그리퍼가 놓을 수 없다."
     )
-    # 성공 공차가 트레이 밖으로 새지 않아야 한다.
-    assert tray_xy_tolerance() <= 0.5 * TRAY_INNER_SIZE + 1e-9, (
-        "in_tray 공차가 트레이 반폭보다 크면 트레이 밖에 놓아도 성공이 된다."
+    # 유지 시간이 에피소드 예산 안에 들어와야 한다. 유지 구간이 에피소드보다
+    # 길면 성공이 원리적으로 불가능해진다 (녹화 때는 타임아웃이 꺼지지만
+    # 평가·RFT 롤아웃은 MAX_EPISODE_STEPS 에서 잘린다).
+    assert 0 < SUCCESS_HOLD_STEPS < MAX_EPISODE_STEPS // 2, (
+        f"성공 유지 {SUCCESS_HOLD_STEPS}스텝이 에피소드 {MAX_EPISODE_STEPS}스텝의 "
+        "절반 이상이다 — 태스크를 끝낼 시간이 남지 않는다."
     )
     # 리프트 경계가 박스 벽 위여야 스티칭 구간에 충돌 위험이 없다.
     assert LIFT_HEIGHT_THRESHOLD > BOX_WALL_HEIGHT, (
@@ -752,10 +779,12 @@ def summary() -> str:
         f"{TRAY_INNER_SIZE * 1000:.0f}mm (블록 긴축 대비 "
         f"{TRAY_INNER_SIZE / BLOCK_SIZE[0]:.2f}배), 레일높이 "
         f"{TRAY_DEPTH * 1000:.0f}mm\n"
-        f"  성공 판정 : xy공차 ±{tray_xy_tolerance() * 1000:.0f}mm(축별), "
-        f"안착 z ≤ {tray_seat_z_max() * 1000:.0f}mm, "
-        f"yaw 조건 {'사용' if SUCCESS_REQUIRE_YAW else '미사용(진단만)'}"
-        f" [{SUCCESS_YAW_TOLERANCE:.2f}rad]\n"
+        f"  성공 판정 : 블록 바닥면이 트레이 영역과 겹치면 OK (중심 기준 아님), "
+        f"안착 z ≤ {tray_seat_z_max() * 1000:.0f}mm\n"
+        f"              유지 {SUCCESS_HOLD_SECONDS:.1f}초 = {SUCCESS_HOLD_STEPS}스텝 / "
+        f"정지조건 {'O' if SUCCESS_REQUIRE_SETTLED else 'X'}, "
+        f"파지리프트 {'O' if SUCCESS_REQUIRE_GRASP_LIFT else 'X'}, "
+        f"yaw {'O' if SUCCESS_REQUIRE_YAW else 'X(진단만)'}\n"
     )
 
 
