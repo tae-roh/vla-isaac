@@ -69,8 +69,8 @@ def inspect_hdf5(paths: list[Path]) -> dict:
                 lengths.append(len(actions))
                 total_demos += 1
                 if "target_ids" in demo["obs"]:
-                    tb, ts = np.asarray(demo["obs"]["target_ids"])[0][:2]
-                    instructions.append(SPEC.instruction_for(int(tb), int(ts)))
+                    tb = np.asarray(demo["obs"]["target_ids"])[0][0]
+                    instructions.append(SPEC.instruction_for(int(tb)))
 
             if demo_keys:
                 sample = data[demo_keys[0]]

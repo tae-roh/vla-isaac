@@ -69,11 +69,6 @@ def target_block_index(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return _index_buffer(env, "_vla_target_block")
 
 
-def target_slot_index(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """각 env 의 타깃 슬롯 인덱스. Shape (num_envs,) long."""
-    return _index_buffer(env, "_vla_target_slot")
-
-
 def all_block_poses(env: "ManagerBasedRLEnv") -> torch.Tensor:
     """블록 전체의 pos+quat (env 로컬). Shape (num_envs, NUM_BLOCKS, 7)."""
     poses = []
@@ -109,38 +104,41 @@ def target_block_lin_vel(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return _gather_target(env, vels)
 
 
-def target_pocket_pose(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """타깃 포켓의 pos+quat (env 로컬). Shape (num_envs, 7).
+def target_tray_pose(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """타깃 트레이의 pos+quat (env 로컬). Shape (num_envs, 7).
 
-    포켓은 정지 구조물이라 씬에서 읽을 필요 없이 스펙에서 만들어 낸다.
-    쿼터니언은 항등 — 포켓 장축이 x축과 나란하다는 것이 yaw 정렬의 기준이다.
+    트레이는 정지 구조물이고 **하나뿐**이라 씬에서 읽을 필요 없이 스펙에서
+    만들어 낸다. 모든 env 가 같은 값이다.
+    쿼터니언은 항등 — 트레이 변이 x/y 축과 나란하다는 것이 yaw 오차의 기준이다.
 
     Mimic 의 두 번째 서브태스크(배치)가 이 pose 를 기준 오브젝트로 쓴다.
-    타깃 슬롯이 env 마다 다르므로, 이게 없으면 증강된 궤적이 전부 같은 포켓으로
-    간다 — 언어 조건이 데이터에서 사라진다.
     """
-    centers = torch.tensor(
-        [SPEC.pocket_center(i) for i in range(len(SPEC.SLOT_NAMES))],
+    tx, ty = SPEC.tray_center()
+    xy = torch.tensor([tx, ty], device=env.device, dtype=torch.float32)
+    xy = xy.unsqueeze(0).expand(env.num_envs, 2)
+    z = torch.full(
+        (env.num_envs, 1),
+        SPEC.TABLE_HEIGHT + 0.5 * SPEC.BLOCK_SIZE[2],
         device=env.device,
         dtype=torch.float32,
-    )                                                     # (num_slots, 2)
-    xy = centers[target_slot_index(env)]                  # (num_envs, 2)
-    z = torch.full_like(xy[:, :1], SPEC.TABLE_HEIGHT + 0.5 * SPEC.BLOCK_SIZE[2])
+    )
     quat = torch.zeros(env.num_envs, 4, device=env.device)
     quat[:, 0] = 1.0
     return torch.cat([xy, z, quat], dim=-1)
 
 
 def target_ids(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """[타깃 블록 idx, 타깃 슬롯 idx]. Shape (num_envs, 2) float.
+    """[타깃 블록 idx]. Shape (num_envs, 1) float.
 
     지시문 문자열을 만드는 재료다. 관측으로 내보내는 이유: 롤아웃 워커와
     HDF5→RLDS 변환이 **같은 소스**에서 지시문을 만들어야 하기 때문이다.
     두 곳에서 따로 만들면 SFT 데이터의 지시문과 RFT 롤아웃의 지시문이 어긋난다.
+
+    ★ 트레이 단일화로 슬롯 인덱스가 빠져 (num_envs, 2) → (num_envs, 1) 이
+      되었다. 개편 이전 HDF5 를 읽는 코드는 두 번째 열을 기대하므로,
+      그런 데이터는 재수집 대상이다.
     """
-    return torch.stack(
-        [target_block_index(env).float(), target_slot_index(env).float()], dim=-1
-    )
+    return target_block_index(env).float().unsqueeze(-1)
 
 
 # -----------------------------------------------------------------------------
@@ -290,7 +288,7 @@ def place_start_signal(
     """
     grasped = target_grasped(env, robot_cfg=robot_cfg, ee_frame_cfg=ee_frame_cfg)
     dxy = torch.linalg.norm(
-        target_block_pose(env)[:, :2] - target_pocket_pose(env)[:, :2], dim=-1
+        target_block_pose(env)[:, :2] - target_tray_pose(env)[:, :2], dim=-1
     )
     return grasped & (dxy < start_radius)
 
@@ -298,7 +296,8 @@ def place_start_signal(
 # -----------------------------------------------------------------------------
 # 성공 술어 (sparse binary) — 개정 §2-5
 # -----------------------------------------------------------------------------
-#   success = in_pocket AND yaw_aligned AND settled AND grasped_during_lift
+#   success = in_tray AND settled AND grasped_during_lift
+#             (+ yaw_aligned 은 SPEC.SUCCESS_REQUIRE_YAW 가 True 일 때만)
 #
 # dense shaping 은 넣지 않는다. 목표까지의 거리 항은 "밀기/끌기"를 적극적으로
 # 보상해 파지 없는 정책으로 수렴시킨다.
@@ -358,26 +357,32 @@ def placed_signal(
     "보상과 평가 기준이 같은 코드에서 나온다"는 것이 중요하다. 따로 구현하면
     RFT 가 최적화하는 것과 우리가 측정하는 것이 미묘하게 달라진다.
     """
-    clearance = getattr(env.cfg, "pocket_clearance", SPEC.POCKET_CLEARANCE)
     block = target_block_pose(env)
-    pocket = target_pocket_pose(env)
+    tray = target_tray_pose(env)
 
-    # (1) 포켓 안 — xy 공차는 클리어런스에서 파생된다 (split 마다 함께 조여진다).
-    dxy = torch.linalg.norm(block[:, :2] - pocket[:, :2], dim=-1)
-    in_pocket = dxy < SPEC.pocket_xy_tolerance(clearance)
+    # (1) 트레이 안 — 정사각이라 축별(체비셰프) 판정이 지오메트리에 맞는다.
+    #     반지름 원으로 재면 트레이 모서리 밖도 통과해 버린다.
+    d = (block[:, :2] - tray[:, :2]).abs()
+    in_tray = d.amax(dim=-1) < SPEC.tray_xy_tolerance()
     # 레일 위에 걸쳐 있는 상태와 구분한다. xy 만 보면 얹혀 있어도 성공이 된다.
-    in_pocket &= block[:, 2] < SPEC.pocket_seat_z_max()
+    in_tray &= block[:, 2] < SPEC.tray_seat_z_max()
 
-    # (2) yaw 정렬 — 대칭 차수를 고려한다.
-    yaw_aligned = yaw_error(env) < SPEC.SUCCESS_YAW_TOLERANCE
-
-    # (3) 정지 — 굴러가거나 튀는 중에 성공이 뜨는 것을 막는다.
+    # (2) 정지 — 굴러가거나 튀는 중에 성공이 뜨는 것을 막는다.
     settled = (
         torch.linalg.norm(target_block_lin_vel(env), dim=-1)
         < SPEC.SUCCESS_LIN_VEL_THRESHOLD
     )
 
-    # (4) 리프트 구간 동안 파지 — 밀기·끌기 배제.
+    # (3) 리프트 구간 동안 파지 — 밀기·끌기 배제.
     lifted = grasped_during_lift(env, robot_cfg=robot_cfg, ee_frame_cfg=ee_frame_cfg)
 
-    return in_pocket & yaw_aligned & settled & lifted
+    ok = in_tray & settled & lifted
+
+    # (4) yaw 정렬 — 기본은 **끈다**. 넓은 정사각 트레이는 블록 대각선보다 커서
+    #     yaw 를 물리적으로 강제하지 못한다. 물리가 돕지 않는 조건을 판정에만
+    #     요구하면 사람도 정책도 맨손으로 맞춰야 한다.
+    #     yaw_error 는 관측(yaw_error_obs)으로 계속 나가므로 진단은 가능하다.
+    if SPEC.SUCCESS_REQUIRE_YAW:
+        ok &= yaw_error(env) < SPEC.SUCCESS_YAW_TOLERANCE
+
+    return ok

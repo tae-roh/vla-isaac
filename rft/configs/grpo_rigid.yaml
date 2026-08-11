@@ -20,7 +20,7 @@
 # =============================================================================
 
 checkpoint: ""                    # --checkpoint 로 넘기거나 여기에 채운다
-task: VlaPlace-v0                 # 클리어런스 split 은 VlaPlace-c1mm-v0 처럼 지정
+task: VlaPlace-v0                 # 등록된 태스크는 이것 하나뿐이다
 bank: train                       # 초기 상태 뱅크. 평가 홀드아웃(eval_base)과 달라야 한다
 isaaclab_python: ~/env_isaaclab/bin/python
 

@@ -47,19 +47,18 @@ def show(name: str) -> int:
             f"{row[3 * b + 2]:+.2f}rad)"
             for b in range(n)
         )
-        tb, ts = int(row[3 * n]), int(row[3 * n + 1])
+        tb = int(row[3 * n])
         print(f"  [{i}] {blocks}")
-        print(f"       → {SPEC.instruction_for(tb, ts)!r}")
+        print(f"       → {SPEC.instruction_for(tb)!r}")
     if len(bank) > 5:
         print(f"  ... 외 {len(bank) - 5}개")
 
     # 지시문 분포 — 한쪽으로 쏠리면 언어 채널이 사실상 죽는다.
     import collections
 
-    counts = collections.Counter(
-        (int(r[3 * n]), int(r[3 * n + 1])) for r in bank
-    )
-    print(f"  (블록,슬롯) 조합 {len(counts)}종 / "
+    counts = collections.Counter(int(r[3 * n]) for r in bank)
+    named = {SPEC.BLOCK_ATTRS[k]: v for k, v in sorted(counts.items())}
+    print(f"  타깃 블록 {len(counts)}종 {named} / "
           f"최소 {min(counts.values())}회, 최대 {max(counts.values())}회")
     return 0
 

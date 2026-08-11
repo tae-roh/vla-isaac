@@ -10,7 +10,7 @@
 #   목표영역(GOAL_REGION_*) 전제가 모두 스펙에서 사라졌다.
 #
 #   되살릴 때 할 일:
-#     - 성공 술어를 새 술어(in_pocket/yaw/settled/grasped_during_lift)로 포팅
+#     - 성공 술어를 새 술어(in_tray/settled/grasped_during_lift)로 포팅
 #     - 박막 지오메트리로 교체 (얇은 메시는 convex hull cooking 이 GPU 에서
 #       실패해 CPU 폴백이 나고, 그러면 변형체 충돌이 아예 동작하지 않는다.
 #       그 경고 로그를 반드시 확인할 것)

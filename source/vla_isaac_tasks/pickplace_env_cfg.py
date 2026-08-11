@@ -31,7 +31,7 @@ from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.utils import configclass
 
 from . import mdp
-from .scene_assets import apply_clearance, box_wall, make_block_cfg, tray_rail
+from .scene_assets import box_wall, make_block_cfg, tray_rail
 from .spec import SPEC
 
 ##
@@ -45,7 +45,7 @@ from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG  # isort: ski
 assert SPEC.NUM_BLOCKS == 3, (
     f"SPEC.NUM_BLOCKS={SPEC.NUM_BLOCKS} 인데 씬에는 블록 필드가 3개뿐이다. "
     "PickPlaceSceneCfg 의 block_* 필드를 함께 늘리고, BLOCK_COLORS / "
-    "BLOCK_ATTRS / SLOT_NAMES 도 같이 맞출 것."
+    "BLOCK_ATTRS 도 같이 맞출 것."
 )
 
 
@@ -100,16 +100,11 @@ class PickPlaceSceneCfg(InteractiveSceneCfg):
     box_y_pos = box_wall("box_y_pos")
     box_y_neg = box_wall("box_y_neg")
 
-    # --- 트레이: 긴 레일 2장 + 포켓별 칸막이 2장 ---
-    # 클리어런스 split 은 apply_clearance() 가 이 필드들을 통째로 갈아끼운다.
+    # --- 타깃 트레이: 정사각 하나, 레일 4장 ---
     tray_x_pos = tray_rail("tray_x_pos")
     tray_x_neg = tray_rail("tray_x_neg")
-    pocket0_y_pos = tray_rail("pocket0_y_pos")
-    pocket0_y_neg = tray_rail("pocket0_y_neg")
-    pocket1_y_pos = tray_rail("pocket1_y_pos")
-    pocket1_y_neg = tray_rail("pocket1_y_neg")
-    pocket2_y_pos = tray_rail("pocket2_y_pos")
-    pocket2_y_neg = tray_rail("pocket2_y_neg")
+    tray_y_pos = tray_rail("tray_y_pos")
+    tray_y_neg = tray_rail("tray_y_neg")
 
     # 엔드이펙터 프레임 — Mimic 의 get_robot_eef_pose 가 이 값을 쓴다.
     ee_frame: FrameTransformerCfg = FrameTransformerCfg(
@@ -137,9 +132,9 @@ class PickPlaceSceneCfg(InteractiveSceneCfg):
 
     # 3인칭 단일 카메라. 손목캠은 넣지 않는다 (단일 뷰 스펙).
     # TiledCamera 를 쓰는 이유: 병렬 env 렌더가 CameraCfg 보다 크게 빠르다.
-    # ★ 박스와 트레이가 **둘 다** 화각에 들어와야 한다. Day 1 에
-    #   dump_obs_reference.py 의 PNG 로 확인하고, 슬롯 좌우가 지시문의
-    #   left/right 와 맞는지도 같이 볼 것 (SPEC.SLOT_Y_SIGN).
+    # ★ 박스와 타깃 트레이가 **둘 다** 화각에 들어와야 한다.
+    #   dump_obs_reference.py 의 PNG 로 확인할 것 (스펙의
+    #   assert_workspace_visible() 이 렌더 없이 먼저 걸러 준다).
     table_cam: TiledCameraCfg = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/table_cam",
         update_period=0.0,
@@ -226,7 +221,7 @@ class ObservationsCfg:
         # ★ target_ids 가 지시문의 유일한 출처다. 롤아웃 워커와 RLDS 변환이
         #   같은 값에서 문장을 만들어야 SFT 와 RFT 의 지시문이 어긋나지 않는다.
         target_pose = ObsTerm(func=mdp.target_block_pose)
-        pocket_pose = ObsTerm(func=mdp.target_pocket_pose)
+        tray_pose = ObsTerm(func=mdp.target_tray_pose)
         target_ids = ObsTerm(func=mdp.target_ids)
 
         # --- 진단 채널 (정책은 안 본다. 롤아웃 워커가 평균만 보고한다) ---
@@ -366,15 +361,6 @@ class PickPlaceEnvCfg(ManagerBasedRLEnvCfg):
     terminations: TerminationsCfg = TerminationsCfg()
     commands = None
     curriculum = None
-
-    # ★ 연속 난이도 축 (개정 §2-3b). 성공 판정 공차가 이 값에서 파생되므로
-    #   포켓 지오메트리와 반드시 함께 움직여야 한다 → set_clearance() 를 쓸 것.
-    pocket_clearance: float = SPEC.POCKET_CLEARANCE
-
-    def set_clearance(self, clearance: float) -> None:
-        """클리어런스 split 을 만든다. 포켓 레일과 판정 공차를 함께 바꾼다."""
-        self.pocket_clearance = clearance
-        apply_clearance(self.scene, clearance)
 
     def __post_init__(self):
         self.decimation = SPEC.DECIMATION

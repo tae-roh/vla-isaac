@@ -151,13 +151,13 @@ class VlaPick(tfds.core.GeneratorBasedBuilder):
 
         state = self._build_state(obs, num_steps)
 
-        # 지시문은 에피소드마다 다르다 — 타깃 블록·슬롯이 다르기 때문이다.
+        # 지시문은 에피소드마다 다르다 — 타깃 블록이 다르기 때문이다.
         # ★ 환경이 기록한 target_ids 에서 만든다. 여기서 문자열을 지어내면
         #   롤아웃(rft/isaaclab_rollout_worker.py)이 만드는 문장과 어긋나고,
         #   증상은 "SFT 는 되는데 RFT 를 켜니 무너진다" 로만 나타난다.
         if "target_ids" in obs:
-            tb, ts = np.asarray(obs["target_ids"])[0][:2]
-            instruction = SPEC.instruction_for(int(tb), int(ts))
+            tb = np.asarray(obs["target_ids"])[0][0]
+            instruction = SPEC.instruction_for(int(tb))
         else:
             raise ValueError(
                 f"{path.name}/{demo_key}: 관측에 target_ids 가 없다. "

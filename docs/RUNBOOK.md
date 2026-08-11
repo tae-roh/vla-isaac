@@ -9,8 +9,8 @@
 |---|---|---|
 | 1 | 1× L40S (포트 개방) | 환경 3종 동작 + 데모 12~15개 + 야간 증강 배치 |
 | 2 | L40S 유지 + H100 신규 | RLDS 데이터셋 / SFT 착수 ∥ RFT 인프라 |
-| 3 | RFT 인스턴스 (2~4× L40S) | split 별 SFT 베이스라인 + RFT 착수 |
-| 4 | 동일 | **클리어런스 곡선 SR_SFT(c) vs SR_SFT+RL(c) (핵심 결과)** |
+| 3 | RFT 인스턴스 (2~4× L40S) | SFT 베이스라인 + RFT 착수 |
+| 4 | 동일 | **SFT 대비 RFT 성공률 개선폭 (핵심 결과)** |
 
 **Day 2 부터는 두 인스턴스가 동시에 돈다.** SFT 가 도는 동안 L40S 에서 RFT
 인프라를 만드는 것이 3~4일이 성립하는 이유다 — SFT 를 기다리지 않는다.
@@ -67,8 +67,15 @@ cd "$(git -C ~/workspace/vla-isaac rev-parse --show-toplevel 2>/dev/null || echo
 나중에 붙이면 그 전 실험 결과가 전부 재현 불가가 되므로 여기서 한다.
 
 ```bash
-python scripts/make_init_states.py --name train
-python scripts/make_init_states.py --name eval_base      # 평가 홀드아웃 64개
+python scripts/make_init_states.py --show train          # 이미 커밋돼 있다 — 확인만
+python scripts/make_init_states.py --show eval_base      # 평가 홀드아웃 64개
+```
+
+없거나 스펙이 바뀌어 차원이 어긋나면 그때만 만든다 (기존 파일은 `--force` 필요):
+
+```bash
+python scripts/make_init_states.py --name train --force
+python scripts/make_init_states.py --name eval_base --size 64 --seed 12345 --force
 git add datasets/init_states && git commit -m "초기 상태 뱅크"
 ```
 
@@ -78,16 +85,14 @@ python scripts/dump_obs_reference.py --task VlaPlace-v0 --save \
     --out datasets/obs_reference --num-frames 8 --livestream 2
 ```
 
-> 저장소에 커밋된 `datasets/obs_reference/*.png` 는 **태스크 개정 전** 씬이다
-> (자재 1개 + 목표 원판). 위 명령으로 덮어써서 새 씬 레퍼런스를 만들어야 하고,
-> Phase 4 스펙 대조는 새로 만든 것과 해야 한다.
+> `datasets/obs_reference/*.png` 는 2026-08-11 트레이 개편 후 씬으로 재생성해
+> 두었다 (블록 3개 + 정사각 트레이 1개). 씬 지오메트리를 다시 건드리면 위
+> 명령으로 덮어쓸 것 — Phase 4 스펙 대조는 항상 최신 씬 기준이어야 한다.
 
 저장된 PNG 를 **반드시 눈으로 볼 것**:
-- [ ] 박스(블록 3개)와 포켓 트레이가 **둘 다** 화면 안에 있는가
+- [ ] 박스(블록 3개)와 타깃 트레이가 **둘 다** 화면 안에 있는가
 - [ ] 블록 3색이 서로 구분되는가 (구분이 안 되면 언어 채널이 죽는다)
-- [ ] **슬롯 좌우가 지시문의 left/right 와 맞는가** — 카메라가 로봇을 마주 보므로
-      화면 좌우가 뒤집혀 보일 수 있다. 어긋나면 `SPEC.SLOT_Y_SIGN` 을 -1 로.
-      에러 없이 언어 채널만 조용히 망가지는 종류의 문제다.
+- [ ] 트레이가 블록보다 확실히 넉넉해 보이는가 (한 변 72mm vs 블록 60×30mm)
 - [ ] 파지 순간이 로봇 팔에 가려지지 않는가
 - [ ] 이미지가 뒤집혀 있지 않은가 (뒤집혔으면 `configs/vla_spec.py` 의 `ROTATE_IMAGE_180`)
 
@@ -104,9 +109,9 @@ python scripts/dump_obs_reference.py --task VlaPlace-v0 --save \
 > 계산이라 `python configs/vla_spec.py` 만으로 즉시 검증된다 — 카메라를 다시 만질
 > 일이 생기면 렌더 전에 이걸 먼저 볼 것.
 >
-> **태스크 개정 후 검사 대상이 바뀌었다**: 자재 스폰 범위 + 목표 영역 → **소스
-> 박스 내부 + 포켓 트레이 + 리프트 높이**. 카메라 값은 그대로 두고 ROI 만 새
-> 지오메트리로 옮겼으며, 같은 검사를 통과한다.
+> **개편 후 검사 대상**: 소스 박스 내부 + 타깃 트레이 + 리프트 높이.
+> 카메라 값은 확정한 것을 그대로 두고 ROI 만 지오메트리에 맞췄으며, 같은 검사를
+> 통과한다.
 
 ### 1-3. 변형체 — 지금은 하지 않는다
 
@@ -122,7 +127,7 @@ python scripts/dump_obs_reference.py --task VlaPlace-v0 --save \
 
 ```bash
 python -c "import gymnasium as gym; print([k for k in gym.registry if k.startswith('VlaPlace')])"
-# 15개가 나와야 한다 (기본 3종 + 클리어런스 4단계 x 3종). 비어 있으면 먼저 어느 쪽 문제인지 가른다:
+# 3개가 나와야 한다. 비어 있으면 먼저 어느 쪽 문제인지 가른다:
 #   python -c "import vla_isaac_tasks; import gymnasium as gym; print([k for k in gym.registry if k.startswith('VlaPlace')])"
 #     → 이쪽에서 나오면 .pth 만 안 걸린 것 / 에러 나면 패키지 설치 문제
 #
@@ -132,9 +137,23 @@ python -c "import gymnasium as gym; print([k for k in gym.registry if k.startswi
 #   echo "import vla_isaac_tasks" > "$(python -c 'import sysconfig;print(sysconfig.get_paths()["purelib"])')/vla_isaac_tasks.pth"
 ```
 
+**★ `VLA_ANNOUNCE_TARGET=1` 을 반드시 붙일 것.** 블록 3개는 색만 다르고 형상이
+같아서, 지시문을 모르면 어느 것을 집어야 하는지 알 방법이 없다. 이 환경변수를
+켜면 **리셋할 때마다** 터미널에 타깃이 찍힌다:
+
+```
+============================================================
+  [env 0 / 뱅크 #7]  ▶  PUT THE GREEN BLOCK INTO THE TRAY
+============================================================
+```
+
+타깃을 틀리면 성공 판정이 안 뜨고, `record_demos.py` 는 성공한 것만 저장하므로
+그 에피소드는 통째로 버려진다 — 에러는 안 나고 "왜 저장이 안 되지" 로만 보인다.
+`R` 로 폐기해도 리셋이므로 안내가 다시 찍힌다. 세면서 따라갈 필요가 없다.
+
 ```bash
 mkdir -p datasets
-python $ISAACLAB_DIR/scripts/tools/record_demos.py \
+VLA_ANNOUNCE_TARGET=1 python $ISAACLAB_DIR/scripts/tools/record_demos.py \
     --task VlaPlace-v0 --teleop_device keyboard --enable_cameras \
     --dataset_file ./datasets/source.hdf5 --num_demos 15 \
     --step_hz 24 --livestream 2
@@ -145,6 +164,7 @@ python $ISAACLAB_DIR/scripts/tools/record_demos.py \
 `--num_success_steps` 는 기본 10 이고 `SPEC.SUCCESS_HOLD_STEPS` 와 같으므로 건드리지 않는다.
 
 **품질 체크리스트 — 생성 성공률에 직결된다:**
+- [ ] **안내에 찍힌 색의 블록을 집었는가** ← 틀리면 그 에피소드는 저장되지 않는다
 - [ ] 궤적이 짧은가 (불필요한 이동 최소화)
 - [ ] 직선 경로인가 (축 단위로 나눠 움직이지 말 것)
 - [ ] **일시정지가 없는가** ← 키보드 조작의 최대 함정. 멈춤은 정책이 학습하기 어렵다
@@ -157,7 +177,7 @@ python $ISAACLAB_DIR/scripts/tools/record_demos.py \
 그 계단이 그대로 Mimic 생성 성공률을 깎는다.
 
 ```bash
-python $ISAACLAB_DIR/scripts/tools/record_demos.py \
+VLA_ANNOUNCE_TARGET=1 python $ISAACLAB_DIR/scripts/tools/record_demos.py \
     --task VlaPlace-v0 --teleop_device gamepad --enable_cameras \
     --dataset_file ./datasets/source.hdf5 --num_demos 15 \
     --step_hz 24 --livestream 2
@@ -316,22 +336,6 @@ python env/smoke/check_rft.py --full
 이게 통과하면 남은 RFT 작업은 GRPO 루프 배선뿐이다. 통과하지 못하면
 `rft/README.md` 의 "흔한 실패와 해석" 표부터 볼 것.
 
-### 2-4. [L40S, 선택] 타이트한 split 의 생성 수율 측정
-
-시간이 남으면 클리어런스를 조인 split 에서 **소량 생성**을 돌려 수율을 잰다.
-수율은 그 자체로 난이도의 사전 지표다 (개정 §4-4) — 조일수록 떨어지므로,
-Day 4 에 그 split 을 쓰려면 시도 횟수를 얼마나 늘려야 하는지 여기서 역산한다.
-
-```bash
-python $ISAACLAB_DIR/scripts/imitation_learning/isaaclab_mimic/generate_dataset.py \
-    --task VlaPlace-c1mm-Visuomotor-Mimic-v0 --enable_cameras --headless --use_skillgen \
-    --num_envs 10 --generation_num_trials 20 \
-    --input_file ./datasets/annotated.hdf5 --output_file ./datasets/gen_c1mm_small.hdf5
-```
-
-> 어노테이션 파일은 공유해도 된다. 클리어런스는 포켓 레일 지오메트리만 바꾸므로
-> 사람 데모의 서브태스크 경계는 그대로 유효하다.
-
 ---
 
 ## Day 3 — 베이스라인 + RFT 착수
@@ -358,25 +362,24 @@ python scripts/dump_obs_reference.py --compare datasets/obs_reference \
 라이브 뷰포트로는 검출할 수 없는 종류의 불일치다. 여기서 잡지 않으면
 "RFT 커브가 오르지 않는다" 는 형태로만 드러나고 원인 추적에 며칠이 든다.
 
-### 3-3. 베이스라인 성공률 — 클리어런스 곡선의 SFT 쪽 절반
+### 3-3. 베이스라인 성공률
 
 ```bash
-for T in c5mm c2mm c1mm c0p5mm; do
-  python scripts/eval_rollout.py --checkpoint ckpt/sft \
-      --task VlaPlace-${T}-v0 --out logs/sft_${T}.json
-done
+python scripts/eval_rollout.py --checkpoint ckpt/sft \
+    --task VlaPlace-v0 --out logs/sft_base.json
 ```
 
 평가는 `eval_base` 홀드아웃 64개를 **인덱스 순서대로** 돈다. 시드가 아니라
 파일이라, 나중에 RFT 체크포인트를 재면 정확히 같은 씬에서 비교된다.
 
-해석 (개정 §5 게이트):
-- **≥30%** → 그 split 에서 RL 을 돌린다
-- 5~30% → RL 개선폭이 나오기 어렵다. 더 헐거운 split 부터 곡선을 그린다
+해석:
+- **≥30%** → 그대로 RL 을 돌린다
+- 5~30% → 개선폭이 나오기 어렵지만 0 이 아니면 진행한다 (SimpleVLA-RL 은
+  17.3% 에서 91.7% 까지 올린 사례가 있다)
 - <5% → 학습 신호가 없다. 데이터/스펙부터 본다
 
-**모든 split 이 0 이면** 공차 문제가 아니라 파이프라인 문제다. 진단항
-`grasp_lift_diag` (파지·리프트까지는 되는가) 와 `yaw_diag` (각도) 를 먼저 볼 것.
+**0 이면** 공차 문제가 아니라 파이프라인 문제다. 진단항 `grasp_lift_diag`
+(파지·리프트까지는 되는가) 와 `yaw_diag` (각도) 를 먼저 볼 것.
 
 추가로 Language split 도 여기서 한 번 재 둔다 (씬은 그대로, 문장만 바꾼다):
 
@@ -390,7 +393,7 @@ python scripts/eval_rollout.py --checkpoint ckpt/sft --rephrase 0 \
 **정오까지 어댑터로 롤아웃 1회가 안 돌면 자작 GRPO 로 전환한다.**
 환경·보상·브리지·평가가 전부 재사용되므로 전환 비용은 RL 루프뿐이다.
 
-### 3-5. RFT 착수 (게이트를 통과한 split 부터)
+### 3-5. RFT 착수
 
 ```bash
 tmux new -s rft
@@ -410,24 +413,23 @@ ssh -L 6006:localhost:6006 <서버>
 
 ## Day 4 — 결과 확보
 
-### 4-1. 클리어런스 곡선 — 이 프로젝트의 핵심 결과물
+### 4-1. 개선폭 측정 — 이 프로젝트의 핵심 결과물
 
-RL 을 돌린 split 마다 같은 홀드아웃으로 다시 잰다:
+같은 홀드아웃으로 다시 잰다:
 
 ```bash
-python scripts/eval_rollout.py --checkpoint logs/grpo_c5mm/checkpoint-<N> \
-    --task VlaPlace-c5mm-v0 --out logs/rft_c5mm.json
+python scripts/eval_rollout.py --checkpoint logs/grpo_rigid/checkpoint-<N> \
+    --task VlaPlace-v0 --out logs/rft_base.json
 ```
 
-`logs/sft_c*.json` 과 나란히 놓은 것이 `SR_SFT(c)` vs `SR_SFT+RL(c)` 다.
-**실패 구간도 결과다** — 공차가 너무 빡빡해 SFT 가 바닥이면 RL 도 실패한다는
-임계값 현상이 같은 그래프에 담긴다. 점이 3개만 있어도 곡선은 성립한다.
+`logs/sft_base.json` 과 나란히 놓은 것이 핵심 결과다 — 같은 64개 초기 상태에서
+SFT 대비 RFT 가 얼마나 올랐는가. 커브가 오르기 시작하는 것만 확인돼도 성립한다.
 
 ### 4-2. 커브가 오르지 않을 때
 
 로그의 `무신호그룹` 비율부터 본다:
 - ~100% → `temperature` 를 올린다(1.6 → 1.8). 그룹이 전멸/전승으로 쏠린 것
-  — 전멸 쪽이면 애초에 그 split 이 게이트(30%)를 못 넘긴 것일 수 있다
+  — 전멸 쪽이면 애초에 SFT 베이스라인이 너무 낮은 것일 수 있다
 - 낮은데도 평평 → 진단항으로 어디서 막혔는지 가른다:
   `grasp_lift_diag` 가 낮으면 박스에서 꺼내지를 못하는 것,
   높은데 성공률이 낮으면 배치 정밀도 — `yaw_diag` 로 각도 문제인지 본다
@@ -435,8 +437,11 @@ python scripts/eval_rollout.py --checkpoint logs/grpo_c5mm/checkpoint-<N> \
 
 ### 4-3. 후속 확장 (지금은 하지 않는다)
 
-embodiment 축(팔만 교체)과 변형체 박막 split. 개정 §8 참조 — 강체 곡선을
-확보한 뒤의 이야기다.
+embodiment 축(팔만 교체), 변형체 박막, 그리고 **난이도 축 복원** — 트레이를
+다시 좁혀 클리어런스 곡선을 그리는 것. 셋 다 기본 성공률을 확보한 뒤의
+이야기다. 난이도를 되돌릴 때는 `SPEC.TRAY_INNER_SIZE` 를 줄이고
+`SPEC.SUCCESS_REQUIRE_YAW` 를 True 로 올리면 되지만, 그 순간 텔레옵 데모를
+다시 만들 수 있는지가 병목이 된다는 점을 기억할 것.
 
 ### 4-4. 마무리
 

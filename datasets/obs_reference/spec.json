@@ -1,5 +1,5 @@
 {
-  "task": "VlaPick-v0",
+  "task": "VlaPlace-v0",
   "image_hw": [
     224,
     224
@@ -20,5 +20,16 @@
   "rotate_image_180": false,
   "action_dim": 7,
   "num_actions_chunk": 8,
-  "instruction": "pick up the material and place it in the target zone"
+  "instruction_template": "put the {attr} block into the tray",
+  "block_attrs": [
+    "red",
+    "blue",
+    "green"
+  ],
+  "tray_center": [
+    0.45,
+    0.22
+  ],
+  "tray_inner_size": 0.072,
+  "success_require_yaw": false
 }

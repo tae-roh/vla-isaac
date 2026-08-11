@@ -18,7 +18,7 @@ Isaac Sim 은 rft/ipc_bridge.py 를 통해 별도 프로세스로 돌아간다.
 
     # Tolerance split — 클리어런스 곡선의 점 하나 (태스크 이름이 공차를 담는다)
     python scripts/eval_rollout.py --checkpoint runs/sft/step-20000 \
-        --task VlaPlace-c1mm-v0 --num-episodes 64
+        --task VlaPlace-v0 --num-episodes 64
 
     # Language split — 지시문 rephrase (씬은 그대로)
     python scripts/eval_rollout.py --checkpoint runs/sft/step-20000 \

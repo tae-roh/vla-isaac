@@ -235,7 +235,7 @@ def main() -> int:
                         f"항을 확인할 것. 있는 키: {list(policy_obs.keys())}"
                     )
                 ids = policy_obs["target_ids"].detach().cpu().numpy().astype(int)
-                instr = [spec.instruction_for(b, s) for b, s in ids]
+                instr = [spec.instruction_for(int(b)) for (b,) in ids]
                 return (
                     f"obs['{cam_key}'] {tuple(img.shape)}, dtype={img.dtype} / "
                     f"지시문 예: {instr}"

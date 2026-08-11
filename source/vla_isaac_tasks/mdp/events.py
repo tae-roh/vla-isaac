@@ -3,8 +3,8 @@
 #
 # 리셋 시 씬 초기화. **랜덤 샘플링을 하지 않는다** (개정 §3).
 #
-# 초기 배치·타깃 블록·타깃 슬롯은 전부 미리 만들어 둔 초기 상태 뱅크에서
-# 인덱스로 꺼낸다. 이유는 init_states.py 머리말 참조 — 한 줄로 요약하면
+# 초기 배치와 타깃 블록은 전부 미리 만들어 둔 초기 상태 뱅크에서 인덱스로
+# 꺼낸다. 이유는 init_states.py 머리말 참조 — 한 줄로 요약하면
 # "GRPO 는 같은 s₀ 에서 G개를 굴려야 하고, 그러려면 s₀ 를 지정할 수 있어야 한다".
 #
 # 인덱스를 정하는 두 경로:
@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -103,7 +104,7 @@ def reset_scene_from_bank(
     env_ids: torch.Tensor,
     bank_name: str = "train",
 ) -> None:
-    """블록 배치 + 타깃(블록·슬롯)을 초기 상태 뱅크에서 복원한다.
+    """블록 배치 + 타깃 블록을 초기 상태 뱅크에서 복원한다.
 
     ★ 이 함수가 초기 상태의 **유일한** 출처다. 여기 말고 다른 곳에서 블록을
       흔들면 (예: 별도의 pose 랜덤화 이벤트) 인덱스로 s₀ 를 지정한다는 전제가
@@ -136,14 +137,46 @@ def reset_scene_from_bank(
         asset.write_root_pose_to_sim(root[:, :7], env_ids=env_ids)
         asset.write_root_velocity_to_sim(root[:, 7:], env_ids=env_ids)
 
-    # 타깃 지정 — 관측·성공판정·지시문이 모두 이 두 버퍼를 읽는다.
+    # 타깃 지정 — 관측·성공판정·지시문이 모두 이 버퍼를 읽는다.
+    # 트레이는 하나뿐이라 "어느 블록인가" 만 남았다.
     tgt_block = rows_t[:, 3 * SPEC.NUM_BLOCKS].long()
-    tgt_slot = rows_t[:, 3 * SPEC.NUM_BLOCKS + 1].long()
     _buffer(env, "_vla_target_block", torch.long)[env_ids] = tgt_block
-    _buffer(env, "_vla_target_slot", torch.long)[env_ids] = tgt_slot
     _buffer(env, "_vla_init_index", torch.long)[env_ids] = torch.as_tensor(
         idx, dtype=torch.long, device=device
     )
+
+    _announce_targets(env_ids, tgt_block, idx)
+
+
+# -----------------------------------------------------------------------------
+# 텔레옵용 타깃 안내
+# -----------------------------------------------------------------------------
+# ★ 왜 필요한가
+#   블록 3개는 색만 다르고 형상·크기가 같다. 지시문을 모르면 사람은 어느 것을
+#   집어야 하는지 알 방법이 없는데, record_demos.py 는 관측을 화면에 찍어 주지
+#   않는다. 타깃을 틀리면 성공 판정이 안 뜨고 → EXPORT_SUCCEEDED_ONLY 라
+#   에피소드가 통째로 버려진다. 에러도 안 나서 "왜 저장이 안 되지" 로만 보인다.
+#
+#   뱅크를 미리 출력해 두고 세는 방법도 있지만, 폐기(R) 도 리셋이라 커서를
+#   소비하므로 한 번 어긋나면 계속 어긋난다. 리셋 때마다 환경이 직접 말하게 하는
+#   것이 유일하게 어긋나지 않는 방법이다.
+#
+#   기본은 꺼 둔다 — 야간 배치 생성(num_envs=30)에서 매 리셋마다 찍으면 로그가
+#   쓸모없어진다. 텔레옵 수집 때만 VLA_ANNOUNCE_TARGET=1 로 켠다.
+def _announce_targets(env_ids, tgt_block, idx) -> None:
+    """리셋된 env 의 지시문을 stdout 에 찍는다 (VLA_ANNOUNCE_TARGET=1 일 때만)."""
+    if os.environ.get("VLA_ANNOUNCE_TARGET", "") not in ("1", "true", "True"):
+        return
+    ids = env_ids.detach().cpu().numpy().tolist()
+    blocks = tgt_block.detach().cpu().numpy().tolist()
+    for e, b, i in zip(ids, blocks, np.atleast_1d(idx).tolist()):
+        instr = SPEC.instruction_for(int(b))
+        print(
+            f"\n{'=' * 60}\n"
+            f"  [env {e} / 뱅크 #{i}]  ▶  {instr.upper()}\n"
+            f"{'=' * 60}",
+            flush=True,
+        )
 
 
 def reset_episode_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor) -> None:

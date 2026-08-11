@@ -225,37 +225,45 @@ ROTATE_IMAGE_180 = False
 #
 # ★ 설계 원칙 (개정 §2-4): 시각적 유일성만으로 타깃이 결정되면 안 된다.
 #   블록 3개는 **색만 다르고 형상·크기가 같다.** "하나만 튀는" 구성이 아니므로
-#   지시문을 읽지 않으면 타깃을 고를 수 없다. 포켓도 마찬가지로 3개가 동일해서
-#   블록–슬롯 대응이 오직 지시문으로만 결정된다.
+#   지시문을 읽지 않으면 타깃을 고를 수 없다.
 #   → 색만으로 부족하다 싶으면 BLOCK_ATTRS 를 "small/large" 같은 크기 속성으로
-#     바꾸고 blocks.py 의 BLOCK_SIZES 를 함께 손대면 된다 (한 쌍이다).
+#     바꾸고 BLOCK_SIZE 를 함께 손대면 된다 (한 쌍이다).
+#
+# ★ 트레이는 하나뿐이다 (2026-08-11 개편). 예전에는 좁은 포켓 3개 중 하나를
+#   슬롯 이름(left/middle/right)으로 지정했지만, 그 조합은 텔레옵으로 데모를
+#   만드는 것 자체가 어려웠다. 이제 언어 채널이 지시하는 것은 **어느 블록인가**
+#   하나뿐이고, 목적지는 항상 같은 트레이다.
 PROMPT_TEMPLATE = "In: What action should the robot take to {task}?\nOut:"
-INSTRUCTION_TEMPLATE = "put the {attr} block into the {slot} slot"
+INSTRUCTION_TEMPLATE = "put the {attr} block into the tray"
 
 # 사전학습 어휘에 흔한 일반 형용사만 쓴다. 사내 자재명 금지.
 BLOCK_ATTRS = ("red", "blue", "green")
-SLOT_NAMES = ("left", "middle", "right")
 
 
 # Language split (§6) 전용 rephrase. **학습에는 쓰지 않는다** — 학습 지시문은
 # 위 템플릿 하나로 고정하고, 평가에서만 이 문장들로 바꿔 언어 일반화를 잰다.
 INSTRUCTION_TEMPLATES_EVAL = (
-    "place the {attr} block in the {slot} slot",
-    "put the block that is {attr} into the {slot} pocket",
-    "move the {attr} one to the {slot} slot",
+    "place the {attr} block in the tray",
+    "put the block that is {attr} into the tray",
+    "move the {attr} one to the tray",
 )
 
 
-def instruction_for(block_idx: int, slot_idx: int, template: str | None = None) -> str:
-    """(타깃 블록, 타깃 슬롯) → 지시문 문자열."""
+def instruction_for(block_idx: int, template: str | None = None) -> str:
+    """타깃 블록 인덱스 → 지시문 문자열.
+
+    슬롯 인자는 트레이 단일화와 함께 사라졌다. 예전 시그니처
+    instruction_for(block, slot) 로 부르는 코드가 남아 있으면 TypeError 로
+    즉시 드러난다 — 조용히 엉뚱한 지시문이 나가는 것보다 낫다.
+    """
     return (template or INSTRUCTION_TEMPLATE).format(
-        attr=BLOCK_ATTRS[int(block_idx)], slot=SLOT_NAMES[int(slot_idx)]
+        attr=BLOCK_ATTRS[int(block_idx)]
     )
 
 
 # 대표 예시 하나. 프롬프트 기본값·문서 출력용이며, 실제 롤아웃은 env 별로
 # instruction_for() 로 만든 문자열을 쓴다.
-TASK_INSTRUCTION = instruction_for(0, 0)
+TASK_INSTRUCTION = instruction_for(0)
 
 
 def build_prompt(instruction: str = TASK_INSTRUCTION) -> str:
@@ -313,18 +321,25 @@ DECIMATION = 5                       # → 정책 주기 24Hz
 EPISODE_LENGTH_S = MAX_EPISODE_STEPS * SIM_DT * DECIMATION
 
 # =============================================================================
-# 씬 지오메트리 — 박스 → 맞춤 포켓 (개정 §2)
+# 씬 지오메트리 — 박스 → 타깃 트레이 (2026-08-11 개편)
 # =============================================================================
-# 태스크: 얕은 박스 안의 블록 N개 중 지시문이 지정한 하나를 꺼내, 트레이의
-#        지정된 포켓에 안착시킨다.
+# 태스크: 얕은 박스 안의 블록 N개 중 지시문이 지정한 하나를 꺼내, **하나뿐인
+#        타깃 트레이**에 넣는다.
 #
-# 난이도 손잡이는 두 개다:
-#   (a) 대칭 차수 — 이산. 정육면체(4) / 2:1 직육면체(2) / L자(1)
-#       BLOCK_SYMMETRY_ORDER 로 표현되고, yaw 오차를 접는 주기가 된다.
-#   (b) 클리어런스 — 연속. POCKET_CLEARANCE 를 5mm → 0.5mm 로 조인다.
-#       SR_SFT(c) vs SR_SFT+RL(c) 곡선이 이 프로젝트의 핵심 결과물이므로,
-#       이 값 하나만 바꿔 split 을 만들 수 있어야 한다 (환경 변형 클래스가
-#       이 상수만 덮어쓴다 — pickplace_env_cfg.py 참조).
+# ★ 무엇이 바뀌었나
+#   이전 설계는 좁은 맞춤 포켓 3개(클리어런스 5mm→0.5mm 사다리)였고, 핵심
+#   결과물이 SR_SFT(c) vs SR_SFT+RL(c) 곡선이었다. 그런데 그 태스크는
+#   **사람이 텔레옵으로 원본 데모를 만드는 것 자체가 성립하지 않았다**:
+#     - xy 성공 공차 6.5mm 인데 키보드 한 스텝 이동이 25mm (약 4배)
+#     - 포켓 입구에 챔퍼가 없어 물리적 유도도 없음
+#     - 에피소드 예산 12.5초 안에 정렬까지 끝내야 함
+#   데모가 없으면 Mimic 증강도 SFT 도 시작할 수 없으므로, 난이도 축을 접고
+#   트레이를 넓혀 데모가 만들어지는 지점으로 되돌렸다.
+#
+# 남은 난이도 손잡이는 하나다:
+#   대칭 차수 — 이산. 정육면체(4) / 2:1 직육면체(2) / L자(1)
+#   BLOCK_SYMMETRY_ORDER 로 표현되고, yaw 오차를 접는 주기가 된다.
+#   (yaw 는 성공 판정에서 빠졌고 진단 관측으로만 남는다 — SUCCESS_REQUIRE_YAW)
 
 TABLE_HEIGHT = 0.0                   # 테이블 상면 z (env 로컬 기준) [m]
 
@@ -351,77 +366,69 @@ BOX_INNER_SIZE = (0.20, 0.20)        # 안쪽 가로·세로 [m]
 BOX_WALL_THICKNESS = 0.010
 BOX_WALL_HEIGHT = 0.045              # 블록(0.030)보다 높아야 "꺼낸다"가 성립한다
 
-# --- 트레이 (맞춤 포켓 N개) ----------------------------------------------------
-# 포켓은 파내지 않고 **레일로 둘러싼다** — 바닥은 테이블 상면 그대로다.
+# --- 타깃 트레이 (하나, 정사각) -------------------------------------------------
+# 트레이는 파내지 않고 **레일 4장으로 둘러싼다** — 바닥은 테이블 상면 그대로다.
 # 프리미티브 콜라이더만 쓰므로 시뮬 비용이 최저이고, 얇은 메시의 convex hull
 # cooking 실패(GPU→CPU 폴백) 위험도 없다.
 TRAY_CENTER = (0.45, 0.22)
-POCKET_CLEARANCE = 0.005             # ★ 연속 난이도 축. 기본 split = 5mm
-# 곡선을 그릴 split 사다리. 각 값마다 태스크가 하나씩 등록된다
-# (VlaPlace-c5mm-v0 … c0p5mm). 실패 구간도 결과다 — SFT 성공률이 바닥이면
-# RL 도 실패한다는 임계값 현상까지 같은 그래프에 담긴다.
-CLEARANCE_LADDER = (0.005, 0.002, 0.001, 0.0005)
+
+# 한 변 = 블록 긴 축 × 1.2. "맞춤 포켓" 이 아니라 "여유 있는 목표 트레이" 다.
+#   블록 60×30 이 72×72 안에 들어가므로 긴축 여유 12mm / 짧은축 여유 42mm.
+#   yaw 를 맞추지 않고 비스듬히 놓아도 들어간다 (블록 대각선 67mm < 72mm).
+#   ★ 이 마지막 성질이 SUCCESS_REQUIRE_YAW=False 와 한 쌍이다. 트레이가 yaw 를
+#     강제하지 못하는데 판정만 요구하면, 물리가 돕지 않는 조건을 사람과 정책이
+#     맨손으로 맞춰야 한다 — 그게 이전 설계가 텔레옵으로 안 되던 이유였다.
+TRAY_INNER_SIZE = round(BLOCK_SIZE[0] * 1.2, 4)   # 0.072 [m], 정사각 한 변
+TRAY_DEPTH = 0.020                   # 레일 높이 [m]
+TRAY_RAIL_THICKNESS = 0.008
 
 
-def clearance_tag(clearance: float) -> str:
-    """0.0005 → 'c0p5mm'. 태스크 이름에 쓰는 꼬리표."""
-    return "c" + f"{clearance * 1000:g}".replace(".", "p") + "mm"
-POCKET_DEPTH = 0.020                 # 레일 높이 [m]
-POCKET_RAIL_THICKNESS = 0.008
-POCKET_PITCH = 0.055                 # 포켓 중심 간격 (y 방향) [m]
-# 슬롯 이름(left/middle/right)이 +y / 0 / -y 중 어느 쪽에 붙는가.
-# ★ Day 1 에 dump_obs_reference.py 의 PNG 를 보고 확정할 것. 카메라가 로봇을
-#   마주 보므로 화면 좌우가 뒤집혀 보일 수 있고, 그러면 지시문의 "left" 가
-#   그림의 오른쪽을 가리키게 된다 — 에러 없이 언어 채널만 조용히 망가진다.
-SLOT_Y_SIGN = +1.0
+def tray_center() -> tuple[float, float]:
+    """타깃 트레이 중심 xy (로봇 베이스 기준). 트레이는 하나뿐이다."""
+    return TRAY_CENTER
 
 
-def pocket_center(slot_idx: int) -> tuple[float, float]:
-    """슬롯 인덱스 → 포켓 중심 xy (로봇 베이스 기준)."""
-    tx, ty = TRAY_CENTER
-    offset = (slot_idx - (len(SLOT_NAMES) - 1) / 2.0) * POCKET_PITCH
-    return (tx, ty + SLOT_Y_SIGN * offset)
-
-
-def pocket_inner_size(clearance: float | None = None) -> tuple[float, float]:
-    """포켓 안치수 = 블록 단면 + 클리어런스.
-
-    clearance 를 인자로 받는 이유: 클리어런스는 **split 마다 다른 유일한 값**이다
-    (개정 §2-3b). 모듈 상수는 기본 split 값일 뿐이고, 실제 환경은 자기
-    `env.cfg.pocket_clearance` 를 넘긴다. 여기서 상수를 직접 읽어 버리면
-    타이트한 split 을 만들어도 포켓만 좁아지고 성공 판정 공차는 그대로여서,
-    곡선이 조용히 틀어진다.
-    """
-    c = POCKET_CLEARANCE if clearance is None else clearance
-    return (BLOCK_SIZE[0] + c, BLOCK_SIZE[1] + c)
+def tray_inner_size() -> tuple[float, float]:
+    """트레이 안치수 (가로, 세로). 정사각이라 두 값이 같다."""
+    return (TRAY_INNER_SIZE, TRAY_INNER_SIZE)
 
 
 # -----------------------------------------------------------------------------
 # 성공 판정 (Mimic 서브태스크 시그널 + RFT 0/1 보상이 공유)
 # -----------------------------------------------------------------------------
-# success = in_pocket AND yaw_aligned AND settled AND grasped_during_lift
+# success = in_tray AND settled AND grasped_during_lift
+#           (+ yaw_aligned 은 SUCCESS_REQUIRE_YAW 가 True 일 때만)
 #
 # dense shaping 금지 (개정 §2-5). 거리 항은 "밀기/끌기"를 적극적으로 보상해
 # 파지 없는 정책으로 수렴시킨다. 마지막 항이 그 pushcut 방지책이다.
 
-# in_pocket: 블록 중심이 포켓 중심에서 이만큼 안. 클리어런스에 연동한다 —
-# 물리적으로 안착하면 최대 편차가 clearance/2 이고, 여유 4mm 는 "테두리에
-# 걸친 상태"와 구분할 정도만 준다.
-POCKET_XY_MARGIN = 0.004
 # 안착 높이: 블록 중심이 레일 상단보다 아래여야 한다 (얹혀 있는 것과 구분).
-POCKET_SEAT_Z_MARGIN = 0.005
+TRAY_SEAT_Z_MARGIN = 0.005
 # yaw 정렬 허용 오차 [rad]. 대칭 차수로 접은 뒤의 오차에 적용한다.
 SUCCESS_YAW_TOLERANCE = 0.20         # 약 11.5도
 
+# ★ yaw 를 성공 조건에 넣을 것인가.
+#   False = 트레이 안에 안착하기만 하면 성공. 넓은 정사각 트레이는 yaw 를
+#           물리적으로 강제하지 못하므로 기본값이 False 다. yaw_error 는
+#           관측·로그에 계속 남아 "각도까지 맞추고 있는가" 를 진단할 수 있다.
+#   True  = 예전처럼 방향까지 맞춰야 성공. 되돌리려면 이 한 줄만 바꾸면 된다
+#           (성공 술어·보상·Mimic 시그널이 전부 placed_signal 하나를 공유한다).
+SUCCESS_REQUIRE_YAW = False
 
-def pocket_xy_tolerance(clearance: float | None = None) -> float:
-    c = POCKET_CLEARANCE if clearance is None else clearance
-    return 0.5 * c + POCKET_XY_MARGIN
+
+def tray_xy_tolerance() -> float:
+    """블록 중심이 트레이 중심에서 이만큼 안이면 "트레이 안" 으로 본다 [m].
+
+    축별(체비셰프) 판정이다 — 트레이가 정사각이므로 반지름 원보다 지오메트리에
+    맞는다. 레일이 물리적으로 막아 주므로 값 자체는 "안에 들어갔는가" 를
+    가르는 용도이고, 얹혀 있는 상태는 tray_seat_z_max() 가 따로 걸러낸다.
+    """
+    return 0.5 * TRAY_INNER_SIZE
 
 
-def pocket_seat_z_max() -> float:
+def tray_seat_z_max() -> float:
     """성공으로 인정할 블록 중심 z 상한 (env 로컬)."""
-    return TABLE_HEIGHT + 0.5 * BLOCK_SIZE[2] + POCKET_SEAT_Z_MARGIN
+    return TABLE_HEIGHT + 0.5 * BLOCK_SIZE[2] + TRAY_SEAT_Z_MARGIN
 
 # "정지" 판정 속도 임계값 [m/s]. 물체가 굴러가는 중에 성공이 뜨는 것을 막는다.
 SUCCESS_LIN_VEL_THRESHOLD = 0.03
@@ -456,8 +463,8 @@ LIFT_HEIGHT_THRESHOLD = BOX_WALL_HEIGHT + 0.030
 # 정렬·하강하는 구간까지 사람 데모를 써야 파지가 재현된다.
 APPROACH_START_DISTANCE = 0.15
 
-# 배치 시작: 블록을 든 채로 타깃 포켓 중심에서 이 반경 안에 들어오면 배치 구간 시작 [m].
-# 포켓 크기보다 훨씬 커야 한다 — 포켓 바로 위에 도달한 뒤가 아니라, 그 위로
+# 배치 시작: 블록을 든 채로 트레이 중심에서 이 반경 안에 들어오면 배치 구간 시작 [m].
+# 트레이 크기보다 훨씬 커야 한다 — 트레이 바로 위에 도달한 뒤가 아니라, 그 위로
 # 접근해 정렬·하강을 시작하는 지점부터가 사람 데모가 필요한 구간이다.
 PLACE_START_RADIUS = 0.12
 
@@ -476,8 +483,10 @@ SUCCESS_HOLD_STEPS = 10
 # 그래서 초기 상태를 런타임에 샘플링하지 않는다. 미리 만들어 **직렬화해 둔
 # 뱅크**에서 인덱스로 꺼내 쓴다 (LIBERO 의 set_init_state 와 같은 발상).
 # 뱅크 한 줄의 레이아웃:
-#     [x, y, yaw] × NUM_BLOCKS  +  [target_block_idx, target_slot_idx]
-INIT_STATE_DIM = 3 * NUM_BLOCKS + 2
+#     [x, y, yaw] × NUM_BLOCKS  +  [target_block_idx]
+# ★ 트레이 단일화로 target_slot_idx 가 사라져 차원이 하나 줄었다. 예전 뱅크는
+#   load_bank() 의 차원 검사에 걸려 거부된다 — 조용히 잘못 읽는 것보다 낫다.
+INIT_STATE_DIM = 3 * NUM_BLOCKS + 1
 INIT_STATE_DIR = "datasets/init_states"      # 저장소 루트 기준
 EVAL_HOLDOUT_SIZE = 64                       # 태스크당 평가용 고정 초기 상태 수
 TRAIN_BANK_SIZE = 4096                       # 학습/생성용 뱅크 크기
@@ -512,9 +521,9 @@ def assert_consistent() -> None:
     assert IMAGE_HEIGHT == IMAGE_WIDTH == 224, "OpenVLA 입력 해상도는 224x224 고정."
 
     # --- 태스크 지오메트리 ---
-    assert NUM_BLOCKS == len(BLOCK_ATTRS) == len(SLOT_NAMES), (
-        f"블록 {NUM_BLOCKS}개 / 속성어 {len(BLOCK_ATTRS)}개 / 슬롯 "
-        f"{len(SLOT_NAMES)}개가 어긋났다. 지시문을 만들 수 없다."
+    assert NUM_BLOCKS == len(BLOCK_ATTRS), (
+        f"블록 {NUM_BLOCKS}개 / 속성어 {len(BLOCK_ATTRS)}개가 어긋났다. "
+        "지시문을 만들 수 없다."
     )
     # 짧은 변으로 잡는다. 이걸 넘기면 텔레옵 데모 자체가 안 만들어진다.
     assert min(BLOCK_SIZE[:2]) < GRIPPER_MAX_WIDTH, (
@@ -529,20 +538,26 @@ def assert_consistent() -> None:
             "대칭 차수 2 는 단면이 정사각형이 아닐 때만 성립한다. "
             "x·y 가 같으면 실제 차수는 4 이고, yaw 판정이 실제보다 엄격해진다."
         )
-    # 포켓에 실제로 들어가야 한다.
-    assert POCKET_CLEARANCE > 0, "클리어런스가 0 이면 물리적으로 들어가지 않는다."
-    assert POCKET_DEPTH < BLOCK_SIZE[2], (
-        f"포켓 깊이 {POCKET_DEPTH} 가 블록 높이 {BLOCK_SIZE[2]} 이상이면 "
+    # 트레이에 실제로 들어가야 한다.
+    assert TRAY_INNER_SIZE > BLOCK_SIZE[0], (
+        f"트레이 한 변 {TRAY_INNER_SIZE} 가 블록 긴 축 {BLOCK_SIZE[0]} 이하다 — "
+        "어떤 자세로도 들어가지 않는다."
+    )
+    # ★ yaw 를 맞추지 않고 비스듬히 놓아도 들어가야 한다. 이게 성립해야
+    #   SUCCESS_REQUIRE_YAW=False 가 "물리가 허용하는 것만 요구한다" 는 뜻이 된다.
+    _diag = math.hypot(BLOCK_SIZE[0], BLOCK_SIZE[1])
+    assert TRAY_INNER_SIZE > _diag, (
+        f"트레이 한 변 {TRAY_INNER_SIZE} 가 블록 대각선 {_diag:.3f} 이하다 — "
+        "yaw 를 맞추지 않으면 들어가지 않으므로 yaw 를 성공 조건에서 빼면 안 된다. "
+        "트레이를 키우거나 SUCCESS_REQUIRE_YAW 를 True 로 되돌릴 것."
+    )
+    assert TRAY_DEPTH < BLOCK_SIZE[2], (
+        f"트레이 레일 높이 {TRAY_DEPTH} 가 블록 높이 {BLOCK_SIZE[2]} 이상이면 "
         "블록이 레일에 파묻혀 그리퍼가 놓을 수 없다."
     )
-    # 포켓이 서로 겹치지 않아야 한다 (레일 두께 포함).
-    _pw = pocket_inner_size()[1] + 2 * POCKET_RAIL_THICKNESS
-    assert POCKET_PITCH > _pw, (
-        f"포켓 간격 {POCKET_PITCH} 가 포켓 외폭 {_pw:.3f} 이하다 — 레일이 겹친다."
-    )
-    # 성공 판정 공차가 클리어런스와 함께 움직이는지 (연동을 끊으면 곡선이 무의미해진다).
-    assert pocket_xy_tolerance() < 0.5 * BLOCK_SIZE[1], (
-        "in_pocket 공차가 블록 반폭보다 크면 포켓 밖에 놓아도 성공이 된다."
+    # 성공 공차가 트레이 밖으로 새지 않아야 한다.
+    assert tray_xy_tolerance() <= 0.5 * TRAY_INNER_SIZE + 1e-9, (
+        "in_tray 공차가 트레이 반폭보다 크면 트레이 밖에 놓아도 성공이 된다."
     )
     # 리프트 경계가 박스 벽 위여야 스티칭 구간에 충돌 위험이 없다.
     assert LIFT_HEIGHT_THRESHOLD > BOX_WALL_HEIGHT, (
@@ -554,7 +569,7 @@ def assert_consistent() -> None:
         f"스폰 가능 영역 {_span:.3f}m 가 블록 최소 간격 {BLOCK_MIN_SEPARATION}m "
         "이하다. 박스를 키우거나 여백을 줄일 것."
     )
-    assert INIT_STATE_DIM == 3 * NUM_BLOCKS + 2
+    assert INIT_STATE_DIM == 3 * NUM_BLOCKS + 1
 
     # --- embodiment ↔ 액션 스펙 교차 검증 ---
     # 7차원 = 델타 포즈 6 (위치3 + 회전3) + 그리퍼 1.
@@ -580,14 +595,12 @@ def assert_consistent() -> None:
     )
     assert CONTROL_FRAME in ("robot_base", "world", "eef")
 
-    # 박스와 트레이가 겹치면 리셋 직후 블록이 포켓 안에 있는 에피소드가 생긴다
+    # 박스와 트레이가 겹치면 리셋 직후 블록이 트레이 안에 있는 에피소드가 생긴다
     # (아무것도 안 해도 성공 → RFT 보상 오염).
     _box_y_hi = BOX_CENTER[1] + 0.5 * BOX_INNER_SIZE[1] + BOX_WALL_THICKNESS
-    _tray_y_lo = min(pocket_center(i)[1] for i in range(len(SLOT_NAMES))) - (
-        0.5 * pocket_inner_size()[1] + POCKET_RAIL_THICKNESS
-    )
+    _tray_y_lo = TRAY_CENTER[1] - (0.5 * TRAY_INNER_SIZE + TRAY_RAIL_THICKNESS)
     assert _box_y_hi < _tray_y_lo, (
-        f"소스 박스(y≤{_box_y_hi:.3f})와 포켓 트레이(y≥{_tray_y_lo:.3f})가 겹친다. "
+        f"소스 박스(y≤{_box_y_hi:.3f})와 타깃 트레이(y≥{_tray_y_lo:.3f})가 겹친다. "
         "BOX_CENTER / TRAY_CENTER 를 떨어뜨릴 것."
     )
 
@@ -649,12 +662,11 @@ def center_crop_bounds() -> tuple[float, float]:
 def workspace_roi_points() -> list:
     """정책이 반드시 봐야 하는 점들.
 
-    태스크 개정으로 대상이 바뀌었다: 자재 스폰 범위 + 목표 영역 →
-    **소스 박스(벽 윗면까지) + 포켓 트레이 + 리프트 높이**.
-    카메라 값은 Day 1 에 확정한 것을 그대로 쓰고, ROI 만 새 지오메트리로 옮겼다.
+    대상: **소스 박스(벽 윗면까지) + 타깃 트레이 + 리프트 높이**.
+    카메라 값은 Day 1 에 확정한 것을 그대로 쓰고, ROI 만 지오메트리에 맞춘다.
 
-    포켓이 프레임을 벗어나면 정책은 "어느 슬롯에 넣어야 하는지" 를 볼 수 없고,
-    그건 에러 없이 언어 채널만 죽인다 — 이 검사가 존재하는 이유 그대로다.
+    트레이가 프레임을 벗어나면 정책은 "어디에 놓아야 하는지" 를 볼 수 없고,
+    그건 에러 없이 성능만 깎는다 — 이 검사가 존재하는 이유 그대로다.
     """
     bx, by = BOX_CENTER
     hx = 0.5 * BOX_INNER_SIZE[0] + BOX_WALL_THICKNESS
@@ -667,28 +679,19 @@ def workspace_roi_points() -> list:
             for z in (TABLE_HEIGHT, TABLE_HEIGHT + BOX_WALL_HEIGHT):
                 pts.append((bx + sx * hx, by + sy * hy, z))
 
-    # 포켓 — 각 슬롯의 네 귀퉁이 (레일 포함)
-    px, py = pocket_inner_size()
-    for i in range(len(SLOT_NAMES)):
-        cx, cy = pocket_center(i)
-        for sx in (-1, 1):
-            for sy in (-1, 1):
-                pts.append(
-                    (
-                        cx + sx * (0.5 * px + POCKET_RAIL_THICKNESS),
-                        cy + sy * (0.5 * py + POCKET_RAIL_THICKNESS),
-                        TABLE_HEIGHT + POCKET_DEPTH,
-                    )
-                )
+    # 트레이 네 귀퉁이 (레일 포함)
+    tx, ty = TRAY_CENTER
+    th = 0.5 * TRAY_INNER_SIZE + TRAY_RAIL_THICKNESS
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            pts.append((tx + sx * th, ty + sy * th, TABLE_HEIGHT + TRAY_DEPTH))
 
-    # 운반 중 블록 — 리프트 높이에서 박스 위 / 포켓 위
+    # 운반 중 블록 — 리프트 높이에서 박스 위 / 트레이 위
     z_lift = TABLE_HEIGHT + LIFT_HEIGHT_THRESHOLD + 0.05
     for sx in (-1, 1):
         for sy in (-1, 1):
             pts.append((bx + sx * hx, by + sy * hy, z_lift))
-    for i in range(len(SLOT_NAMES)):
-        cx, cy = pocket_center(i)
-        pts.append((cx, cy, z_lift))
+    pts.append((tx, ty, z_lift))
     return pts
 
 
@@ -701,7 +704,7 @@ def assert_workspace_visible(margin_px: float = 6.0) -> None:
       관측 shape 도 맞고 스모크도 통과한다. 정책이 "어디에 놓아야 하는지" 를 못 보는
       것뿐이고, 그건 SFT 를 다 돌린 뒤 "성능이 안 나온다" 로만 드러난다.
       카메라와 씬 지오메트리는 서로 다른 파일에 있어서 한쪽만 바뀌기 쉽다.
-      태스크가 개정되면서 검사 대상도 박스·포켓으로 옮겼다 —
+      태스크가 바뀔 때마다 검사 대상도 함께 옮겨 왔다 (지금은 박스·타깃 트레이) —
       같은 함정을 새 지오메트리에서 다시 밟지 않기 위해서다.
     """
     lo, hi = center_crop_bounds()
@@ -721,7 +724,7 @@ def assert_workspace_visible(margin_px: float = 6.0) -> None:
             f"작업공간이 카메라 화각을 벗어난다 (crop 후 허용 {lo:.1f}~{hi:.1f}px, "
             f"{len(bad)}개 지점 실패):\n{lines}\n"
             "  CAMERA_POS / CAMERA_ROT / CAMERA_FOCAL_LENGTH 와 "
-            "BOX_CENTER / TRAY_CENTER / POCKET_PITCH 중 하나가 어긋났다.\n"
+            "BOX_CENTER / TRAY_CENTER / TRAY_INNER_SIZE 중 하나가 어긋났다.\n"
             "  이건 에러 없이 조용히 성능만 깎는 종류의 불일치다 — 반드시 맞출 것."
         )
 
@@ -745,10 +748,14 @@ def summary() -> str:
         f"{BLOCK_SYMMETRY_ORDER}, 속성 {BLOCK_ATTRS}\n"
         f"  박스      : 중심 {BOX_CENTER}, 안치수 {BOX_INNER_SIZE}, "
         f"벽높이 {BOX_WALL_HEIGHT * 100:.1f}cm\n"
-        f"  포켓      : {SLOT_NAMES}, 클리어런스 "
-        f"{POCKET_CLEARANCE * 1000:.1f}mm → xy공차 "
-        f"{pocket_xy_tolerance() * 1000:.1f}mm, yaw공차 "
-        f"{SUCCESS_YAW_TOLERANCE:.2f}rad\n"
+        f"  트레이    : 중심 {TRAY_CENTER}, 정사각 한 변 "
+        f"{TRAY_INNER_SIZE * 1000:.0f}mm (블록 긴축 대비 "
+        f"{TRAY_INNER_SIZE / BLOCK_SIZE[0]:.2f}배), 레일높이 "
+        f"{TRAY_DEPTH * 1000:.0f}mm\n"
+        f"  성공 판정 : xy공차 ±{tray_xy_tolerance() * 1000:.0f}mm(축별), "
+        f"안착 z ≤ {tray_seat_z_max() * 1000:.0f}mm, "
+        f"yaw 조건 {'사용' if SUCCESS_REQUIRE_YAW else '미사용(진단만)'}"
+        f" [{SUCCESS_YAW_TOLERANCE:.2f}rad]\n"
     )
 
 

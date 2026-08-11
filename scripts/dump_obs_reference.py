@@ -214,8 +214,9 @@ def run_save(args: argparse.Namespace) -> int:
                     "num_actions_chunk": SPEC.NUM_ACTIONS_CHUNK,
                     "instruction_template": SPEC.INSTRUCTION_TEMPLATE,
                     "block_attrs": list(SPEC.BLOCK_ATTRS),
-                    "slot_names": list(SPEC.SLOT_NAMES),
-                    "pocket_clearance": SPEC.POCKET_CLEARANCE,
+                    "tray_center": list(SPEC.TRAY_CENTER),
+                    "tray_inner_size": SPEC.TRAY_INNER_SIZE,
+                    "success_require_yaw": SPEC.SUCCESS_REQUIRE_YAW,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -225,10 +226,9 @@ def run_save(args: argparse.Namespace) -> int:
 
         print(f"\n레퍼런스 {saved}장 + spec.json → {args.out}")
         print("★ 이 PNG 들을 반드시 눈으로 확인할 것:")
-        print("   - 박스(블록 3개)와 포켓 트레이가 둘 다 화면 안에 있는가")
+        print("   - 박스(블록 3개)와 타깃 트레이가 둘 다 화면 안에 있는가")
         print("   - 블록 3색이 서로 구분되는가")
-        print("   - 슬롯 좌우가 지시문의 left/right 와 맞는가 "
-              "(어긋나면 SPEC.SLOT_Y_SIGN 을 -1 로)")
+        print("   - 트레이가 블록보다 확실히 넉넉해 보이는가")
         print("   - 그리퍼가 블록에 닿는 순간이 가려지지 않는가")
         print("   - 이미지가 뒤집혀 있지 않은가 (뒤집혀 있으면 "
               "configs/vla_spec.py 의 ROTATE_IMAGE_180 을 켤 것)")

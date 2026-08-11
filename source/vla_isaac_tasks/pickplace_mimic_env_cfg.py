@@ -20,13 +20,8 @@ from .pickplace_mimic_env import EEF_NAME
 from .spec import SPEC
 
 
-def datagen_name(clearance: float) -> str:
-    """생성 데이터셋 이름. 클리어런스를 이름에 박아 split 이 섞이는 것을 막는다.
-
-    split 마다 생성 수율이 다르고(개정 §4-4: 그 수율 자체가 난이도의 사전
-    지표다), 데이터가 섞이면 곡선의 각 점이 무엇으로 학습된 것인지 알 수 없게 된다.
-    """
-    return f"vla_place_{SPEC.clearance_tag(clearance)}"
+# 생성 데이터셋 이름. 클리어런스 split 이 없어져 하나로 고정됐다.
+DATAGEN_NAME = "vla_place"
 
 
 def _build_subtask_configs() -> list[SubTaskConfig]:
@@ -41,10 +36,11 @@ def _build_subtask_configs() -> list[SubTaskConfig]:
 
     ★ object_ref 가 서브태스크마다 다르다.
       1) 파지 → "target"  : 지시문이 지정한 블록의 pose 기준으로 궤적을 변환
-      2) 배치 → "pocket"  : 지시문이 지정한 포켓의 pose 기준으로 궤적을 변환
-      둘 다 env 마다 값이 다르다 (get_object_poses 참조). 여기를 고정 엔티티
-      이름으로 두면 증강 데이터가 전부 같은 블록·같은 포켓으로 가고, 언어 조건이
-      데이터에서 사라진다.
+      2) 배치 → "tray"    : 타깃 트레이의 pose 기준으로 궤적을 변환
+      "target" 은 env 마다 값이 다르다 (get_object_poses 참조). 여기를 고정
+      엔티티 이름으로 두면 증강 데이터가 전부 같은 블록으로 가고, 언어 조건이
+      데이터에서 사라진다. "tray" 는 트레이가 하나뿐이라 모든 env 가 같지만,
+      배치 구간의 기준 프레임으로는 여전히 필요하다.
 
     ★ 시작 경계(SkillGen 용)는 여기에 적지 않는다.
       SubTaskConfig 에는 subtask_start_signal 같은 필드가 **없다**.
@@ -73,15 +69,15 @@ def _build_subtask_configs() -> list[SubTaskConfig]:
             # 파지가 확실히 안정된 뒤에 구간이 끊겨 스티칭이 매끄럽다.
             subtask_term_offset_range=(10, 20),
             description="Pick the target block out of the box",
-            next_subtask_description="Align and seat the block into its pocket",
+            next_subtask_description="Place the block into the tray",
             **common,
         ),
-        # 서브태스크 2: 타깃 포켓에 정렬해 안착시킨다. (마지막 → 종료 시그널 없음)
+        # 서브태스크 2: 타깃 트레이에 넣는다. (마지막 → 종료 시그널 없음)
         SubTaskConfig(
-            object_ref="pocket",
+            object_ref="tray",
             subtask_term_signal=None,
             subtask_term_offset_range=(0, 0),
-            description="Align and seat the block into its pocket",
+            description="Place the block into the tray",
             **common,
         ),
     ]
@@ -94,7 +90,7 @@ def _apply_datagen_config(cfg) -> None:
       `--use_skillgen` 플래그가 지배한다. 의도된 설계다: SkillGen 을 기본으로
       쓰되, cuRobo 가 막히면 **플래그 하나만 빼서** MimicGen 으로 후퇴할 수 있다.
     """
-    cfg.datagen_config.name = datagen_name(cfg.pocket_clearance)
+    cfg.datagen_config.name = DATAGEN_NAME
     # 생성 성공을 보장할 때까지 재시도한다.
     cfg.datagen_config.generation_guarantee = True
     # 실패 궤적은 버린다. SFT 데이터에 실패가 섞이면 정책이 실패를 학습한다.

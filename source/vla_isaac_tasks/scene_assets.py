@@ -108,7 +108,17 @@ def make_block_cfg(idx: int) -> RigidObjectCfg:
 # 정지 구조물 — 공통 생성기
 # -----------------------------------------------------------------------------
 def _static_box(prim: str, size, pos, color) -> AssetBaseCfg:
-    """충돌체를 가진 정지 직육면체 하나."""
+    """충돌체를 가진 정지 직육면체 하나.
+
+    ★ prim 은 **평평한 이름**이어야 한다 ("Box/box_x_pos" 처럼 중첩 금지).
+      isaaclab.sim.utils.prims 의 @clone 데코레이터는 prim_path 를 마지막 '/'
+      기준으로 쪼갠 뒤 부모 경로를 find_matching_prim_paths() 로 찾는데,
+      중간 그룹 Xform 은 아무도 만들어 주지 않는다 (Isaac Lab 은 자동 생성하지
+      않는다). 그래서 중첩하면
+          RuntimeError: Unable to find source prim path: '/World/envs/env_.*/Box'
+      로 씬 생성이 죽는다. 부모를 먼저 선언하는 방법도 있지만 필드 순서에
+      의존하게 되어, 나중에 순서만 바뀌어도 같은 곳에서 다시 깨진다.
+    """
     return AssetBaseCfg(
         prim_path=f"{{ENV_REGEX_NS}}/{prim}",
         spawn=sim_utils.CuboidCfg(
@@ -145,59 +155,39 @@ def box_wall(name: str) -> AssetBaseCfg:
         "box_y_neg": ((ix, t, h), (bx, by - 0.5 * iy - 0.5 * t, z)),
     }
     size, pos = layout[name]
-    return _static_box(f"Box/{name}", size, pos, _BOX_COLOR)
+    return _static_box(name, size, pos, _BOX_COLOR)
 
 
 # -----------------------------------------------------------------------------
-# 트레이 (맞춤 포켓 N개) — 레일 2 + 칸막이 2N
+# 타깃 트레이 (하나, 정사각) — 레일 4장
 # -----------------------------------------------------------------------------
-# 포켓 바닥은 테이블 상면 그대로다. 바닥판을 깔지 않으면 프림이 하나 줄고,
-# 블록 안착 높이 계산도 단순해진다 (성공 판정이 SPEC.pocket_seat_z_max() 하나).
+# 트레이 바닥은 테이블 상면 그대로다. 바닥판을 깔지 않으면 프림이 하나 줄고,
+# 블록 안착 높이 계산도 단순해진다 (성공 판정이 SPEC.tray_seat_z_max() 하나).
 #
-# 클리어런스가 바뀌면 이 레일들의 위치·크기가 전부 바뀐다. split 별 환경은
-# apply_clearance() 로 한 번에 갈아끼운다 — 씬 cfg 를 split 마다 복제하지 않는다.
-TRAY_RAIL_NAMES = ("tray_x_pos", "tray_x_neg") + tuple(
-    f"pocket{i}_{s}" for i in range(SPEC.NUM_BLOCKS) for s in ("y_pos", "y_neg")
-)
+# ★ 2026-08-11 개편: 좁은 포켓 3개(레일 2 + 칸막이 6 = 8프림) → 정사각 트레이
+#   1개(레일 4장). 한 변이 블록 긴 축의 1.2배(72mm)라, 블록 대각선(67mm)보다
+#   커서 yaw 를 맞추지 않고 비스듬히 넣어도 들어간다. 그게 성공 판정에서 yaw 를
+#   뺄 수 있는 근거다 (SPEC.SUCCESS_REQUIRE_YAW).
+TRAY_RAIL_NAMES = ("tray_x_pos", "tray_x_neg", "tray_y_pos", "tray_y_neg")
 _TRAY_COLOR = (0.30, 0.30, 0.34)
 
 
-def tray_rail(name: str, clearance: float | None = None) -> AssetBaseCfg:
-    """트레이 레일 하나. name 은 TRAY_RAIL_NAMES 중 하나."""
-    px, py = SPEC.pocket_inner_size(clearance)
-    r, d = SPEC.POCKET_RAIL_THICKNESS, SPEC.POCKET_DEPTH
+def tray_rail(name: str) -> AssetBaseCfg:
+    """트레이 레일 하나. name 은 TRAY_RAIL_NAMES 중 하나.
+
+    x 레일이 모서리까지 덮고(길이 s+2r), y 레일은 그 사이(길이 s)만 채운다 —
+    소스 박스 벽과 같은 규약이라 두 구조물의 코너 처리가 일관된다.
+    """
+    s = SPEC.TRAY_INNER_SIZE
+    r, d = SPEC.TRAY_RAIL_THICKNESS, SPEC.TRAY_DEPTH
     tx, ty = SPEC.TRAY_CENTER
     z = SPEC.TABLE_HEIGHT + 0.5 * d
 
-    if name.startswith("tray_x"):
-        # 긴 레일 2장은 포켓 열 전체를 따라 이어진다.
-        span = (SPEC.NUM_BLOCKS - 1) * SPEC.POCKET_PITCH + py + 2 * r
-        sign = 1.0 if name.endswith("pos") else -1.0
-        return _static_box(
-            f"Tray/{name}",
-            (r, span, d),
-            (tx + sign * (0.5 * px + 0.5 * r), ty, z),
-            _TRAY_COLOR,
-        )
-
-    # pocket{i}_y_{pos,neg} — 포켓 하나의 앞뒤 칸막이.
-    idx = int(name[len("pocket")])
-    _, cy = SPEC.pocket_center(idx)
-    sign = 1.0 if name.endswith("pos") else -1.0
-    return _static_box(
-        f"Tray/{name}",
-        (px + 2 * r, r, d),
-        (tx, cy + sign * (0.5 * py + 0.5 * r), z),
-        _TRAY_COLOR,
-    )
-
-
-def apply_clearance(scene_cfg, clearance: float) -> None:
-    """씬의 포켓 레일을 주어진 클리어런스로 다시 만든다.
-
-    클리어런스 split 환경(`VlaPlace-c1mm-v0` 등)이 __post_init__ 에서 부른다.
-    성공 판정 공차도 같은 값에서 파생되어야 하므로, 호출부는 반드시
-    `env_cfg.pocket_clearance` 도 함께 갱신할 것 — 둘은 한 쌍이다.
-    """
-    for name in TRAY_RAIL_NAMES:
-        setattr(scene_cfg, name, tray_rail(name, clearance))
+    layout = {
+        "tray_x_pos": ((r, s + 2 * r, d), (tx + 0.5 * s + 0.5 * r, ty, z)),
+        "tray_x_neg": ((r, s + 2 * r, d), (tx - 0.5 * s - 0.5 * r, ty, z)),
+        "tray_y_pos": ((s, r, d), (tx, ty + 0.5 * s + 0.5 * r, z)),
+        "tray_y_neg": ((s, r, d), (tx, ty - 0.5 * s - 0.5 * r, z)),
+    }
+    size, pos = layout[name]
+    return _static_box(name, size, pos, _TRAY_COLOR)

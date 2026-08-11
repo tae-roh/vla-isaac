@@ -124,8 +124,8 @@ def main() -> int:
             if ids is not None:
                 ids = ids.detach().cpu().numpy().astype(int)
                 out["instruction"] = [
-                    SPEC.instruction_for(b, s, instruction_template["value"])
-                    for b, s in ids
+                    SPEC.instruction_for(int(b), instruction_template["value"])
+                    for (b,) in ids
                 ]
             return out
 

@@ -137,7 +137,7 @@ class PickPlaceMimicEnv(ManagerBasedRLMimicEnv):
           만점이 나오는 데이터셋이 만들어진다.
 
           "target" : 지시문이 지정한 블록의 현재 pose  → 서브태스크 1(파지) 기준
-          "pocket" : 지시문이 지정한 포켓의 pose       → 서브태스크 2(배치) 기준
+          "tray"   : 타깃 트레이의 pose               → 서브태스크 2(배치) 기준
 
         SubTaskConfig.object_ref 가 이 키와 일치해야 한다.
         """
@@ -145,7 +145,7 @@ class PickPlaceMimicEnv(ManagerBasedRLMimicEnv):
             env_ids = slice(None)
 
         out = {}
-        for key, obs_key in (("target", "target_pose"), ("pocket", "pocket_pose")):
+        for key, obs_key in (("target", "target_pose"), ("tray", "tray_pose")):
             pose7 = self.obs_buf["policy"][obs_key][env_ids]   # (N, 7) pos+quat
             out[key] = PoseUtils.make_pose(
                 pose7[..., :3], PoseUtils.matrix_from_quat(pose7[..., 3:7])

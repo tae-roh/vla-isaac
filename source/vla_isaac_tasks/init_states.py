@@ -16,7 +16,7 @@
 # 이 모듈은 **numpy 만** 쓴다. Isaac Sim 없이도 뱅크를 만들고 검사할 수 있어야
 # 하기 때문이다 (scripts/make_init_states.py 가 어느 venv 에서든 돈다).
 #
-# 뱅크 한 줄:  [x, y, yaw] × NUM_BLOCKS + [target_block_idx, target_slot_idx]
+# 뱅크 한 줄:  [x, y, yaw] × NUM_BLOCKS + [target_block_idx]
 # =============================================================================
 
 from __future__ import annotations
@@ -70,13 +70,11 @@ def sample_bank(size: int, seed: int) -> np.ndarray:
     half_y = 0.5 * SPEC.BOX_INNER_SIZE[1] - SPEC.BLOCK_SPAWN_WALL_MARGIN
     n = SPEC.NUM_BLOCKS
 
-    # 타깃 (블록, 슬롯) 조합은 **균등 배분**한다. 그냥 뽑으면 64개짜리 홀드아웃에서
-    # 어떤 조합은 1번, 어떤 조합은 14번 나온다 — 성공률이 조합 운에 좌우되고,
+    # 타깃 블록은 **균등 배분**한다. 그냥 뽑으면 64개짜리 홀드아웃에서 어떤
+    # 색은 12번, 어떤 색은 25번 나온다 — 성공률이 뽑기 운에 좌우되고,
     # Language split 의 숫자가 그만큼 흔들린다.
-    combos = np.array(
-        [(b, s) for b in range(n) for s in range(len(SPEC.SLOT_NAMES))]
-    )
-    targets = combos[np.arange(size) % len(combos)]
+    # (트레이 단일화로 조합이 9종 → 3종이 되어 배분이 더 촘촘해졌다.)
+    targets = np.arange(size) % n
     rng.shuffle(targets)
 
     rows = np.zeros((size, SPEC.INIT_STATE_DIM), dtype=np.float64)
@@ -84,7 +82,7 @@ def sample_bank(size: int, seed: int) -> np.ndarray:
         xy = _sample_non_overlapping(rng, n, bx, by, half_x, half_y)
         yaw = rng.uniform(-math.pi, math.pi, size=n)
         rows[k, : 3 * n] = np.stack([xy[:, 0], xy[:, 1], yaw], axis=1).reshape(-1)
-        rows[k, 3 * n : 3 * n + 2] = targets[k]
+        rows[k, 3 * n] = targets[k]
     return rows
 
 
@@ -149,7 +147,17 @@ def load_bank(name: str) -> np.ndarray:
             f"{path.name}: 박스 안치수가 뱅크 생성 시점과 다르다 "
             f"({data['box_inner']} → {SPEC.BOX_INNER_SIZE}). 뱅크를 다시 만들 것."
         )
-    return np.asarray(data["states"], dtype=np.float64)
+    states = np.asarray(data["states"], dtype=np.float64)
+    # ★ 차원 검사. 트레이 단일화로 target_slot_idx 가 빠져 한 줄이 짧아졌다
+    #   (3N+2 → 3N+1). 이걸 안 막으면 예전 뱅크의 슬롯 인덱스를 타깃 블록으로
+    #   읽어 지시문과 실제 타깃이 조용히 어긋난다 — 에러 없이 데이터만 오염된다.
+    if states.shape[1] != SPEC.INIT_STATE_DIM:
+        raise ValueError(
+            f"{path.name}: 상태 차원 {states.shape[1]} != 현재 스펙 "
+            f"{SPEC.INIT_STATE_DIM}. 태스크 지오메트리가 바뀌었다 — 뱅크를 다시 "
+            f"만들 것:\n  python scripts/make_init_states.py --name {name} --force"
+        )
+    return states
 
 
 def ensure_bank(name: str, size: int, seed: int) -> np.ndarray:
@@ -186,9 +194,8 @@ def _demo() -> None:
     off = np.abs(xy - np.asarray(SPEC.BOX_CENTER))
     assert (off <= half + 1e-9).all(), "블록이 박스 밖에 스폰됐다."
 
-    tgt = a[:, 3 * n : 3 * n + 2].astype(int)
-    assert tgt[:, 0].min() >= 0 and tgt[:, 0].max() < n
-    assert tgt[:, 1].min() >= 0 and tgt[:, 1].max() < len(SPEC.SLOT_NAMES)
+    tgt = a[:, 3 * n].astype(int)
+    assert tgt.min() >= 0 and tgt.max() < n
     print(f"초기 상태 뱅크 검사 통과 (상태 차원 {SPEC.INIT_STATE_DIM}).")
 
 

@@ -29,9 +29,8 @@ from .observations import (  # noqa: F401
     target_grasped,
     target_height_above_table,
     target_ids,
-    target_pocket_pose,
+    target_tray_pose,
     target_position_in_robot_root_frame,
-    target_slot_index,
     yaw_error,
     yaw_error_obs,
 )
