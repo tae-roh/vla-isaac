@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -296,7 +297,7 @@ def place_start_signal(
 # -----------------------------------------------------------------------------
 # 성공 술어 (sparse binary) — 개정 §2-5
 # -----------------------------------------------------------------------------
-#   success = (블록 바닥면이 트레이 영역과 겹침) AND (레일 위가 아님)
+#   success = (블록 꼭짓점 하나가 트레이 안쪽에서 바닥에 닿음 — 자세 무관)
 #             [+ settled / grasped_during_lift / yaw_aligned 은 각각의
 #              SPEC.SUCCESS_REQUIRE_* 플래그가 True 일 때만]
 #   → 이 조건을 SPEC.SUCCESS_HOLD_STEPS(2초) 연속 유지해야 종료된다
@@ -349,41 +350,81 @@ def grasped_during_lift(
     return latch
 
 
-def block_overlaps_tray(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """타깃 블록의 바닥면이 트레이 안쪽 영역과 겹치는가. Shape (num_envs,) bool.
+def block_corners(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """타깃 블록의 8개 꼭짓점 좌표 (env 로컬). Shape (num_envs, 8, 3).
 
-    "블록의 한 점이라도 트레이 영역 안" 을 그대로 구현한 것이다. 중심이 어디에
-    있는지, yaw 가 얼마인지는 묻지 않는다 — 두 사각형(축정렬 트레이 × 회전한
-    블록)이 조금이라도 겹치면 True.
-
-    ★ 분리축 정리(SAT). 볼록 다각형 둘은 **어떤 축에서도 분리되지 않을 때만**
-      겹친다. 사각형 둘이면 후보 축은 각자의 변 법선 4개뿐이라 이 4개만 보면
-      정확한 판정이 된다 (근사가 아니다).
-
-      축 a 에 대해:
-        트레이 반폭 = ht·(|aₓ| + |a_y|)      (정사각이라 두 변 반폭이 같다)
-        블록 반폭   = hbw·|a·u| + hbh·|a·v|   (u, v = 블록의 두 변 방향)
-        겹침 ⟺ |중심차·a| ≤ 트레이반폭 + 블록반폭
+    자세를 그대로 반영한다 — 기울어져 있으면 기울어진 대로 나온다.
     """
     pose = target_block_pose(env)
-    tray = target_tray_pose(env)
+    half = torch.tensor(
+        [0.5 * s for s in SPEC.BLOCK_SIZE], device=env.device, dtype=torch.float32
+    )
+    signs = torch.tensor(
+        [[sx, sy, sz] for sx in (-1.0, 1.0) for sy in (-1.0, 1.0) for sz in (-1.0, 1.0)],
+        device=env.device,
+        dtype=torch.float32,
+    )                                                   # (8, 3)
+    rot = math_utils.matrix_from_quat(pose[:, 3:7])      # (N, 3, 3)
+    local = (signs * half).unsqueeze(0)                  # (1, 8, 3)
+    return pose[:, None, :3] + torch.einsum("nij,nkj->nki", rot, local)
 
-    d = pose[:, :2] - tray[:, :2]                       # 중심차 (N, 2)
-    _, _, yaw = math_utils.euler_xyz_from_quat(pose[:, 3:7])
-    c, s = torch.cos(yaw), torch.sin(yaw)               # 블록 축 u=(c,s), v=(-s,c)
 
-    ht = SPEC.tray_half_extent()
-    hbw, hbh = SPEC.block_half_extents()
-    ac, as_ = c.abs(), s.abs()
+def block_in_tray(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """블록의 한 점이라도 트레이 영역 안에서 바닥에 닿아 있는가. (num_envs,) bool.
 
-    # 축 1·2: 트레이의 변 법선 (1,0) 과 (0,1)
-    sep_x = d[:, 0].abs() > ht + (hbw * ac + hbh * as_)
-    sep_y = d[:, 1].abs() > ht + (hbw * as_ + hbh * ac)
-    # 축 3·4: 블록의 변 법선 u, v
-    sep_u = (d[:, 0] * c + d[:, 1] * s).abs() > ht * (ac + as_) + hbw
-    sep_v = (-d[:, 0] * s + d[:, 1] * c).abs() > ht * (as_ + ac) + hbh
+    "자세와 관계없이 블록의 한 점이라도 트레이 영역 안에 닿아 있으면" 을 그대로
+    구현한 것이다. 판정은 **꼭짓점 하나라도**
+        (xy 가 트레이 안쪽 사각형 안)  AND  (z 가 트레이 바닥 근처)
+    를 만족하면 True.
 
-    return ~(sep_x | sep_y | sep_u | sep_v)
+    ★ 왜 꼭짓점인가 — 중심 기준으로는 자세가 판정을 오염시킨다.
+      블록을 세울수록 중심 z 가 올라가서(피치 45도 → 25.6mm, 80도 → 30.0mm),
+      중심 z 임계로 자르면 "트레이 바닥에 모서리가 닿은 채 기울어진" 정상 상태가
+      실패로 잡힌다. 볼록 다면체가 평면에 닿을 때 접점은 항상 꼭짓점·모서리·면이고
+      그 극점은 전부 꼭짓점이므로, 꼭짓점만 보면 자세와 무관하게 정확하다.
+
+    ★ 이 하나가 "트레이와 겹침" 과 "레일에 얹힌 것 배제" 를 동시에 해결한다.
+      - 레일 위에 얹힌 블록  → 최저 꼭짓점이 레일 높이(20mm)라 바닥 조건 탈락
+      - 밖에서 레일에 기대어 트레이 위로 넘어온 블록
+                             → 트레이 안에 있는 꼭짓점은 위쪽이라 바닥 조건 탈락,
+                               바닥에 닿은 꼭짓점은 트레이 밖이라 xy 조건 탈락
+    """
+    corners = block_corners(env)                         # (N, 8, 3)
+    tray = target_tray_pose(env)                         # (N, 7)
+
+    d = (corners[..., :2] - tray[:, None, :2]).abs()     # (N, 8, 2)
+    inside_xy = (d <= SPEC.tray_half_extent()).all(dim=-1)
+    on_floor = corners[..., 2] <= SPEC.tray_floor_z_max()
+    return (inside_xy & on_floor).any(dim=1)
+
+
+def _diagnose(env, in_tray, settled, lifted, ok) -> None:
+    """왜 성공이 안 뜨는지 한 줄로 알려 준다 (VLA_ANNOUNCE_TARGET=1 일 때만).
+
+    ★ 텔레옵에서 이게 없으면 "블록을 넣었는데 에피소드가 안 끝난다" 를 눈으로
+      진단할 방법이 없다. 조건은 셋인데 화면에는 아무것도 안 나오기 때문이다.
+      상태가 **바뀔 때만** 찍으므로 로그가 흐르지 않는다.
+    """
+    if os.environ.get("VLA_ANNOUNCE_TARGET", "") not in ("1", "true", "True"):
+        return
+    state = (bool(in_tray[0]), bool(settled[0]), bool(lifted[0]), bool(ok[0]))
+    if getattr(env, "_vla_last_diag", None) == state:
+        return
+    env._vla_last_diag = state
+    it, se, li, allok = state
+    if allok:
+        print(f"  ✓ 성공 조건 충족 — {SPEC.SUCCESS_HOLD_SECONDS:.0f}초 유지하면 종료",
+              flush=True)
+        return
+    miss = []
+    if not it:
+        miss.append("트레이 안 바닥에 닿지 않음")
+    if not se and SPEC.SUCCESS_REQUIRE_SETTLED:
+        miss.append("아직 움직이는 중")
+    if not li and SPEC.SUCCESS_REQUIRE_GRASP_LIFT:
+        miss.append("쥔 채로 박스 벽 위까지 들어올린 적 없음")
+    if miss:
+        print("  … 성공 대기: " + " / ".join(miss), flush=True)
 
 
 def placed_signal(
@@ -397,26 +438,27 @@ def placed_signal(
     "보상과 평가 기준이 같은 코드에서 나온다"는 것이 중요하다. 따로 구현하면
     RFT 가 최적화하는 것과 우리가 측정하는 것이 미묘하게 달라진다.
     """
-    # (1) 트레이와 겹침 — 블록의 **한 점이라도** 트레이 영역 안이면 인정한다.
-    ok = block_overlaps_tray(env)
-
-    # 레일 위에 걸쳐 있는 상태와 구분한다. xy 만 보면 얹혀 있어도 성공이 된다.
-    # 겹침 판정이 매우 관대해졌으므로 이 z 검사가 "정말 안에 들어갔는가" 를
-    # 지탱하는 축이다 — 레일에 걸친 블록은 중심 z 가 레일 높이만큼 올라간다.
-    ok &= target_block_pose(env)[:, 2] < SPEC.tray_seat_z_max()
+    # (1) 트레이 안에서 바닥에 닿음 — 자세는 묻지 않는다.
+    #     "겹침" 과 "레일에 얹힌 것 배제" 를 이 하나가 함께 해결한다.
+    in_tray = block_in_tray(env)
+    ok = in_tray.clone()
 
     # (2) 정지 — 굴러 지나가는 중에 성공이 뜨는 것을 막는다.
+    settled = (
+        torch.linalg.norm(target_block_lin_vel(env), dim=-1)
+        < SPEC.SUCCESS_LIN_VEL_THRESHOLD
+    )
     if SPEC.SUCCESS_REQUIRE_SETTLED:
-        ok &= (
-            torch.linalg.norm(target_block_lin_vel(env), dim=-1)
-            < SPEC.SUCCESS_LIN_VEL_THRESHOLD
-        )
+        ok &= settled
 
     # (3) 리프트 구간 동안 파지 — 밀기·끌기 배제 (pushcut).
+    #     ★ 래치 갱신은 플래그와 무관하게 매번 돌려야 한다. 조건부로 부르면
+    #       플래그를 껐다 켤 때 래치가 비어 있어 성공이 영영 안 뜬다.
+    lifted = grasped_during_lift(env, robot_cfg=robot_cfg, ee_frame_cfg=ee_frame_cfg)
     if SPEC.SUCCESS_REQUIRE_GRASP_LIFT:
-        ok &= grasped_during_lift(
-            env, robot_cfg=robot_cfg, ee_frame_cfg=ee_frame_cfg
-        )
+        ok &= lifted
+
+    _diagnose(env, in_tray, settled, lifted, ok)
 
     # (4) yaw 정렬 — 기본은 **끈다**. 넓은 정사각 트레이는 블록 대각선보다 커서
     #     yaw 를 물리적으로 강제하지 못한다. 물리가 돕지 않는 조건을 판정에만

@@ -402,8 +402,15 @@ def tray_inner_size() -> tuple[float, float]:
 # dense shaping 금지 (개정 §2-5). 거리 항은 "밀기/끌기"를 적극적으로 보상해
 # 파지 없는 정책으로 수렴시킨다. 마지막 항이 그 pushcut 방지책이다.
 
-# 안착 높이: 블록 중심이 레일 상단보다 아래여야 한다 (얹혀 있는 것과 구분).
-TRAY_SEAT_Z_MARGIN = 0.005
+# 바닥 접촉 판정: 블록 꼭짓점이 트레이 바닥(=테이블 상면)에서 이 안이면 "닿았다".
+#
+# ★ 중심 z 로 판정하지 않는다. 블록을 비스듬히 세우면 자세만으로 중심이 올라간다
+#   (피치 45도 → 25.6mm, 80도 → 30.0mm 실측). 중심 임계로 자르면 "트레이 바닥에
+#   모서리가 닿은 채 기울어진" 정상 상태가 실패로 잡힌다 — 자세와 무관하게
+#   판정하겠다는 규약과 정면으로 어긋난다.
+#   꼭짓점 기준이면 기울기와 무관하다: 바닥에 닿은 점은 어떤 자세에서도 z≈0 이고,
+#   레일 위에 얹힌 블록은 최저점이 레일 높이(20mm)라 확실히 갈린다.
+TRAY_FLOOR_TOUCH_MARGIN = 0.005
 # yaw 정렬 허용 오차 [rad]. 대칭 차수로 접은 뒤의 오차에 적용한다.
 SUCCESS_YAW_TOLERANCE = 0.20         # 약 11.5도
 
@@ -438,9 +445,9 @@ def block_half_extents() -> tuple[float, float]:
     return (0.5 * BLOCK_SIZE[0], 0.5 * BLOCK_SIZE[1])
 
 
-def tray_seat_z_max() -> float:
-    """성공으로 인정할 블록 중심 z 상한 (env 로컬)."""
-    return TABLE_HEIGHT + 0.5 * BLOCK_SIZE[2] + TRAY_SEAT_Z_MARGIN
+def tray_floor_z_max() -> float:
+    """블록 꼭짓점이 이 z 아래면 트레이 바닥에 "닿았다" 로 본다 (env 로컬)."""
+    return TABLE_HEIGHT + TRAY_FLOOR_TOUCH_MARGIN
 
 # "정지" 판정 속도 임계값 [m/s]. 물체가 굴러가는 중에 성공이 뜨는 것을 막는다.
 SUCCESS_LIN_VEL_THRESHOLD = 0.03
@@ -779,8 +786,9 @@ def summary() -> str:
         f"{TRAY_INNER_SIZE * 1000:.0f}mm (블록 긴축 대비 "
         f"{TRAY_INNER_SIZE / BLOCK_SIZE[0]:.2f}배), 레일높이 "
         f"{TRAY_DEPTH * 1000:.0f}mm\n"
-        f"  성공 판정 : 블록 바닥면이 트레이 영역과 겹치면 OK (중심 기준 아님), "
-        f"안착 z ≤ {tray_seat_z_max() * 1000:.0f}mm\n"
+        f"  성공 판정 : 블록 꼭짓점 하나라도 트레이 안쪽(±"
+        f"{tray_half_extent() * 1000:.0f}mm)에서 바닥(z ≤ "
+        f"{tray_floor_z_max() * 1000:.0f}mm)에 닿으면 OK — 자세 무관\n"
         f"              유지 {SUCCESS_HOLD_SECONDS:.1f}초 = {SUCCESS_HOLD_STEPS}스텝 / "
         f"정지조건 {'O' if SUCCESS_REQUIRE_SETTLED else 'X'}, "
         f"파지리프트 {'O' if SUCCESS_REQUIRE_GRASP_LIFT else 'X'}, "
