@@ -25,13 +25,35 @@ if TYPE_CHECKING:
 _HOLD_COUNTER_ATTR = "_vla_success_hold_counter"
 
 
+def update_success_hold(
+    env: "ManagerBasedRLEnv",
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+) -> torch.Tensor:
+    """성공 조건 유지 카운터를 **한 스텝분** 전진시킨다. Shape (num_envs,).
+
+    ★ 반드시 스텝당 정확히 한 번만 불러야 한다. 그래서 호출부는 환경의
+      step() 하나로 못 박아 두었다 (vla_env.VlaEnvMixin). 왜 그래야 하는지는
+      task_success() 의 주석 참조.
+    """
+    cond = placed_signal(env, robot_cfg=robot_cfg, ee_frame_cfg=ee_frame_cfg)
+
+    counter = getattr(env, _HOLD_COUNTER_ATTR, None)
+    if counter is None or counter.shape[0] != env.num_envs:
+        counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+    counter = torch.where(cond, counter + 1, torch.zeros_like(counter))
+    setattr(env, _HOLD_COUNTER_ATTR, counter)
+    return counter
+
+
 def task_success(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
     hold_steps: int = SPEC.SUCCESS_HOLD_STEPS,
 ) -> torch.Tensor:
-    """성공 조건이 hold_steps 연속으로 유지되면 True. Shape (num_envs,).
+    """성공 조건이 hold_steps 연속으로 유지되었으면 True. Shape (num_envs,).
 
     ★ 왜 즉시 종료하지 않고 유지 스텝을 두는가
 
@@ -43,20 +65,25 @@ def task_success(
 
       부수 효과로 "물체를 놓자마자 굴러 나가는" 가짜 성공도 걸러진다.
 
-    카운터는 조건이 깨지면 0 으로 돌아간다. 에피소드 리셋 시 블록은 전부 박스
-    안에 스폰되고 grasped_during_lift 래치도 꺼져 있으므로, 첫 스텝에서 조건이
-    False 가 되어 카운터가 자연히 초기화된다.
-    """
-    cond = placed_signal(env, robot_cfg=robot_cfg, ee_frame_cfg=ee_frame_cfg)
+    ★ 이 함수는 **카운터를 읽기만 한다.** 예전에는 호출될 때마다 카운터를
+      올렸는데, 그러면 "몇 번 불렸는가" 를 세게 되어 호출 빈도가 다른 소비자
+      사이에서 의미가 달라진다. 실제로 이것 때문에 replay 가 항상 실패했다:
 
+          replay_demos.py 는 env_cfg.terminations = {} 로 종료 조건을 전부 끈 뒤
+          success_term.func() 를 **에피소드 끝에 한 번만** 부른다.
+          → 카운터가 1 까지밖에 못 올라가 1 >= 48 이 영원히 False.
+          → 데모가 아무리 멀쩡해도 성공률이 0/10 으로 나온다.
+
+      이제 전진은 update_success_hold() 가 환경 step() 에서 스텝당 한 번씩
+      담당하고, 이 함수는 그 결과만 본다. 호출 횟수와 무관해졌으므로
+      replay / Mimic 생성 / RFT 어느 경로에서 불러도 같은 뜻이 된다.
+
+    카운터는 조건이 깨지면 0 으로 돌아가고, 리셋에서는
+    events.reset_episode_buffers 가 지운다.
+    """
     counter = getattr(env, _HOLD_COUNTER_ATTR, None)
     if counter is None or counter.shape[0] != env.num_envs:
-        counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
-        setattr(env, _HOLD_COUNTER_ATTR, counter)
-
-    counter = torch.where(cond, counter + 1, torch.zeros_like(counter))
-    setattr(env, _HOLD_COUNTER_ATTR, counter)
-
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     return counter >= hold_steps
 
 

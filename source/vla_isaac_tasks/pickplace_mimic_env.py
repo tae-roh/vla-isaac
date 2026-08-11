@@ -19,13 +19,21 @@ import torch
 import isaaclab.utils.math as PoseUtils
 from isaaclab.envs import ManagerBasedRLMimicEnv
 
+from .vla_env import VlaEnvMixin
+
 # 이 문자열은 MimicEnvCfg.subtask_configs 의 키이자 헬퍼들이 주고받는 eef 이름이다.
 # cfg 쪽과 반드시 같아야 한다 → 여기서 한 번만 정의하고 cfg 가 import 해 쓴다.
 EEF_NAME = "franka"
 
 
-class PickPlaceMimicEnv(ManagerBasedRLMimicEnv):
-    """형상 랜덤 자재 픽앤플레이스용 Mimic 환경."""
+class PickPlaceMimicEnv(VlaEnvMixin, ManagerBasedRLMimicEnv):
+    """블록 픽앤플레이스용 Mimic 환경.
+
+    ★ VlaEnvMixin 이 앞에 와야 한다. annotate_demos.py 가 소스 데모를
+      reset_to() 로 재생하는데, 그 경로에서 타깃 블록이 뱅크 커서 값으로
+      덮어써지기 때문이다 (vla_env.py 머리말 참조). 믹스인이 없으면 서브태스크
+      경계가 전부 틀린 블록 기준으로 찍힌다.
+    """
 
     # -------------------------------------------------------------------------
     def get_robot_eef_pose(

@@ -64,7 +64,7 @@ def _cfg_entry(kind: str):
 
 gym.register(
     id="VlaPlace-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point="{}.vla_env:VlaPlaceEnv".format(__name__),
     kwargs={"env_cfg_entry_point": _cfg_entry("base")},
     disable_env_checker=True,
 )

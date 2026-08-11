@@ -66,6 +66,69 @@ def active_bank_name() -> str | None:
     return _BANK["name"]
 
 
+# 뱅크 행 역조회 허용 오차 [m]. 블록 N개의 xy 를 이어 붙인 벡터의 L2 거리다.
+# 실측상 정확히 일치하는 행은 거리 0.00mm 이고, 서로 다른 행은 수 cm 떨어져
+# 있으므로 이 값은 매우 넉넉하다. 넘으면 "뱅크에서 온 배치가 아니다" 로 본다.
+_BANK_MATCH_TOL = 0.005
+
+
+def recover_target_from_scene(env, env_ids=None) -> int:
+    """현재 블록 배치로 뱅크 행을 역조회해 타깃 블록을 복원한다.
+
+    ★ 왜 필요한가 — replay / annotate 경로가 타깃을 잃어버린다.
+      ManagerBasedEnv.reset_to() 는 이 순서로 돈다:
+          _reset_idx()            → reset 이벤트 실행 (reset_scene_from_bank)
+          scene.reset_to(state)   → 블록 위치를 **파일 값으로 덮어씀**
+      블록 위치는 복원되지만 `_vla_target_block` 은 파이썬 버퍼라 물리 상태에
+      들어 있지 않다. 그래서 이벤트가 뱅크 커서에서 뽑은 값이 그대로 남고,
+      데모가 실제로 지시했던 블록과 어긋난다 (실측 10개 중 7개 불일치).
+      성공 판정이 엉뚱한 블록을 보게 되어 replay 성공률이 0 이 된다.
+
+      초기 배치는 연속 난수라 뱅크 행을 유일하게 식별한다. 그래서 덮어쓰기가
+      끝난 뒤 배치로 행을 되찾으면 타깃이 정확히 복원된다.
+      정상 롤아웃에서는 방금 그 행을 다시 찾으므로 아무것도 바뀌지 않는다.
+
+    Returns:
+        복원에 성공한 env 수.
+    """
+    states = _BANK["states"]
+    if states is None:
+        return 0
+
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    elif not isinstance(env_ids, torch.Tensor):
+        env_ids = torch.as_tensor(env_ids, device=env.device)
+    if env_ids.numel() == 0:
+        return 0
+
+    n = SPEC.NUM_BLOCKS
+    cur = []
+    for b in range(n):
+        asset: RigidObject = env.scene[block_name(b)]
+        pos = asset.data.root_pos_w[env_ids] - env.scene.env_origins[env_ids]
+        cur.append(pos[:, :2])
+    cur_np = torch.cat(cur, dim=-1).detach().cpu().numpy()          # (N, 2n)
+
+    bank_xy = np.concatenate(
+        [states[:, [3 * b, 3 * b + 1]] for b in range(n)], axis=1
+    )                                                               # (K, 2n)
+    dist = np.linalg.norm(bank_xy[None, :, :] - cur_np[:, None, :], axis=-1)
+    j = dist.argmin(axis=1)
+    dmin = dist[np.arange(len(j)), j]
+    tgt = states[j, 3 * n].astype(np.int64)
+
+    buf = _buffer(env, "_vla_target_block", torch.long)
+    idx_buf = _buffer(env, "_vla_init_index", torch.long)
+    recovered = 0
+    for i, e in enumerate(env_ids.tolist()):
+        if dmin[i] <= _BANK_MATCH_TOL:
+            buf[e] = int(tgt[i])
+            idx_buf[e] = int(j[i])
+            recovered += 1
+    return recovered
+
+
 def _rows_for(
     env_ids: torch.Tensor, bank_name: str
 ) -> tuple[np.ndarray, np.ndarray]:
