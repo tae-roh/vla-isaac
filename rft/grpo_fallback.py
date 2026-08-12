@@ -60,7 +60,13 @@ class GRPOConfig:
     # 롤아웃
     group_size: int = 8           # 같은 초기 상태에서 굴릴 궤적 수 (G)
     num_envs: int = 8             # 워커의 배치 크기. group_size 와 같게 두면 한 라운드 = 한 그룹
-    groups_per_step: int = 2      # 한 업데이트에 쓸 그룹 수
+    groups_per_step: int = 2      # 한 업데이트에 쓸 **유효** 그룹 수
+    # dynamic sampling (DAPO). 전멸/전승 그룹은 advantage 가 0 이라 버리고 다시
+    # 뽑아 배치를 채운다. False 면 예전처럼 건너뛰기만 한다.
+    dynamic_sampling: bool = True
+    # 한 스텝에서 시도할 그룹 수의 상한. 0 = groups_per_step 의 3배.
+    # 정책이 태스크를 못 풀면 유효 그룹이 영원히 안 나오므로 상한이 필요하다.
+    max_group_attempts: int = 0
     max_steps_per_episode: int = SPEC.MAX_EPISODE_STEPS
     temperature: float = 1.6      # 개정 §5: SimpleVLA-RL 설정값
     # 초기 상태 뱅크 (개정 §3). 학습용 뱅크를 쓰고, 평가는 별도 홀드아웃을 쓴다.
@@ -134,6 +140,48 @@ def degenerate_fraction(rewards: np.ndarray) -> float:
     return float((std <= 1e-6).mean())
 
 
+def is_degenerate(reward_row: np.ndarray) -> bool:
+    """그룹 하나가 전멸(전부 0) 또는 전승(전부 1)인가 → advantage 가 0 이다."""
+    return bool(np.std(reward_row) <= 1e-6)
+
+
+def collect_groups(collect_fn, groups_per_step: int, max_attempts: int, cursor: int):
+    """유효 그룹이 목표 개수를 채울 때까지 뽑는다 (DAPO 의 dynamic sampling).
+
+    ★ 왜 건너뛰기만으로는 부족한가
+      전멸/전승 그룹은 advantage 가 0 이라 그래디언트에 기여하지 않는다. 그냥
+      건너뛰면 그 스텝의 유효 배치가 줄고, 성공률이 낮은 초기에는
+      **업데이트가 거의 일어나지 않은 채 스텝만 흐른다.**
+      SimpleVLA-RL/DAPO 는 버린 만큼 다시 뽑아 배치를 채운다.
+
+    ★ 상한이 필요한 이유
+      정책이 태스크를 아예 못 풀면 유효 그룹이 영원히 안 나온다. 상한 없이는
+      한 스텝에서 무한히 롤아웃을 돌게 된다 — 롤아웃이 전체 시간의 대부분인
+      구조라 그대로 밤을 날린다. 상한에 닿으면 모은 것으로 업데이트하고 넘어가고,
+      그 사실은 로그의 group_attempts 로 드러난다.
+
+    Args:
+        collect_fn: `init_index -> (rewards(N,), payload)` 를 돌려주는 함수.
+        cursor: 다음에 쓸 초기 상태 뱅크 인덱스. 시도마다 1씩 나아간다 —
+            재시도에 같은 s₀ 를 다시 쓰면 같은 결과가 나와 재샘플링이 무의미하다.
+
+    Returns:
+        (used_rewards, used_payloads, all_rewards, cursor)
+        all_rewards 는 버린 것까지 포함한다 (degenerate 비율 계산용).
+    """
+    used_rewards, used_payloads, all_rewards = [], [], []
+    attempts = 0
+    while len(used_rewards) < groups_per_step and attempts < max_attempts:
+        rewards, payload = collect_fn(cursor)
+        cursor += 1
+        attempts += 1
+        all_rewards.append(rewards)
+        if not is_degenerate(rewards):
+            used_rewards.append(rewards)
+            used_payloads.append(payload)
+    return used_rewards, used_payloads, all_rewards, cursor
+
+
 # =============================================================================
 class GRPOTrainer:
     def __init__(self, cfg: GRPOConfig):
@@ -168,6 +216,9 @@ class GRPOTrainer:
               f"전체 {sum(p.numel() for p in self.model.parameters()) / 1e9:.1f}B")
 
         self.optimizer = torch.optim.AdamW(trainable, lr=cfg.learning_rate)
+
+        # 초기 상태 뱅크 커서. 그룹을 하나 뽑을 때마다 나아간다 (재샘플링 포함).
+        self._init_cursor = 0
 
         # 액션 디토크나이저 구간. SFT 가 만든 것과 같은 파일을 읽어야 한다 —
         # 다르면 같은 토큰이 다른 물리량을 뜻하게 되어 정책이 통째로 어긋난다.
@@ -328,6 +379,11 @@ class GRPOTrainer:
 
         return rewards, transitions, dict(self.client.last_diag)
 
+    def _collect_for_sampling(self, init_index: int):
+        """collect_groups 가 요구하는 형태로 감싼다 → (보상, 나머지 페이로드)."""
+        rewards, transitions, diag = self.collect_group(init_index)
+        return rewards, (transitions, diag)
+
     # -------------------------------------------------------------------------
     def train(self) -> int:
         cfg = self.cfg
@@ -336,22 +392,36 @@ class GRPOTrainer:
 
         torch = self.torch
 
-        for step in range(cfg.total_steps):
-            group_rewards, group_transitions, group_diags = [], [], []
-            for g in range(cfg.groups_per_step):
-                # 뱅크 인덱스로 s₀ 를 지정한다. 스텝마다 다른 씬을 쓰되,
-                # 한 그룹 안에서는 전 env 가 동일한 s₀ 다 (GRPO 전제).
-                r, transitions, diag = self.collect_group(
-                    init_index=step * cfg.groups_per_step + g
-                )
-                group_rewards.append(r)
-                group_transitions.append(transitions)
-                group_diags.append(diag)
+        max_attempts = cfg.max_group_attempts or (3 * cfg.groups_per_step)
+        if not cfg.dynamic_sampling:
+            # 예전 동작: 정해진 횟수만 뽑고 무신호 그룹은 아래에서 건너뛴다.
+            max_attempts = cfg.groups_per_step
 
-            rewards = np.stack(group_rewards)                      # (그룹수, num_envs)
+        for step in range(cfg.total_steps):
+            # 뱅크 인덱스로 s₀ 를 지정한다. 그룹 안에서는 전 env 가 동일한 s₀ 이고
+            # (GRPO 전제), 커서는 시도마다 나아간다 — 재시도에 같은 s₀ 를 다시
+            # 쓰면 같은 결과가 나와 재샘플링이 무의미해진다.
+            used, payloads, attempted, self._init_cursor = collect_groups(
+                collect_fn=self._collect_for_sampling,
+                groups_per_step=cfg.groups_per_step,
+                max_attempts=max_attempts,
+                cursor=self._init_cursor,
+            )
+            group_transitions = [p[0] for p in payloads]
+            group_diags = [p[1] for p in payloads]
+
+            # ★ 성공률과 무신호 비율은 **버린 그룹까지 포함해** 센다.
+            #   유효 그룹만 세면 전멸 그룹이 통계에서 사라져 성공률이 부풀려진다 —
+            #   재샘플링을 켠 순간 로그가 조용히 낙관적으로 변하는 함정이다.
+            attempted_arr = np.stack(attempted)
+            degen = degenerate_fraction(attempted_arr)
+            success_rate = float(attempted_arr.mean())
+
+            # 유효 그룹이 하나도 없으면 group_transitions 도 비어 있어 아래 업데이트
+            # 루프가 그냥 돌지 않는다. 그 스텝은 로그만 남는다 —
+            # SFT 베이스라인이 게이트(30%)를 못 넘겼다는 신호다.
+            rewards = np.stack(used) if used else attempted_arr
             advantages = compute_group_advantages(rewards)
-            degen = degenerate_fraction(rewards)
-            success_rate = float(rewards.mean())
 
             # --- 정책 업데이트 (PPO 클리핑) ---
             # advantage 는 궤적 단위다. 궤적 안의 모든 액션 청크가 같은 advantage 를
@@ -416,18 +486,24 @@ class GRPOTrainer:
                     np.mean([d.get("yaw_err", np.nan) for d in group_diags])
                 ),
                 "updated_terms": num_terms,
+                # 재샘플링 비용. 이게 안 보이면 상한을 조정할 근거가 없다.
+                "groups_used": len(used),
+                "group_attempts": len(attempted),
                 "elapsed_min": elapsed / 60,
             }
             history.append(record)
             print(
                 f"[grpo] step {step:4d} | 성공률 {success_rate:.1%} | "
                 f"loss {mean_loss:+.4f} | 무신호그룹 {degen:.0%} | "
+                f"그룹 {len(used)}/{len(attempted)} | "
                 f"리프트 {record['lifted_frac']:.0%} | "
                 f"{elapsed / 60:.1f}분"
             )
-            if degen > 0.9:
-                print("       ⚠ 그룹 대부분이 전멸 또는 전승이라 학습 신호가 없다. "
-                      "temperature 를 올리거나(탐색↑) SFT prior 를 점검할 것.")
+            if len(used) < cfg.groups_per_step:
+                print(f"       ⚠ 유효 그룹 {len(used)}/{cfg.groups_per_step} — "
+                      f"시도 {len(attempted)}회로 배치를 못 채웠다. 그룹이 전멸/전승으로 "
+                      "쏠린다는 뜻이다. temperature 를 올리거나(탐색↑), "
+                      "SFT 베이스라인이 30% 게이트를 넘는지 먼저 확인할 것.")
 
             if self.writer:
                 self.writer.log(record)
@@ -446,12 +522,64 @@ class GRPOTrainer:
 
 
 # =============================================================================
+def self_check() -> int:
+    """dynamic sampling 수집 루프 점검. GPU·Isaac Sim 없이 돈다.
+
+    여기서 깨지면 RFT 가 "도는 것처럼 보이는데 학습이 안 되는" 상태가 된다 —
+    로그만으로는 구분이 어려운 종류라 실행 가능한 검사를 남긴다.
+    """
+    # (1) 무신호 그룹은 버리고 다시 뽑아 배치를 채운다.
+    seen = []
+
+    def scripted(idx):
+        seen.append(idx)
+        # 인덱스 0,1,2 는 전멸(무신호), 3부터 신호 있음.
+        row = np.zeros(4, dtype=np.float32) if idx < 3 else np.array(
+            [1, 0, 1, 0], dtype=np.float32
+        )
+        return row, f"payload-{idx}"
+
+    used, payloads, attempted, cursor = collect_groups(scripted, 2, 10, cursor=0)
+    assert len(used) == 2, f"유효 그룹 {len(used)} != 2 — 재샘플링이 안 됐다."
+    assert payloads == ["payload-3", "payload-4"], payloads
+    assert len(attempted) == 5, f"시도 {len(attempted)} != 5 (버린 3 + 쓴 2)"
+    assert cursor == 5 and seen == [0, 1, 2, 3, 4], (
+        f"커서가 안 나아갔다: {seen} → 재시도에 같은 s₀ 를 다시 쓰게 된다."
+    )
+
+    # (2) 전부 무신호여도 상한에서 멈춘다 (무한 루프 방지).
+    calls = []
+
+    def all_degenerate(idx):
+        calls.append(idx)
+        return np.ones(4, dtype=np.float32), None      # 전승 = 무신호
+
+    used, _, attempted, cursor = collect_groups(all_degenerate, 2, 6, cursor=100)
+    assert used == [] and len(attempted) == 6 and cursor == 106, (
+        f"상한에서 멈추지 않았다: used={len(used)} attempts={len(attempted)}"
+    )
+
+    # (3) degenerate 비율은 **시도 전체** 기준이어야 한다 (버린 것 포함).
+    frac = degenerate_fraction(np.stack([np.zeros(4), np.array([1, 0, 1, 0])]))
+    assert abs(frac - 0.5) < 1e-9, frac
+
+    print("dynamic sampling 자체 검사 통과 (재샘플링 / 상한 / 커서 전진).")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--total-steps", type=int, default=None)
+    parser.add_argument("--self-check", action="store_true",
+                        help="수집 루프만 점검하고 끝낸다 (GPU 불필요)")
     args = parser.parse_args()
+
+    if args.self_check:
+        return self_check()
+    if args.config is None:
+        parser.error("--config 가 필요하다 (또는 --self-check).")
 
     cfg = load_config(args.config)
     if args.checkpoint:

@@ -65,7 +65,8 @@ python scripts/eval_rollout.py --random-policy --num-episodes 4
 python scripts/eval_rollout.py --checkpoint <ckpt> --num-episodes 32 \
     --out logs/sft_base.json
 
-# 5. RFT 본 학습
+# 5. RFT 본 학습 (수집 루프만 미리 점검하려면 --self-check, GPU 불필요)
+python rft/grpo_fallback.py --self-check
 python rft/grpo_fallback.py --config rft/configs/grpo_rigid.yaml \
     --checkpoint <ckpt>
 ```
@@ -89,6 +90,6 @@ wandb 는 아웃바운드라 포트와 무관하다.
 |---|---|
 | 워커가 응답 없이 죽음 | `--enable_cameras` 누락, GPU 메모리 부족. stderr 의 Isaac Sim 로그를 볼 것 |
 | 그리퍼가 전혀 안 움직임 | 부호를 두 번 뒤집어 상쇄됨. 변환은 워커의 `GRIPPER_INVERT_FOR_VLA` 한 곳에서만 |
-| 성공률이 계속 0 | 관측 스펙 불일치(2번을 건너뛰었는지), 또는 SFT prior 부족 |
-| 무신호그룹 비율 ~100% | temperature 를 올릴 것. 그룹이 전멸/전승으로 쏠려 advantage 가 0 |
-| loss 는 도는데 커브가 평평 | `grasp_lift_diag`(weight=0 진단항) 로그를 볼 것 — 파지까지는 되는지 구분된다 |
+| 성공률이 계속 0 | ① 워커의 성공 임계 — env 보상은 `func × weight × dt` 라 성공해도 ≈0.042 다. `reward > 1e-6` 이어야 하고, 0.5 같은 절대값으로 되돌리면 성공이 영원히 안 잡힌다 ② 관측 스펙 불일치(2번을 건너뛰었는지) ③ SFT prior 부족 |
+| `그룹 used/attempts` 가 상한에 붙음 | 그룹이 전멸/전승으로 쏠려 재샘플링이 배치를 못 채운다. temperature 를 올리거나, SFT 베이스라인이 30% 게이트를 넘는지 확인 |
+| loss 는 도는데 커브가 평평 | 워커가 보내는 `diag` 를 볼 것 — `lifted` 가 낮으면 박스에서 못 꺼내는 것, 높은데 성공률이 낮으면 배치 정밀도(그때는 `yaw_err`) |
