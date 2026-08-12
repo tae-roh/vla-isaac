@@ -238,4 +238,5 @@ class PickPlaceMimicEnv(VlaEnvMixin, ManagerBasedRLMimicEnv):
         # 첫 서브태스크(파지) 시작 시점에는 빈손이다.
         if subtask_index == 0:
             return None
+
         return "block_0"

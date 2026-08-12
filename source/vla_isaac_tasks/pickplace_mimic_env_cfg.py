@@ -62,7 +62,16 @@ def _build_subtask_configs() -> list[SubTaskConfig]:
     common = dict(
         selection_strategy="nearest_neighbor_object",
         selection_strategy_kwargs={"nn_k": 3},
-        action_noise=0.03,
+        # ★ 생성 시 액션에 주입하는 가우시안 노이즈. 데이터 다양성을 위한 것인데,
+        #   우리 데모의 액션 크기에 비해 과했다. 실측:
+        #       사람 데모 평균 액션 크기   0.0037
+        #       생성 데이터 스텝간 변화    0.0355 (17.7mm) ← 신호와 같은 크기
+        #       생성 데이터 방향 반전      38.6%  (사람 데모는 1.8%)
+        #   0.03 은 Isaac Lab Franka stack 레퍼런스 값인데, 그 태스크는 사람
+        #   데모의 액션이 우리보다 훨씬 크다. 우리 데모는 텔레옵 감도를 낮춰
+        #   곱게 만든 것이라 같은 노이즈가 신호를 덮는다 (SNR 약 1:8).
+        #   참고로 AgiBot 레퍼런스는 0.01, G1 은 0.003 을 쓴다.
+        action_noise=float(os.environ.get("VLA_ACTION_NOISE", 0.003)),
         num_interpolation_steps=5,
         num_fixed_steps=0,
         apply_noise_during_interpolation=False,
@@ -117,7 +126,15 @@ def _apply_datagen_config(cfg) -> None:
     """
     cfg.datagen_config.name = DATAGEN_NAME
     # 생성 성공을 보장할 때까지 재시도한다.
-    cfg.datagen_config.generation_guarantee = True
+    #
+    # ★ True 면 generation_num_trials 가 **성공 개수**이고 채울 때까지 무한
+    #   재시도한다 (generation.py:132-137 의 check_val 분기). 성공률이 낮을 때
+    #   이게 몇 백 회씩 돌아 GPU 를 태운다 — SkillGen 0% 일 때 296회까지 갔다.
+    #   VLA_TRIALS_ARE_ATTEMPTS=1 로 끄면 generation_num_trials 가 **시도 횟수**
+    #   상한이 되어, 성공률 탐색용 짧은 실행을 정확히 N회에서 끊을 수 있다.
+    cfg.datagen_config.generation_guarantee = os.environ.get(
+        "VLA_TRIALS_ARE_ATTEMPTS", ""
+    ) not in ("1", "true", "True")
     # 실패 궤적은 버린다. SFT 데이터에 실패가 섞이면 정책이 실패를 학습한다.
     #
     # ★ 진단할 때만 VLA_KEEP_FAILED=1 로 켠다. 그러면 실패분이
