@@ -244,6 +244,20 @@ python -c "import curobo; print('SkillGen 사용 가능')"
 
 실패하면 아래 **"MimicGen 후퇴"** 로 간다. 성공하면:
 
+> ⚠ **Isaac Lab 상류 버그 — 패치가 적용돼 있어야 한다.**
+> 이 리비전의 `annotate_demos.py` 는 `--annotate_subtask_start_signals` 분기에서
+> 누적 리스트를 텐서로 바꾸지 않고 `torch.any()` 에 넘긴다 (바로 위 종료 시그널
+> 분기는 변환한다). 그래서 SkillGen 어노테이션이 **항상**
+> `TypeError: any() received an invalid combination of arguments - got (list)`
+> 로 죽는다. 우리 코드 문제가 아니다.
+>
+> `~/workspace/IsaacLab` 에서 `git pull` / `git checkout` 을 하면 수정이 날아가므로,
+> 그때는 다시 적용할 것:
+> ```bash
+> cd $ISAACLAB_DIR && git apply ~/workspace/vla-isaac/patches/isaaclab-annotate-start-signals.patch
+> ```
+
+
 ```bash
 # 어노테이션 — SkillGen 은 시작 경계가 필수다.
 # --annotate_subtask_start_signals 를 빼면 생성이 실패한다.

@@ -1,0 +1,18 @@
+diff --git a/scripts/imitation_learning/isaaclab_mimic/annotate_demos.py b/scripts/imitation_learning/isaaclab_mimic/annotate_demos.py
+index a60f79135..5895b3b55 100644
+--- a/scripts/imitation_learning/isaaclab_mimic/annotate_demos.py
++++ b/scripts/imitation_learning/isaaclab_mimic/annotate_demos.py
+@@ -416,6 +416,13 @@ def annotate_episode_in_auto_mode(
+         if args_cli.annotate_subtask_start_signals:
+             subtask_start_signal_dict = annotated_episode.data["obs"]["datagen_info"]["subtask_start_signals"]
+             for signal_name, signal_flags in subtask_start_signal_dict.items():
++                # NOTE(vla-isaac): the term-signal branch above converts the
++                # accumulated per-step list to a tensor before torch.any(); this
++                # branch was missing the same conversion, so
++                # --annotate_subtask_start_signals always raised
++                #   TypeError: any() received an invalid combination of arguments
++                #              - got (list)
++                signal_flags = torch.tensor(signal_flags, device=env.device)
+                 if not torch.any(signal_flags):
+                     is_episode_annotated_successfully = False
+                     print(f'\tDid not detect start for the subtask "{signal_name}".')
