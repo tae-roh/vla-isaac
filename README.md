@@ -1,7 +1,7 @@
 # vla-isaac
 
 Isaac Lab 환경에서 VLA(OpenVLA-OFT)를 **SFT → RFT** 하는 프로젝트.
-태스크: **얕은 박스 안의 블록 3개 중 지시문이 지정한 하나를 꺼내, 지시문이
+태스크: **테이블 위 블록 3개 중 지시문이 지정한 하나를 집어, 지시문이
 지정한 맞춤 포켓에 안착** (Franka Panda). 난이도 손잡이는 두 개 — 블록의
 **대칭 차수**(이산)와 포켓 **클리어런스**(연속 5mm→0.5mm)다.
 핵심 결과물은 클리어런스 곡선 `SR_SFT(c)` vs `SR_SFT+RL(c)`.
@@ -144,7 +144,7 @@ source/vla_isaac_tasks/      Isaac Lab 태스크 — gym 등록 15종
   pickplace_env_cfg.py         VlaPlace-v0             텔레옵·재생·평가
   pickplace_mimic_env*.py      VlaPlace-*-Mimic-v0     Mimic 증강 (헬퍼 6종)
                                VlaPlace-c{5,2,1,0p5}mm-*  클리어런스 split
-  scene_assets.py              블록 3개 + 소스 박스 + 포켓 트레이 (전부 프리미티브)
+  scene_assets.py              블록 3개 + 타깃 트레이 (전부 프리미티브)
   init_states.py               ★ 초기 상태 뱅크 — s0 를 인덱스로 지정한다
   deformable_env_cfg.py        보류 (등록 안 됨. 후속 확장에서 박막부터 재개)
 scripts/                     데이터 파이프라인 + 평가

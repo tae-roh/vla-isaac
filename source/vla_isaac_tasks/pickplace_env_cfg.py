@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import os
+
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.devices import DevicesCfg, Se3GamepadCfg, Se3KeyboardCfg
@@ -31,7 +33,7 @@ from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.utils import configclass
 
 from . import mdp
-from .scene_assets import box_wall, make_block_cfg, tray_rail
+from .scene_assets import make_block_cfg, tray_rail
 from .spec import SPEC
 
 ##
@@ -94,11 +96,9 @@ class PickPlaceSceneCfg(InteractiveSceneCfg):
     block_1: RigidObjectCfg = make_block_cfg(1)
     block_2: RigidObjectCfg = make_block_cfg(2)
 
-    # --- 소스 박스: 벽 4장. 벽이 있어야 "밀어내기" 해가 막힌다 ---
-    box_x_pos = box_wall("box_x_pos")
-    box_x_neg = box_wall("box_x_neg")
-    box_y_pos = box_wall("box_y_pos")
-    box_y_neg = box_wall("box_y_neg")
+    # --- 소스 박스 없음 ---
+    # 블록은 테이블 위 스폰 영역에 그냥 놓인다. 밀어내기 해는 성공 술어의
+    # grasped_during_lift 항이 막는다 (벽이 없어도 성립한다).
 
     # --- 타깃 트레이: 정사각 하나, 레일 4장 ---
     tray_x_pos = tray_rail("tray_x_pos")
@@ -399,22 +399,38 @@ class PickPlaceEnvCfg(ManagerBasedRLEnvCfg):
         #
         # ★ 게임패드는 여기에 등록하지 않으면 아예 못 쓴다 (폴백 경로는
         #   keyboard/spacemouse 만 만든다).
+        # ★ 감도는 환경변수로 덮어쓸 수 있다 — 튜닝 중 코드를 반복 편집하지
+        #   않게 하려는 것이다. 액션 규약(IK_ACTION_SCALE)은 건드리지 않으므로
+        #   기록되는 액션의 의미는 그대로다. 실제 이동량은
+        #       pos_sensitivity × SPEC.IK_ACTION_SCALE(0.5) [m/스텝]
+        #   이라 0.05 → 25mm, 0.02 → 10mm, 0.01 → 5mm 다.
+        #
+        #   ⚠ 낮출수록 정밀해지지만 같은 거리를 가는 데 스텝이 늘어 데모가
+        #     길어진다. 박스~트레이 거리가 38cm 이므로 5mm/스텝이면 이동에만
+        #     76스텝이 든다. 접촉 구간의 정밀도와 전체 길이의 맞교환이다.
+        _pos_sens = float(os.environ.get("VLA_TELEOP_POS_SENS", 0.05))
+        _rot_sens = float(os.environ.get("VLA_TELEOP_ROT_SENS", 0.05))
+        _pad_pos_sens = float(os.environ.get("VLA_TELEOP_PAD_POS_SENS", 1.0))
+        _pad_rot_sens = float(os.environ.get("VLA_TELEOP_PAD_ROT_SENS", 1.6))
+
         self.teleop_devices = DevicesCfg(
             devices={
                 # 키보드: 감도를 낮게 잡는다. 크면 한 번 누를 때마다 팔이 튀어
                 # 궤적에 계단이 생긴다.
-                # ★ SkillGen 전제에서는 계단이 transit 구간에선 무의미하다
-                #   (플래너가 새로 깐다). 품질이 중요한 건 접촉 구간 두 곳뿐이다.
+                # ★ 계단은 그 자체보다 **박스 벽 관통**으로 문제가 됐다 —
+                #   25mm 격자로 200mm 박스 안을 조작하다 보니 데모가 벽을
+                #   27~115스텝 뚫었고, 그 구간이 증강에서 그대로 재생되면서
+                #   파지 실패(실패 사례의 70%)로 이어졌다.
                 "keyboard": Se3KeyboardCfg(
-                    pos_sensitivity=0.05,
-                    rot_sensitivity=0.05,
+                    pos_sensitivity=_pos_sens,
+                    rot_sensitivity=_rot_sens,
                     sim_device=self.sim.device,
                 ),
                 # 게임패드: 아날로그 스틱이라 연속 조작이 되므로 감도를 키워도
                 # 궤적이 매끄럽다. dead_zone 은 스틱 중립에서의 드리프트를 막는다.
                 "gamepad": Se3GamepadCfg(
-                    pos_sensitivity=1.0,
-                    rot_sensitivity=1.6,
+                    pos_sensitivity=_pad_pos_sens,
+                    rot_sensitivity=_pad_rot_sens,
                     dead_zone=0.01,
                     sim_device=self.sim.device,
                 ),

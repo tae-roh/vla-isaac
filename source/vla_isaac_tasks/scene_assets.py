@@ -1,8 +1,12 @@
 # =============================================================================
 # vla_isaac_tasks/scene_assets.py
 #
-# 씬 구성물 — 블록 N개 / 얕은 소스 박스 / 맞춤 포켓 트레이.
-# (개정 §2. 이전의 "형상 랜덤 자재 6종"(materials.py)을 대체한다)
+# 씬 구성물 — 블록 N개 / 타깃 트레이.
+#
+# ★ 2026-08-12: 얕은 소스 박스(벽 4장)를 제거했다. 블록은 테이블 위
+#   스폰 영역(SPEC.SPAWN_CENTER / SPAWN_AREA_SIZE)에 그냥 놓인다 —
+#   그 영역에 대응하는 프림은 없다. 이유는 vla_spec.py 의 스폰 영역 절 참조:
+#   벽이 사람 데모를 관통시켜 증강 파지 실패의 70% 를 만들고 있었다.
 #
 # ★ 왜 전부 프리미티브 직육면체인가
 #   - 콜라이더가 박스 프리미티브라 시뮬 비용이 최저다. RFT 롤아웃 비용에 직결된다.
@@ -82,7 +86,7 @@ def make_block_cfg(idx: int) -> RigidObjectCfg:
     초기 상태 뱅크에서 꺼내 덮어쓰므로 여기 값은 "스폰 시점에 서로 겹치지만
     않으면 되는" 자리다.
     """
-    bx, by = SPEC.BOX_CENTER
+    bx, by = SPEC.SPAWN_CENTER
     spread = SPEC.BLOCK_MIN_SEPARATION
     y0 = by + (idx - (SPEC.NUM_BLOCKS - 1) / 2.0) * spread
     return RigidObjectCfg(
@@ -131,31 +135,6 @@ def _static_box(prim: str, size, pos, color) -> AssetBaseCfg:
         ),
         init_state=AssetBaseCfg.InitialStateCfg(pos=pos),
     )
-
-
-# -----------------------------------------------------------------------------
-# 소스 박스 (얕은 상자) — 벽 4장
-# -----------------------------------------------------------------------------
-BOX_WALL_NAMES = ("box_x_pos", "box_x_neg", "box_y_pos", "box_y_neg")
-_BOX_COLOR = (0.45, 0.42, 0.40)
-
-
-def box_wall(name: str) -> AssetBaseCfg:
-    """박스 벽 하나. name 은 BOX_WALL_NAMES 중 하나."""
-    bx, by = SPEC.BOX_CENTER
-    ix, iy = SPEC.BOX_INNER_SIZE
-    t, h = SPEC.BOX_WALL_THICKNESS, SPEC.BOX_WALL_HEIGHT
-    z = SPEC.TABLE_HEIGHT + 0.5 * h
-
-    # x 벽이 모서리까지 덮고(길이 iy+2t), y 벽은 그 사이(길이 ix)만 채운다.
-    layout = {
-        "box_x_pos": ((t, iy + 2 * t, h), (bx + 0.5 * ix + 0.5 * t, by, z)),
-        "box_x_neg": ((t, iy + 2 * t, h), (bx - 0.5 * ix - 0.5 * t, by, z)),
-        "box_y_pos": ((ix, t, h), (bx, by + 0.5 * iy + 0.5 * t, z)),
-        "box_y_neg": ((ix, t, h), (bx, by - 0.5 * iy - 0.5 * t, z)),
-    }
-    size, pos = layout[name]
-    return _static_box(name, size, pos, _BOX_COLOR)
 
 
 # -----------------------------------------------------------------------------

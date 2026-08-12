@@ -59,15 +59,15 @@ def sample_bank(size: int, seed: int) -> np.ndarray:
       - 블록이 서로 겹치지 않는다. 최소 간격을 블록 대각선보다 크게 잡아
         yaw 와 무관하게 성립시킨다 — 회전까지 고려한 정확한 겹침 판정을
         구현할 이유가 없다.
-      - 전부 박스 안쪽, 벽에서 여유를 두고 스폰한다. 벽에 낀 채로 시작하면
-        실패 원인이 정책인지 초기 배치인지 구분되지 않는다.
+      - 전부 스폰 영역 안쪽, 경계에서 여유를 두고 배치한다. 영역 밖으로
+        삐져나가면 카메라 ROI 검사와 어긋난다.
       - 타깃 블록은 반드시 보이도록 → 겹침이 없으므로 자동으로 만족된다.
         "묻힌 타깃"은 별도 hard split 으로 만든다 (지금은 만들지 않는다).
     """
     rng = np.random.default_rng(seed)
-    bx, by = SPEC.BOX_CENTER
-    half_x = 0.5 * SPEC.BOX_INNER_SIZE[0] - SPEC.BLOCK_SPAWN_WALL_MARGIN
-    half_y = 0.5 * SPEC.BOX_INNER_SIZE[1] - SPEC.BLOCK_SPAWN_WALL_MARGIN
+    bx, by = SPEC.SPAWN_CENTER
+    half_x = 0.5 * SPEC.SPAWN_AREA_SIZE[0] - SPEC.BLOCK_SPAWN_MARGIN
+    half_y = 0.5 * SPEC.SPAWN_AREA_SIZE[1] - SPEC.BLOCK_SPAWN_MARGIN
     n = SPEC.NUM_BLOCKS
 
     # 타깃 블록은 **균등 배분**한다. 그냥 뽑으면 64개짜리 홀드아웃에서 어떤
@@ -103,8 +103,8 @@ def _sample_non_overlapping(rng, n, cx, cy, half_x, half_y) -> np.ndarray:
             return pts
     raise RuntimeError(
         f"블록 {n}개를 최소 간격 {min_sep}m 로 배치하지 못했다. "
-        "BOX_INNER_SIZE 를 키우거나 BLOCK_MIN_SEPARATION / "
-        "BLOCK_SPAWN_WALL_MARGIN 을 줄일 것 (configs/vla_spec.py)."
+        "SPAWN_AREA_SIZE 를 키우거나 BLOCK_MIN_SEPARATION / "
+        "BLOCK_SPAWN_MARGIN 을 줄일 것 (configs/vla_spec.py)."
     )
 
 
@@ -121,8 +121,8 @@ def save_bank(name: str, bank: np.ndarray, seed: int) -> Path:
         seed=np.int64(seed),
         num_blocks=np.int64(SPEC.NUM_BLOCKS),
         # 지오메트리가 바뀌면 예전 뱅크는 의미가 달라진다. 로드할 때 대조한다.
-        box_center=np.asarray(SPEC.BOX_CENTER, dtype=np.float64),
-        box_inner=np.asarray(SPEC.BOX_INNER_SIZE, dtype=np.float64),
+        spawn_center=np.asarray(SPEC.SPAWN_CENTER, dtype=np.float64),
+        spawn_area=np.asarray(SPEC.SPAWN_AREA_SIZE, dtype=np.float64),
     )
     return path
 
@@ -142,10 +142,12 @@ def load_bank(name: str) -> np.ndarray:
             f"{SPEC.NUM_BLOCKS}. 뱅크를 다시 만들 것 — 안 그러면 이전 실험과 "
             "초기 상태가 달라져 비교가 성립하지 않는다."
         )
-    if not np.allclose(data["box_inner"], SPEC.BOX_INNER_SIZE):
+    if "spawn_area" not in data or not np.allclose(
+        data["spawn_area"], SPEC.SPAWN_AREA_SIZE
+    ):
         raise ValueError(
-            f"{path.name}: 박스 안치수가 뱅크 생성 시점과 다르다 "
-            f"({data['box_inner']} → {SPEC.BOX_INNER_SIZE}). 뱅크를 다시 만들 것."
+            f"{path.name}: 스폰 영역이 뱅크 생성 시점과 다르다 "
+            f"(→ {SPEC.SPAWN_AREA_SIZE}). 뱅크를 다시 만들 것 (--force)."
         )
     states = np.asarray(data["states"], dtype=np.float64)
     # ★ 차원 검사. 트레이 단일화로 target_slot_idx 가 빠져 한 줄이 짧아졌다
@@ -190,9 +192,9 @@ def _demo() -> None:
     d[:, np.arange(n), np.arange(n)] = np.inf
     assert d.min() >= SPEC.BLOCK_MIN_SEPARATION - 1e-9, "블록이 겹쳤다."
 
-    half = 0.5 * np.asarray(SPEC.BOX_INNER_SIZE) - SPEC.BLOCK_SPAWN_WALL_MARGIN
-    off = np.abs(xy - np.asarray(SPEC.BOX_CENTER))
-    assert (off <= half + 1e-9).all(), "블록이 박스 밖에 스폰됐다."
+    half = 0.5 * np.asarray(SPEC.SPAWN_AREA_SIZE) - SPEC.BLOCK_SPAWN_MARGIN
+    off = np.abs(xy - np.asarray(SPEC.SPAWN_CENTER))
+    assert (off <= half + 1e-9).all(), "블록이 스폰 영역 밖에 배치됐다."
 
     tgt = a[:, 3 * n].astype(int)
     assert tgt.min() >= 0 and tgt.max() < n
