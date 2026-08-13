@@ -340,6 +340,10 @@ python scripts/convert_hdf5_to_rlds.py --inspect datasets/generated.hdf5
 경고를 흘리지 말 것 — 특히 "한 번도 움직이지 않은 액션 차원" 과
 "궤적이 전반적으로 길다".
 
+> 2026-08-13 실행 결과와 판단은 **[docs/DATASET.md](DATASET.md)** 에 남겼다.
+> 요약: 데이터 1,500개는 건강하지만 궤적이 예산(300스텝)의 약 2배라
+> 평가·RFT 예산을 올려야 한다. SkillGen 0% 미해결 건도 같은 문서에 있다.
+
 ```bash
 python scripts/convert_hdf5_to_rlds.py \
     --hdf5 datasets/generated.hdf5 --out datasets/rlds
