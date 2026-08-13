@@ -167,3 +167,49 @@ MimicGen 은 43% 인데 SkillGen 은 **0/296, 0/20 어떤 조건에서도 0%** �
 Isaac Lab 에 `get_subtask_start_signals()` 를 구현한 환경이 하나도 없다 —
 이 경로는 상류에서 검증된 적이 없다. RUNBOOK §1-5 의 지침("오후까지 안 되면
 후퇴하고 밤 배치를 지킬 것")대로 **MimicGen 으로 진행 중**이다.
+
+---
+
+## RLDS 변환 · 업로드 (2026-08-13)
+
+```bash
+python scripts/convert_hdf5_to_rlds.py --hdf5 datasets/generated.hdf5 --out datasets/rlds
+python scripts/upload_hub.py --path datasets/rlds --repo tae-roh/vla-pick-rlds --repo-type dataset
+```
+
+| | 값 |
+|---|---|
+| 변환 소요 | 972초 (16분), 1.43 예제/초 ≈ 860 프레임/초 |
+| 결과 | `vla_pick 2.0.0` — 1,500 에피소드 / 64 샤드 / **5.91 GB** |
+| 압축 | 21.2 GB (HDF5 uint8) → 5.91 GB (RLDS JPEG), 약 3.6배 |
+| 업로드 | 410초, 381 MB/s → `tae-roh/vla-pick-rlds` (private) |
+
+검증 (표본 20개를 실제로 디코딩):
+
+```
+이미지    (224,224,3) uint8        JPEG 디코딩 정상
+평균 길이 599 스텝                 HDF5 점검(598)과 일치
+지시문    red/blue/green 3종 모두 매핑
+norm_stats action q01/q99 가 HDF5 점검 값과 일치, 그리퍼 차원은 ±1 유지
+```
+
+원격 대조: 매니페스트 67개 중 **누락 0 / 크기 불일치 0**, tfrecord 샤드 64개 전부.
+
+받는 쪽:
+
+```bash
+huggingface-cli download tae-roh/vla-pick-rlds --repo-type dataset --local-dir datasets/rlds
+python scripts/upload_hub.py --verify datasets/rlds     # sha256 대조
+```
+
+### 함정: `tfds build` CLI 가 env_isaaclab 에서 두 번 막힌다
+
+1. `tensorflow-metadata` 1.21.0 이 `google.protobuf.runtime_version` 을 import 하는데
+   그건 protobuf>=5.27 에만 있다. 그런데 `tensorflow-cpu` 가 `protobuf<5.0` 을
+   요구하므로 protobuf 를 올릴 수 없다.
+   → `tensorflow-metadata==1.16.1` 로 낮춰 `env/constraints.txt` 에 고정했다.
+     Isaac Sim 은 이 패키지를 쓰지 않는다 (스모크 10/10 로 확인).
+2. 그래도 CLI 진입점이 `apache_beam` 을 하드 import 한다. 우리 빌더는 beam 을
+   쓰지 않으므로 설치할 이유가 없다.
+   → `build_rlds()` 가 빌더를 직접 import 해 `download_and_prepare()` 를 부른다.
+     같은 클래스를 같은 인자로 돌리므로 데이터 내용은 CLI 경로와 동일하다.

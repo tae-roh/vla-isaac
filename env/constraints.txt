@@ -34,6 +34,19 @@ typing_extensions>=4.15
 # 본 프로젝트는 rl_games 를 쓰지 않으므로 >=7 로 확정한다.
 psutil>=7
 
+# --- RLDS 변환 (tensorflow_datasets) ---
+# ★ tensorflow-metadata 를 낮춰 고정한다.
+#   1.21.0 은 google.protobuf.runtime_version 을 import 하는데, 그건
+#   protobuf>=5.27 에만 있다. 그런데 tensorflow-cpu 가 protobuf<5.0 을 요구하므로
+#   protobuf 를 올릴 수 없다 (isaaclab_tasks 도 !=5.26.0,>=4.25.8 을 건다).
+#   → tensorflow-metadata 쪽을 protobuf 4.x 호환 버전으로 내리는 것이 유일한 해다.
+#   Isaac Sim 은 이 패키지를 쓰지 않으므로 안전하다 (스모크 10/10 로 확인).
+#
+#   이걸 고정하지 않으면 새 인스턴스에서 convert_hdf5_to_rlds.py 가
+#     ImportError: cannot import name 'runtime_version' from 'google.protobuf'
+#   로 죽는다.
+tensorflow-metadata==1.16.1
+
 # --- 해소 불가로 문서화하고 넘어간 항목 (계획서 §4-3 표) ---
 #   psutil            : isaacsim-kernel ==5.9.8 ↔ rl-games <6 ↔ ipython >=7   → >=7 채택
 #   click             : isaacsim-kernel ==8.1.7 ↔ wandb >=8.2                 → >=8.2 채택
