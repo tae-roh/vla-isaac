@@ -65,7 +65,12 @@ python scripts/eval_rollout.py --random-policy --num-episodes 4
 python scripts/eval_rollout.py --checkpoint <ckpt> --num-episodes 32 \
     --out logs/sft_base.json
 
-# 5. RFT 본 학습 (수집 루프만 미리 점검하려면 --self-check, GPU 불필요)
+# 5. ★ 정책 경로 검증 — RFT 를 돌리기 전에 반드시. SFT 체크포인트가 나온 직후.
+#    우리 샘플링 경로(parallel decoding)가 모델의 predict_action 과 같은 액션을
+#    내는지 확인한다. 어긋나면 커브가 안 오르는 형태로만 드러난다.
+python rft/grpo_fallback.py --verify-checkpoint --checkpoint <ckpt>
+
+# 6. RFT 본 학습 (수집 루프·디토크나이즈만 미리 보려면 --self-check, GPU 불필요)
 python rft/grpo_fallback.py --self-check
 python rft/grpo_fallback.py --config rft/configs/grpo_rigid.yaml \
     --checkpoint <ckpt>
@@ -91,5 +96,6 @@ wandb 는 아웃바운드라 포트와 무관하다.
 | 워커가 응답 없이 죽음 | `--enable_cameras` 누락, GPU 메모리 부족. stderr 의 Isaac Sim 로그를 볼 것 |
 | 그리퍼가 전혀 안 움직임 | 부호를 두 번 뒤집어 상쇄됨. 변환은 워커의 `GRIPPER_INVERT_FOR_VLA` 한 곳에서만 |
 | 성공률이 계속 0 | ① 워커의 성공 임계 — env 보상은 `func × weight × dt` 라 성공해도 ≈0.042 다. `reward > 1e-6` 이어야 하고, 0.5 같은 절대값으로 되돌리면 성공이 영원히 안 잡힌다 ② 관측 스펙 불일치(2번을 건너뛰었는지) ③ SFT prior 부족 |
+| 롤아웃 성공률 ≠ eval_rollout 성공률 | 정책 경로가 어긋난 것. 5번(`--verify-checkpoint`)을 돌릴 것. OFT 는 parallel decoding 으로 학습되므로 `model.generate()` 같은 autoregressive 샘플링을 쓰면 안 된다 |
 | `그룹 used/attempts` 가 상한에 붙음 | 그룹이 전멸/전승으로 쏠려 재샘플링이 배치를 못 채운다. temperature 를 올리거나, SFT 베이스라인이 30% 게이트를 넘는지 확인 |
 | loss 는 도는데 커브가 평평 | 워커가 보내는 `diag` 를 볼 것 — `lifted` 가 낮으면 박스에서 못 꺼내는 것, 높은데 성공률이 낮으면 배치 정밀도(그때는 `yaw_err`) |

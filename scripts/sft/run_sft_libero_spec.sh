@@ -22,6 +22,19 @@
 #   이산 액션 토큰 + cross-entropy 여야 GRPO 의 ratio 를 계산할 수 있다.
 #   이 한 줄이 이 프로젝트에서 SFT 를 하는 이유의 절반이다.
 #
+# ★ 이 설정이 곧 "SimpleVLA-RL 이 요구하는 SFT" 다 (상류에서 확인한 근거)
+#   - 논문(arXiv:2509.09674)이 밝힌 공식 OFT 대비 유일한 모델 변경이
+#     "LLaMA2 output head + cross-entropy (공식은 MLP + L1 regression)" 이고,
+#     그건 공식 finetune.py 의 `if not (use_l1_regression or use_diffusion)`
+#     분기와 같은 것이다. parallel decoding 과 action chunking(k=8)은 유지된다.
+#   - SimpleVLA-RL 이 벤더링한 train_utils.py 는 openvla-oft 학습 헬퍼 그대로다
+#     (get_current_action_mask 등) — SFT 수식이 다르지 않다.
+#   - 그들의 constants.py LIBERO 값(7 / 8 / 8 / q99)이 configs/vla_spec.py 와 같다.
+#   - 그들의 RL 진입점은 **stock OFT 체크포인트**를 받아 자기 modeling_prismatic.py
+#     를 체크포인트에 복사하고 auto_map 을 고쳐 쓴다 (verl/utils/openvla_utils.py).
+#   → 즉 SFT 를 SimpleVLA-RL 용으로 따로 만들 필요가 없다. 이 스크립트 그대로다.
+#     되돌리지 말 것: --use_l1_regression True 로 바꾸는 순간 RFT 가 불가능해진다.
+#
 # 사용:
 #   tmux new -s sft
 #   bash scripts/sft/run_sft_libero_spec.sh
@@ -49,6 +62,7 @@ NUM_GPUS="${NUM_GPUS:-1}"
 
 log()  { echo -e "\n\033[1;32m[SFT]\033[0m $*"; }
 die()  { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; exit 1; }
+warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 
 # --- 사전 확인 ---------------------------------------------------------------
 log "사전 확인"
@@ -136,6 +150,24 @@ torchrun --standalone --nnodes 1 --nproc-per-node "${NUM_GPUS}" \
     --save_latest_checkpoint_only False \
     --merge_lora_during_training True \
     --run_id_note "libero_spec_vla_pick"
+
+# --- 산출물 검증 -------------------------------------------------------------
+# 이산 토큰 경로로 학습됐는지 확인한다. 연속 헤드로 돌았으면 action_head 체크포인트가
+# 함께 저장되는데, 그 상태로는 RFT 를 붙일 수 없다 (log π 가 없다).
+# 하룻밤을 태운 뒤 Phase 4 에서야 알게 되는 것을 막는 검사다.
+log "산출물 검증 (연속 헤드 흔적이 없어야 정상)"
+LATEST_RUN="$(ls -dt "${RUN_ROOT}"/*/ 2>/dev/null | head -1)"
+if [[ -n "${LATEST_RUN}" ]]; then
+    if compgen -G "${LATEST_RUN}**/action_head*.pt" > /dev/null; then
+        die "체크포인트에 action_head*.pt 가 있다 (${LATEST_RUN}).
+     --use_l1_regression False 가 먹지 않았다는 뜻이다. 이 체크포인트로는
+     GRPO 를 붙일 수 없으니 플래그를 확인하고 다시 학습할 것."
+    fi
+    echo "  OK: ${LATEST_RUN} 에 연속 헤드 산출물 없음"
+    # unnorm_key 로 쓸 통계가 함께 저장됐는지도 본다 (평가·RFT 양쪽이 이걸 읽는다).
+    compgen -G "${LATEST_RUN}**/dataset_statistics.json" > /dev/null \
+        || warn "dataset_statistics.json 을 못 찾았다 — eval_rollout/grpo 의 unnorm_key 조회가 실패한다."
+fi
 
 log "SFT 완료. 다음 단계:"
 cat <<NEXT
