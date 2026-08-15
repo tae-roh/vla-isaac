@@ -22,6 +22,10 @@
 checkpoint: ""                    # --checkpoint 로 넘기거나 여기에 채운다
 task: VlaPlace-v0                 # 등록된 태스크는 이것 하나뿐이다
 bank: train                       # 초기 상태 뱅크. 평가 홀드아웃(eval_base)과 달라야 한다
+# 액션 언노멀라이즈 통계 키. **체크포인트 안의** norm_stats 에서 찾는다
+# (SFT 가 dataset_statistics.json 으로 함께 저장한다). 파일에서 따로 읽지 않는다 —
+# 같은 숫자의 출처가 둘이면 갈라지고, 그때 증상은 "RFT 만 액션 스케일이 다름" 이다.
+unnorm_key: vla_pick
 isaaclab_python: ~/env_isaaclab/bin/python
 
 # --- 롤아웃 ---

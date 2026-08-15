@@ -399,6 +399,19 @@ python scripts/dump_obs_reference.py --compare datasets/obs_reference \
 라이브 뷰포트로는 검출할 수 없는 종류의 불일치다. 여기서 잡지 않으면
 "RFT 커브가 오르지 않는다" 는 형태로만 드러나고 원인 추적에 며칠이 든다.
 
+같은 이유로 **정책 경로도 여기서 대조한다.** RFT 의 샘플링은 OFT 의 parallel
+decoding(placeholder 56토큰 + stop, 1회 forward, 액션 구간 양방향 어텐션)을
+그대로 재현해야 한다 — `model.generate()` 같은 autoregressive 생성은 모델이
+학습된 적 없는 방식이라 정책 분포가 조용히 달라진다.
+
+```bash
+python rft/grpo_fallback.py --verify-checkpoint --checkpoint ckpt/sft
+# ✓ 정책 경로가 predict_action 과 일치한다   ← 이 줄이 나와야 진행
+```
+
+어긋나면 로짓 슬라이스 위치(`num_patches + num_prompt_tokens`)나 디토크나이즈
+(`model.vocab_size` / `-1` / `bin_centers`)가 상류와 다른 것이다.
+
 ### 3-3. 베이스라인 성공률
 
 ```bash

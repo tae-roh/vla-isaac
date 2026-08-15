@@ -71,6 +71,9 @@ class GRPOConfig:
     temperature: float = 1.6      # 개정 §5: SimpleVLA-RL 설정값
     # 초기 상태 뱅크 (개정 §3). 학습용 뱅크를 쓰고, 평가는 별도 홀드아웃을 쓴다.
     bank: str = "train"
+    # 액션 언노멀라이즈에 쓸 데이터셋 통계 키. 체크포인트의 norm_stats 안에 있어야
+    # 한다 (SFT 가 dataset_statistics.json 으로 함께 저장한다).
+    unnorm_key: str = "vla_pick"
 
     # 최적화
     learning_rate: float = 1e-6
@@ -143,6 +146,81 @@ def degenerate_fraction(rewards: np.ndarray) -> float:
 def is_degenerate(reward_row: np.ndarray) -> bool:
     """그룹 하나가 전멸(전부 0) 또는 전승(전부 1)인가 → advantage 가 0 이다."""
     return bool(np.std(reward_row) <= 1e-6)
+
+
+def action_logits(
+    model, processor, image, instruction, *, device, num_patches, n_action_tokens
+):
+    """관측 하나 → 액션 구간 로짓 (n_action_tokens, vocab).
+
+    ★ OpenVLA-OFT 는 **parallel decoding** 으로 학습된다. placeholder 액션 토큰
+      56개(= 청크 8 × 액션 7)와 stop 토큰을 프롬프트 뒤에 붙여 **한 번의 forward**
+      로 전체 청크를 예측하고, 액션 구간의 어텐션은 causal 이 아니라 양방향이다.
+      그래서 `model.generate()` 로 한 토큰씩 뽑으면 **학습된 적 없는 방식**으로
+      모델을 굴리게 된다 — 에러는 안 나고 정책 분포만 조용히 달라진다.
+      (증상: 롤아웃 성공률이 eval_rollout 로 잰 SFT 성공률과 다르고, GRPO 의
+       ratio 가 모델이 구현하지도 않는 분포를 비교한다)
+
+      입력 구성은 모델 자신의 헬퍼(_prepare_input_for_action_prediction)에 맡긴다.
+      손으로 흉내 내면 상류가 배치를 바꿀 때 조용히 어긋난다.
+
+    로짓 슬라이스 위치가 predict_action 과 같은지는 --verify-checkpoint 로 확인한다.
+    """
+    import torch
+
+    inputs = processor(
+        SPEC.build_prompt(instruction), SPEC.prepare_image_for_vla(image)
+    ).to(device, dtype=torch.bfloat16)
+
+    input_ids, attention_mask = inputs["input_ids"], inputs["attention_mask"]
+    # placeholder 를 붙이기 **전** 길이여야 한다 (predict_action 과 동일 규약).
+    num_prompt_tokens = input_ids.shape[-1] - 1
+    input_ids, attention_mask = model._prepare_input_for_action_prediction(
+        input_ids, attention_mask
+    )
+
+    out = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        pixel_values=inputs["pixel_values"],
+    )
+    start = num_patches + num_prompt_tokens
+    logits = out.logits[0, start : start + n_action_tokens, :]
+    if logits.shape[0] != n_action_tokens:
+        raise RuntimeError(
+            f"액션 구간 로짓이 {logits.shape[0]}개다 (기대 {n_action_tokens}). "
+            f"시퀀스 길이 {out.logits.shape[1]}, 슬라이스 시작 {start}. "
+            "num_patches 계산이나 프롬프트 길이 규약이 상류와 어긋났다."
+        )
+    return logits
+
+
+def tokens_to_action(ids, vocab_size: int, bin_centers, action_stats) -> np.ndarray:
+    """액션 토큰 → 연속 액션. openvla-oft 의 predict_action 과 같은 산술이다.
+
+    모델 없이도 검사할 수 있도록 순수 함수로 뺐다 (--self-check).
+
+    ★ 세 군데가 틀리기 쉽다. 셋 다 에러 없이 액션만 조용히 어긋난다:
+      1. vocab_size 는 `config.vocab_size`(패딩 포함)가 아니라
+         `text_config.vocab_size - pad_to_multiple_of` 다. 틀리면 pad 크기
+         (보통 64)만큼 bin 이 통째로 밀린다.
+      2. `-1` 이 필요하다. digitize 결과가 [1, n_bins] 인데 bin_centers 는
+         n_bins-1 개뿐이다.
+      3. 선형 환산이 아니라 **bin 의 중심값**이다 (반 bin 오프셋).
+    """
+    ids = np.asarray(ids)
+    centers = np.asarray(bin_centers)
+    idx = np.clip(vocab_size - ids - 1, 0, centers.shape[0] - 1)
+    n = SPEC.NUM_ACTIONS_CHUNK * SPEC.ACTION_DIM
+    normalized = centers[idx][:n].reshape(SPEC.NUM_ACTIONS_CHUNK, SPEC.ACTION_DIM)
+
+    low = np.array(action_stats["q01"], dtype=np.float32)
+    high = np.array(action_stats["q99"], dtype=np.float32)
+    mask = np.array(
+        action_stats.get("mask", np.ones_like(low, dtype=bool)), dtype=bool
+    )
+    denorm = 0.5 * (normalized + 1.0) * (high - low) + low
+    return np.where(mask, denorm, normalized).astype(np.float32)
 
 
 def collect_groups(collect_fn, groups_per_step: int, max_attempts: int, cursor: int):
@@ -220,16 +298,28 @@ class GRPOTrainer:
         # 초기 상태 뱅크 커서. 그룹을 하나 뽑을 때마다 나아간다 (재샘플링 포함).
         self._init_cursor = 0
 
-        # 액션 디토크나이저 구간. SFT 가 만든 것과 같은 파일을 읽어야 한다 —
-        # 다르면 같은 토큰이 다른 물리량을 뜻하게 되어 정책이 통째로 어긋난다.
-        stats_path = REPO_ROOT / "datasets" / "rlds" / SPEC.NORM_STATS_FILENAME
-        self.norm_stats = (
-            json.loads(stats_path.read_text(encoding="utf-8"))
-            if stats_path.exists()
-            else None
+        # --- parallel decoding 에 필요한 상수 (체크포인트에서 읽는다) ---
+        # 액션 토큰 수 = 청크 × 액션 차원. OFT 는 이만큼을 한 번에 예측한다.
+        self._n_action_tokens = SPEC.NUM_ACTIONS_CHUNK * SPEC.ACTION_DIM
+        # 로짓에서 액션 구간을 찾으려면 앞의 비전 패치 수를 알아야 한다.
+        self._num_patches = (
+            self.model.vision_backbone.get_num_patches()
+            * self.model.vision_backbone.get_num_images_in_input()
         )
-        if self.norm_stats is None:
-            print(f"[grpo] ⚠ {stats_path} 없음 — SFT 와 액션 스케일이 어긋날 수 있다.")
+        if not hasattr(self.model, "_prepare_input_for_action_prediction"):
+            raise RuntimeError(
+                "체크포인트가 OpenVLA-OFT 의 parallel decoding 인터페이스를 노출하지 "
+                "않는다 (_prepare_input_for_action_prediction 없음). "
+                "trust_remote_code 로 로드된 modeling_prismatic.py 를 확인할 것."
+            )
+        if self.cfg.unnorm_key not in self.model.norm_stats:
+            raise RuntimeError(
+                f"unnorm_key '{self.cfg.unnorm_key}' 가 체크포인트의 norm_stats 에 "
+                f"없다. 있는 키: {list(self.model.norm_stats)}. SFT 때의 "
+                "dataset_statistics.json 이 체크포인트에 함께 저장됐는지 확인할 것."
+            )
+        print(f"[grpo] parallel decoding: 액션 토큰 {self._n_action_tokens}개, "
+              f"비전 패치 {self._num_patches}개, unnorm_key '{cfg.unnorm_key}'")
 
         self.client = RolloutClient(
             isaaclab_python=cfg.isaaclab_python,
@@ -258,94 +348,87 @@ class GRPOTrainer:
 
         계획서 §Phase4b-6 대로 토큰별 log-prob 을 처음부터 기록한다 — GRPO ratio 에
         필요할 뿐 아니라 KL 예산을 따질 때도 이 로그가 있어야 한다.
+
+        ★ 액션 청크 하나가 **1회 forward** 로 나온다 (parallel decoding).
+          예전 구현은 generate() 로 56스텝을 돌았다 — 학습 방식과 다를 뿐 아니라
+          56배 느렸다.
         """
         import torch
 
-        n_tokens = SPEC.NUM_ACTIONS_CHUNK * SPEC.ACTION_DIM
         actions, tokens, logps = [], [], []
 
         for i in range(images.shape[0]):
-            # center crop 포함. _recompute_logp 와 반드시 같은 전처리여야 한다 —
-            # 다르면 ratio 가 전처리 차이까지 반영해 버려 학습이 망가진다.
-            inputs = self.processor(
-                SPEC.build_prompt(instructions[i]),
-                SPEC.prepare_image_for_vla(images[i]),
-            ).to(self.cfg.device, dtype=torch.bfloat16)
             with torch.no_grad():
-                out = self.model.generate(
-                    **inputs,
-                    do_sample=True,
-                    temperature=self.cfg.temperature,
-                    max_new_tokens=n_tokens,
-                    output_scores=True,
-                    return_dict_in_generate=True,
-                )
-            seq = out.sequences[0, -n_tokens:]
-            token_logps = [
-                torch.log_softmax(score[0].float(), dim=-1)[seq[t]]
-                for t, score in enumerate(out.scores)
-            ]
-            logps.append(torch.stack(token_logps).sum())
+                logits = self._action_logits(images[i], instructions[i])
+
+            # 위치별 categorical 샘플링. 56개 위치가 서로 독립이다 —
+            # parallel decoding 이라 앞 토큰이 뒤 토큰의 조건이 아니다.
+            logp_all = torch.log_softmax(logits.float() / self.cfg.temperature, dim=-1)
+            seq = torch.multinomial(logp_all.exp(), num_samples=1).squeeze(-1)
+
+            logps.append(logp_all.gather(-1, seq.unsqueeze(-1)).squeeze(-1).sum())
             tokens.append(seq)
             actions.append(self._tokens_to_action(seq))
 
         return np.stack(actions), torch.stack(tokens), torch.stack(logps)
 
+    def _action_logits(self, image: np.ndarray, instruction: str):
+        """관측 하나 → 액션 구간 로짓. 샘플링과 logp 재계산이 이걸 공유한다."""
+        return action_logits(
+            self.model,
+            self.processor,
+            image,
+            instruction,
+            device=self.cfg.device,
+            num_patches=self._num_patches,
+            n_action_tokens=self._n_action_tokens,
+        )
+
     def _recompute_logp(self, images: np.ndarray, tokens, instructions):
         """저장해 둔 (이미지, 토큰) 으로 현재 정책의 log-prob 을 **그래디언트와 함께** 계산.
 
-        teacher forcing 이다 — 샘플링을 다시 하는 게 아니라, 이미 샘플된 토큰열의
-        확률을 현재 파라미터로 다시 평가한다. 이게 PPO/GRPO ratio 의 분자다.
+        샘플링을 다시 하는 게 아니라 이미 샘플된 토큰의 확률을 현재 파라미터로
+        다시 평가한다. 이게 PPO/GRPO ratio 의 분자다.
+
+        parallel decoding 이라 위치가 고정이므로 causal 처럼 한 칸 밀어 정렬할
+        필요가 없다 — 액션 구간 로짓에서 그대로 gather 한다.
+
+        ★ temperature 는 샘플링과 여기에 **둘 다** 적용한다. 정책 π 의 정의가
+          "temperature 로 스케일된 분포" 이기 때문이다. 한쪽만 적용하면 첫 스텝의
+          ratio 가 1 이 아니게 되어, 업데이트 전부터 클리핑이 걸린다.
+          (veRL 도 학습 시 로짓을 같은 온도로 나눈다)
         """
         import torch
 
         logps = []
         for i in range(images.shape[0]):
-            inputs = self.processor(
-                SPEC.build_prompt(instructions[i]),
-                SPEC.prepare_image_for_vla(images[i]),
-            ).to(self.cfg.device, dtype=torch.bfloat16)
-            action_tokens = tokens[i].unsqueeze(0)
-            full = torch.cat([inputs["input_ids"], action_tokens], dim=1)
-            attn = torch.ones_like(full)
-
-            out = self.model(
-                input_ids=full,
-                attention_mask=attn,
-                pixel_values=inputs["pixel_values"],
-            )
-            # 위치 t 의 로짓이 위치 t+1 의 토큰을 예측한다 → 한 칸 밀어서 정렬.
-            n = action_tokens.shape[1]
-            logits = out.logits[:, -n - 1 : -1, :].float()
-            logp = torch.log_softmax(logits, dim=-1)
-            picked = logp.gather(-1, action_tokens.unsqueeze(-1)).squeeze(-1)
+            logits = self._action_logits(images[i], instructions[i])
+            logp_all = torch.log_softmax(logits.float() / self.cfg.temperature, dim=-1)
+            picked = logp_all.gather(-1, tokens[i].unsqueeze(-1)).squeeze(-1)
             logps.append(picked.sum())
 
         return torch.stack(logps)
 
     def _tokens_to_action(self, token_ids) -> np.ndarray:
-        """액션 토큰 → 연속 액션. OpenVLA 의 이산 토큰 규약을 따른다.
+        """액션 토큰 → 연속 액션.
 
-        vocab 끝쪽 256개 토큰을 [q01, q99] 구간의 bin 으로 되돌린다.
-        여기서 쓰는 구간은 SFT 때 쓴 것과 **반드시 같아야 한다** —
-        그래서 datasets/norm_stats.json 을 단일 출처로 쓴다.
+        ★ 모델이 이미 들고 있는 값만 쓴다 (openvla-oft 의 predict_action 과 동일).
+          손으로 다시 계산하면 아래 세 가지가 조용히 어긋난다:
+            - `config.vocab_size` 는 **패딩된** 값이다. 규약이 요구하는 것은
+              `text_config.vocab_size - pad_to_multiple_of` (= model.vocab_size).
+              둘이 다르면 pad_to_multiple_of(보통 64)만큼 bin 이 통째로 밀린다.
+            - `-1` 이 필요하다. np.digitize 가 [1, n_bins] 를 돌려주는데
+              bin_centers 는 n_bins-1 개뿐이다.
+            - 선형 환산이 아니라 **bin 의 중심값**이다 (반 bin 오프셋).
         """
-        import torch
-
-        ids = token_ids.detach().cpu().numpy()
-        bins = self.model.config.vocab_size - ids
-        bins = np.clip(bins, 0, 255)
-        normalized = bins / 255.0 * 2.0 - 1.0
-        action = normalized[: SPEC.NUM_ACTIONS_CHUNK * SPEC.ACTION_DIM].reshape(
-            SPEC.NUM_ACTIONS_CHUNK, SPEC.ACTION_DIM
+        # 언노멀라이즈도 모델의 norm_stats 를 쓴다. 같은 숫자의 출처가 둘이면
+        # 언젠가 갈라지고, 그때 증상은 "RFT 만 성능이 다르다" 로 나타난다.
+        return tokens_to_action(
+            token_ids.detach().cpu().numpy(),
+            vocab_size=self.model.vocab_size,
+            bin_centers=np.asarray(self.model.bin_centers),
+            action_stats=self.model.norm_stats[self.cfg.unnorm_key]["action"],
         )
-        if self.norm_stats is not None:
-            low = np.array(self.norm_stats["action"]["q01"], dtype=np.float32)
-            high = np.array(self.norm_stats["action"]["q99"], dtype=np.float32)
-            mask = np.array(self.norm_stats["action"]["mask"], dtype=bool)
-            denorm = 0.5 * (action + 1.0) * (high - low) + low
-            action = np.where(mask, denorm, action)
-        return action.astype(np.float32)
 
     # -------------------------------------------------------------------------
     def collect_group(self, init_index: int):
@@ -563,7 +646,114 @@ def self_check() -> int:
     frac = degenerate_fraction(np.stack([np.zeros(4), np.array([1, 0, 1, 0])]))
     assert abs(frac - 0.5) < 1e-9, frac
 
-    print("dynamic sampling 자체 검사 통과 (재샘플링 / 상한 / 커서 전진).")
+    # (4) 토큰 → 액션 왕복. OpenVLA 규약을 그대로 재현하는지 본다.
+    n_bins = 256
+    bins = np.linspace(-1, 1, n_bins)
+    centers = (bins[:-1] + bins[1:]) / 2.0          # 255개
+    vocab_size = 32000                              # text_config - pad_to_multiple_of
+    n = SPEC.NUM_ACTIONS_CHUNK * SPEC.ACTION_DIM
+    identity = {"q01": [-1.0] * SPEC.ACTION_DIM, "q99": [1.0] * SPEC.ACTION_DIM,
+                "mask": [True] * SPEC.ACTION_DIM}
+
+    # bin i 를 가리키는 토큰 id 는 vocab_size - (i + 1) 이다 (디코드의 역).
+    for i in (0, 1, 127, centers.shape[0] - 1):
+        ids = np.full(n, vocab_size - (i + 1))
+        act = tokens_to_action(ids, vocab_size, centers, identity)
+        assert act.shape == (SPEC.NUM_ACTIONS_CHUNK, SPEC.ACTION_DIM), act.shape
+        assert np.allclose(act, centers[i], atol=1e-6), (
+            f"bin {i} 왕복 실패: {act[0, 0]} != {centers[i]}"
+        )
+
+    # 선형 환산과 혼동하지 않았는지 — 반 bin 만큼 달라야 한다.
+    linear = 0 / (n_bins - 1) * 2.0 - 1.0
+    assert abs(centers[0] - linear) > 1e-4, (
+        "bin 중심이 선형 환산과 같다 — centers 계산이 틀렸다."
+    )
+
+    # 범위 밖 토큰이 들어와도 죽지 않고 끝 bin 으로 잘려야 한다.
+    edge = tokens_to_action(np.full(n, vocab_size + 10), vocab_size, centers, identity)
+    assert np.allclose(edge, centers[0]), edge[0, 0]
+
+    # 언노멀라이즈: [-1,1] → [q01,q99] 선형 사상.
+    stats = {"q01": [0.0] * SPEC.ACTION_DIM, "q99": [2.0] * SPEC.ACTION_DIM,
+             "mask": [True] * SPEC.ACTION_DIM}
+    mid = tokens_to_action(np.full(n, vocab_size - 128), vocab_size, centers, stats)
+    assert np.allclose(mid, 0.5 * (centers[127] + 1.0) * 2.0, atol=1e-6), mid[0, 0]
+
+    print("자체 검사 통과 (재샘플링 / 상한 / 커서 전진 / 토큰→액션 왕복).")
+    return 0
+
+
+def verify_checkpoint(checkpoint: str, device: str, unnorm_key: str) -> int:
+    """우리 정책 경로가 모델의 predict_action 과 같은 액션을 내는지 확인한다.
+
+    ★ 이 검사가 이 파일에서 가장 중요하다.
+      `_action_logits` 는 로짓에서 액션 구간을 **위치로** 잘라낸다
+      (num_patches + num_prompt_tokens). 그 규약이 상류의 predict_action 과
+      어긋나면 아무 에러 없이 엉뚱한 위치의 로짓을 정책으로 쓰게 된다.
+      greedy 로 맞춰 두 경로를 직접 비교하는 것이 유일하게 확실한 확인이다.
+
+    체크포인트가 필요하므로 GPU 인스턴스에서 돈다.
+    """
+    import torch
+    from transformers import AutoModelForVision2Seq, AutoProcessor
+
+    print(f"[verify] 체크포인트 로드: {checkpoint}")
+    processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)
+    model = AutoModelForVision2Seq.from_pretrained(
+        checkpoint, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    ).to(device)
+    model.eval()
+
+    n_tokens = SPEC.NUM_ACTIONS_CHUNK * SPEC.ACTION_DIM
+    num_patches = (
+        model.vision_backbone.get_num_patches()
+        * model.vision_backbone.get_num_images_in_input()
+    )
+    print(f"[verify] 액션 토큰 {n_tokens}, 비전 패치 {num_patches}, "
+          f"vocab_size {model.vocab_size} (config {model.config.text_config.vocab_size} "
+          f"- pad {model.config.pad_to_multiple_of}), bin_centers "
+          f"{np.asarray(model.bin_centers).shape}")
+
+    rng = np.random.default_rng(0)
+    image = rng.integers(0, 255, (SPEC.IMAGE_HEIGHT, SPEC.IMAGE_WIDTH, 3), dtype=np.uint8)
+    instruction = SPEC.TASK_INSTRUCTION
+
+    with torch.no_grad():
+        # 우리 경로: 같은 로짓에서 greedy (샘플링만 빼면 롤아웃과 동일한 경로다)
+        logits = action_logits(
+            model, processor, image, instruction,
+            device=device, num_patches=num_patches, n_action_tokens=n_tokens,
+        )
+        ours = tokens_to_action(
+            logits.argmax(dim=-1).cpu().numpy(),
+            vocab_size=model.vocab_size,
+            bin_centers=np.asarray(model.bin_centers),
+            action_stats=model.norm_stats[unnorm_key]["action"],
+        )
+        # 기준 경로: 모델 자신의 API
+        inputs = processor(
+            SPEC.build_prompt(instruction), SPEC.prepare_image_for_vla(image)
+        ).to(device, dtype=torch.bfloat16)
+        ref = np.asarray(
+            model.predict_action(**inputs, unnorm_key=unnorm_key), dtype=np.float32
+        ).reshape(-1, SPEC.ACTION_DIM)[: SPEC.NUM_ACTIONS_CHUNK]
+
+    diff = float(np.abs(ours - ref).max())
+    print(f"[verify] 최대 절대차 {diff:.3e}")
+    print(f"  ours[0] = {np.round(ours[0], 4)}")
+    print(f"  ref [0] = {np.round(ref[0], 4)}")
+    if diff > 1e-3:
+        print(
+            "\n[verify] ✗ 두 경로가 다르다. 로짓 슬라이스 위치나 디토크나이즈가 "
+            "상류와 어긋났다.\n"
+            "  - 슬라이스: action_logits() 의 num_patches + num_prompt_tokens\n"
+            "  - 디토크나이즈: tokens_to_action() 의 vocab_size / -1 / bin_centers\n"
+            "  체크포인트의 modeling_prismatic.py 안 predict_action 과 대조할 것."
+        )
+        return 1
+    print("\n[verify] ✓ 정책 경로가 predict_action 과 일치한다.")
     return 0
 
 
@@ -573,11 +763,23 @@ def main() -> int:
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--self-check", action="store_true",
-                        help="수집 루프만 점검하고 끝낸다 (GPU 불필요)")
+                        help="수집 루프·디토크나이즈만 점검하고 끝낸다 (GPU 불필요)")
+    parser.add_argument("--verify-checkpoint", action="store_true",
+                        help="정책 경로가 predict_action 과 일치하는지 확인하고 끝낸다 "
+                             "(--checkpoint 필요, GPU 필요)")
+    # 아래 둘은 --verify-checkpoint 전용이다. 학습은 config 의 값을 쓴다.
+    parser.add_argument("--unnorm-key", default="vla_pick",
+                        help="(--verify-checkpoint 전용)")
+    parser.add_argument("--device", default="cuda:0",
+                        help="(--verify-checkpoint 전용)")
     args = parser.parse_args()
 
     if args.self_check:
         return self_check()
+    if args.verify_checkpoint:
+        if not args.checkpoint:
+            parser.error("--verify-checkpoint 에는 --checkpoint 가 필요하다.")
+        return verify_checkpoint(args.checkpoint, args.device, args.unnorm_key)
     if args.config is None:
         parser.error("--config 가 필요하다 (또는 --self-check).")
 
