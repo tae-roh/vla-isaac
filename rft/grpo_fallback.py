@@ -560,7 +560,7 @@ class GRPOTrainer:
                 "success_rate": success_rate,
                 "loss": mean_loss,
                 "degenerate_group_frac": degen,
-                # 진단: 성공률이 낮을 때 "박스에서 못 꺼내는 것"인지
+                # 진단: 성공률이 낮을 때 "블록을 집어 들지 못하는 것"인지
                 # "포켓에 못 넣는 것"인지 가른다 (보상에는 섞지 않는다).
                 "lifted_frac": float(
                     np.mean([d.get("lifted", np.nan) for d in group_diags])

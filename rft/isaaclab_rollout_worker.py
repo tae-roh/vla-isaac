@@ -88,7 +88,7 @@ def main() -> int:
         # 두지 않으면 다음 관측이 이미 새 에피소드 것이라 놓친다.
         success_latch = torch.zeros(num_envs, dtype=torch.bool, device=device)
         done_latch = torch.zeros(num_envs, dtype=torch.bool, device=device)
-        # 진단 래치: "박스에서 꺼내는 것까지는 됐는가".
+        # 진단 래치: "블록을 집어 들어올리는 것까지는 됐는가".
         # 커브가 평평할 때 파지 실패인지 배치 정밀도 문제인지 가르는 값이다.
         lift_latch = torch.zeros(num_envs, dtype=torch.bool, device=device)
 

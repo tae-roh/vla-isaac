@@ -355,16 +355,25 @@ BLOCK_SIZE = (0.060, 0.030, 0.030)   # [m]
 BLOCK_SYMMETRY_ORDER = 2
 BLOCK_MASS = 0.05                    # [kg]
 
-# --- 소스 박스 (얕은 상자) -----------------------------------------------------
-# 벽이 있어야 "밀어내기" 해가 막힌다. 벽 모서리로 끌어 넘기는 해는 성공 술어의
-# grasped_during_lift 항이 막는다.
-# ★ y=-0.16 은 카메라 화각에 맞춘 값이다. -0.20 으로 두면 박스의 먼 귀퉁이
-#   (0.56, -0.31) 이 center crop 이후 프레임 밖(u=10.5 < 12)으로 나간다.
+# --- 블록 스폰 영역 (테이블 위 평면. 물리 구조물 없음) ---------------------------
+# ★ 2026-08-12 개편: 얕은 소스 박스(벽 4장)를 없앴다.
+#
+#   벽은 원래 "밀어내기" 해를 막으려고 둔 것인데, 실제로는 데이터 생성을
+#   무너뜨리는 쪽으로 작용했다. 키보드 텔레옵의 이동 격자(25mm)로 200mm 박스
+#   안을 조작하다 보니 사람 데모가 벽을 27~115스텝 관통했고, 증강은 그 접촉
+#   구간을 새 블록 위치에서 그대로 재생하므로 그리퍼가 벽에 막혀 헛집었다.
+#   실패 60개를 분류한 결과 42개(70%)가 "블록이 15mm 이상 뜬 적 없음" —
+#   파지 자체가 안 된 것이다.
+#
+#   벽이 사라져도 밀어내기는 성공 술어의 grasped_during_lift 항이 막는다.
+#   즉 벽은 필요조건이 아니었고, 대가만 컸다.
+#
+#   영역·중심은 그대로 둔다 — 카메라 화각과 뱅크 좌표를 흔들지 않기 위해서다.
+# ★ y=-0.16 은 카메라 화각에 맞춘 값이다. -0.20 으로 두면 영역의 먼 귀퉁이가
+#   center crop 이후 프레임 밖으로 나간다.
 #   assert_workspace_visible() 이 잡아 준다 — 값을 바꾸면 반드시 다시 돌릴 것.
-BOX_CENTER = (0.45, -0.16)           # 로봇 베이스 기준 xy [m]
-BOX_INNER_SIZE = (0.20, 0.20)        # 안쪽 가로·세로 [m]
-BOX_WALL_THICKNESS = 0.010
-BOX_WALL_HEIGHT = 0.045              # 블록(0.030)보다 높아야 "꺼낸다"가 성립한다
+SPAWN_CENTER = (0.45, -0.16)         # 로봇 베이스 기준 xy [m]
+SPAWN_AREA_SIZE = (0.20, 0.20)       # 블록이 놓일 수 있는 사각 영역 [m]
 
 # --- 타깃 트레이 (하나, 정사각) -------------------------------------------------
 # 트레이는 파내지 않고 **레일 4장으로 둘러싼다** — 바닥은 테이블 상면 그대로다.
@@ -457,10 +466,14 @@ GRIPPER_OPEN_QPOS_SUM = 0.06
 GRASP_DISTANCE_THRESHOLD = 0.06
 # 들어올림 판정: 테이블면으로부터의 높이 [m].
 #   서브태스크 1 의 종료 신호이자 grasped_during_lift 래치의 조건이다.
-#   ★ 박스 벽보다 확실히 위여야 한다 (개정 §4-2): 경계를 파지 직후가 아니라
-#     "블록을 들어 박스 벽 위로 뺀 뒤"에 두어야 플래너가 이어붙일 구간에
-#     충돌 위험이 없다.
-LIFT_HEIGHT_THRESHOLD = BOX_WALL_HEIGHT + 0.030
+#   ★ 박스가 사라지면서 기준이 "벽 위"에서 "확실히 공중"으로 바뀌었다.
+#     블록 높이가 30mm 이므로 60mm 면 바닥에서 블록 하나만큼 떠 있다 —
+#     "집어 들었다" 와 "끌고 있다" 가 명확히 갈린다.
+#     남은 장애물은 트레이 레일(20mm)과 다른 블록(30mm)뿐이라 이 높이면
+#     서브태스크 경계로도 충분히 여유가 있다.
+#     예전 값은 75mm(=벽45+30)였는데, 이제 그만큼 들 이유가 없어 데모가
+#     짧아지는 쪽으로 내렸다.
+LIFT_HEIGHT_THRESHOLD = 0.060
 
 # -----------------------------------------------------------------------------
 # 서브태스크 "시작" 경계 (SkillGen 전용)
@@ -526,8 +539,10 @@ TRAIN_BANK_SIZE = 4096                       # 학습/생성용 뱅크 크기
 # 블록 대각선이 sqrt(0.060² + 0.030²) ≈ 0.067 이므로 그보다 큰 간격을 요구하면
 # yaw 와 무관하게 겹치지 않는다 — 겹침 판정을 회전까지 정확히 할 필요가 없다.
 BLOCK_MIN_SEPARATION = 0.070
-# 박스 안쪽 벽에서 이만큼 떨어뜨려 스폰한다 (블록 대각선 절반 + 여유).
-BLOCK_SPAWN_WALL_MARGIN = 0.038
+# 스폰 영역 경계에서 이만큼 안쪽에만 블록 중심을 둔다 (블록 대각선 절반 + 여유).
+# 벽이 없어졌으므로 "부딪힌다" 는 의미는 사라졌지만, 블록이 영역 밖으로 삐져
+# 나가면 카메라 ROI 검사와 어긋나므로 여백은 유지한다.
+BLOCK_SPAWN_MARGIN = 0.038
 
 
 # -----------------------------------------------------------------------------
@@ -593,15 +608,20 @@ def assert_consistent() -> None:
         f"성공 유지 {SUCCESS_HOLD_STEPS}스텝이 에피소드 {MAX_EPISODE_STEPS}스텝의 "
         "절반 이상이다 — 태스크를 끝낼 시간이 남지 않는다."
     )
-    # 리프트 경계가 박스 벽 위여야 스티칭 구간에 충돌 위험이 없다.
-    assert LIFT_HEIGHT_THRESHOLD > BOX_WALL_HEIGHT, (
-        "리프트 임계가 박스 벽보다 낮으면 서브태스크 경계가 박스 안에 생긴다."
+    # 리프트 경계가 "확실히 공중" 이어야 파지와 끌기가 갈린다.
+    assert LIFT_HEIGHT_THRESHOLD > BLOCK_SIZE[2], (
+        f"리프트 임계 {LIFT_HEIGHT_THRESHOLD} 가 블록 높이 {BLOCK_SIZE[2]} 이하면 "
+        "테이블에 놓인 상태와 구분되지 않는다."
+    )
+    # 트레이 레일보다도 위여야 운반 구간에 레일이 걸리지 않는다.
+    assert LIFT_HEIGHT_THRESHOLD > TRAY_DEPTH, (
+        "리프트 임계가 트레이 레일 높이 이하다 — 운반 경로가 레일과 겹친다."
     )
     # 블록이 박스 안에 겹치지 않고 들어가는가 (뱅크 샘플링이 무한 루프에 빠지는 것 방지).
-    _span = min(BOX_INNER_SIZE) - 2 * BLOCK_SPAWN_WALL_MARGIN
+    _span = min(SPAWN_AREA_SIZE) - 2 * BLOCK_SPAWN_MARGIN
     assert _span > BLOCK_MIN_SEPARATION, (
         f"스폰 가능 영역 {_span:.3f}m 가 블록 최소 간격 {BLOCK_MIN_SEPARATION}m "
-        "이하다. 박스를 키우거나 여백을 줄일 것."
+        "이하다. SPAWN_AREA_SIZE 를 키우거나 BLOCK_SPAWN_MARGIN 을 줄일 것."
     )
     assert INIT_STATE_DIM == 3 * NUM_BLOCKS + 1
 
@@ -629,13 +649,13 @@ def assert_consistent() -> None:
     )
     assert CONTROL_FRAME in ("robot_base", "world", "eef")
 
-    # 박스와 트레이가 겹치면 리셋 직후 블록이 트레이 안에 있는 에피소드가 생긴다
-    # (아무것도 안 해도 성공 → RFT 보상 오염).
-    _box_y_hi = BOX_CENTER[1] + 0.5 * BOX_INNER_SIZE[1] + BOX_WALL_THICKNESS
+    # 스폰 영역과 트레이가 겹치면 리셋 직후 블록이 트레이 안에 있는 에피소드가
+    # 생긴다 (아무것도 안 해도 성공 → RFT 보상 오염).
+    _box_y_hi = SPAWN_CENTER[1] + 0.5 * SPAWN_AREA_SIZE[1]
     _tray_y_lo = TRAY_CENTER[1] - (0.5 * TRAY_INNER_SIZE + TRAY_RAIL_THICKNESS)
     assert _box_y_hi < _tray_y_lo, (
-        f"소스 박스(y≤{_box_y_hi:.3f})와 타깃 트레이(y≥{_tray_y_lo:.3f})가 겹친다. "
-        "BOX_CENTER / TRAY_CENTER 를 떨어뜨릴 것."
+        f"스폰 영역(y≤{_box_y_hi:.3f})과 타깃 트레이(y≥{_tray_y_lo:.3f})가 겹친다. "
+        "SPAWN_CENTER / TRAY_CENTER 를 떨어뜨릴 것."
     )
 
     # 카메라가 작업공간 전체를 담고 있는지 — 에러 없이 성능만 깎는 불일치를 막는다.
@@ -696,21 +716,22 @@ def center_crop_bounds() -> tuple[float, float]:
 def workspace_roi_points() -> list:
     """정책이 반드시 봐야 하는 점들.
 
-    대상: **소스 박스(벽 윗면까지) + 타깃 트레이 + 리프트 높이**.
+    대상: **블록 스폰 영역 + 타깃 트레이 + 리프트 높이**.
     카메라 값은 Day 1 에 확정한 것을 그대로 쓰고, ROI 만 지오메트리에 맞춘다.
 
     트레이가 프레임을 벗어나면 정책은 "어디에 놓아야 하는지" 를 볼 수 없고,
     그건 에러 없이 성능만 깎는다 — 이 검사가 존재하는 이유 그대로다.
     """
-    bx, by = BOX_CENTER
-    hx = 0.5 * BOX_INNER_SIZE[0] + BOX_WALL_THICKNESS
-    hy = 0.5 * BOX_INNER_SIZE[1] + BOX_WALL_THICKNESS
+    bx, by = SPAWN_CENTER
+    hx = 0.5 * SPAWN_AREA_SIZE[0]
+    hy = 0.5 * SPAWN_AREA_SIZE[1]
     pts = []
 
-    # 박스 네 귀퉁이 — 바닥면과 벽 윗면 둘 다 (벽 위로 빼는 동작이 보여야 한다)
+    # 스폰 영역 네 귀퉁이 — 테이블면과 블록 윗면
+    # (벽이 없어졌으므로 "벽 윗면" 대신 블록 높이를 본다)
     for sx in (-1, 1):
         for sy in (-1, 1):
-            for z in (TABLE_HEIGHT, TABLE_HEIGHT + BOX_WALL_HEIGHT):
+            for z in (TABLE_HEIGHT, TABLE_HEIGHT + BLOCK_SIZE[2]):
                 pts.append((bx + sx * hx, by + sy * hy, z))
 
     # 트레이 네 귀퉁이 (레일 포함)
@@ -758,7 +779,7 @@ def assert_workspace_visible(margin_px: float = 6.0) -> None:
             f"작업공간이 카메라 화각을 벗어난다 (crop 후 허용 {lo:.1f}~{hi:.1f}px, "
             f"{len(bad)}개 지점 실패):\n{lines}\n"
             "  CAMERA_POS / CAMERA_ROT / CAMERA_FOCAL_LENGTH 와 "
-            "BOX_CENTER / TRAY_CENTER / TRAY_INNER_SIZE 중 하나가 어긋났다.\n"
+            "SPAWN_CENTER / TRAY_CENTER / TRAY_INNER_SIZE 중 하나가 어긋났다.\n"
             "  이건 에러 없이 조용히 성능만 깎는 종류의 불일치다 — 반드시 맞출 것."
         )
 
@@ -780,8 +801,9 @@ def summary() -> str:
         f"  instruction: {TASK_INSTRUCTION!r} (env 별로 달라진다)\n"
         f"  블록      : {NUM_BLOCKS}개 {BLOCK_SIZE}, 대칭차수 "
         f"{BLOCK_SYMMETRY_ORDER}, 속성 {BLOCK_ATTRS}\n"
-        f"  박스      : 중심 {BOX_CENTER}, 안치수 {BOX_INNER_SIZE}, "
-        f"벽높이 {BOX_WALL_HEIGHT * 100:.1f}cm\n"
+        f"  스폰 영역 : 중심 {SPAWN_CENTER}, 크기 {SPAWN_AREA_SIZE} "
+        f"(구조물 없음, 테이블 위 평면)\n"
+        f"  리프트    : {LIFT_HEIGHT_THRESHOLD * 1000:.0f}mm 이상\n"
         f"  트레이    : 중심 {TRAY_CENTER}, 정사각 한 변 "
         f"{TRAY_INNER_SIZE * 1000:.0f}mm (블록 긴축 대비 "
         f"{TRAY_INNER_SIZE / BLOCK_SIZE[0]:.2f}배), 레일높이 "

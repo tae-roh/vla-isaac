@@ -197,10 +197,17 @@ class PickPlaceMimicEnv(VlaEnvMixin, ManagerBasedRLMimicEnv):
         if env_ids is None:
             env_ids = slice(None)
 
+        from .pickplace_mimic_env_cfg import LAST_SUBTASK_NAME
+
         subtask_terms = self.obs_buf["subtask_terms"]
         return {
-            "grasp_start": subtask_terms["grasp_start"][env_ids],
-            "place_start": subtask_terms["place_start"][env_ids],
+            # ★ 키는 각 서브태스크의 subtask_term_signal 이름이어야 한다.
+            #   SkillGen 이 subtask_start_signals[<term signal 이름>] 로 조회하기
+            #   때문이다 (datagen_info_pool.py:143). "grasp_start"/"place_start"
+            #   처럼 자체 이름을 쓰면 생성이 KeyError 로 죽는다 — 어노테이션은
+            #   --auto 에서 검증이 없어 조용히 통과하므로 여기서 맞춰야 한다.
+            "grasp_lift": subtask_terms["grasp_start"][env_ids],
+            LAST_SUBTASK_NAME: subtask_terms["place_start"][env_ids],
         }
 
     # -------------------------------------------------------------------------
@@ -231,4 +238,5 @@ class PickPlaceMimicEnv(VlaEnvMixin, ManagerBasedRLMimicEnv):
         # 첫 서브태스크(파지) 시작 시점에는 빈손이다.
         if subtask_index == 0:
             return None
+
         return "block_0"

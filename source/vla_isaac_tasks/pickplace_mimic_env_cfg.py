@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import os
+
 from isaaclab.envs.mimic_env_cfg import MimicEnvCfg, SubTaskConfig
 from isaaclab.utils import configclass
 
@@ -22,6 +24,11 @@ from .spec import SPEC
 
 # 생성 데이터셋 이름. 클리어런스 split 이 없어져 하나로 고정됐다.
 DATAGEN_NAME = "vla_place"
+
+# 마지막 서브태스크의 식별 이름. SkillGen 이 시작 시그널 dict 의 키로 쓴다.
+# pickplace_mimic_env.get_subtask_start_signals() 가 같은 이름을 써야 한다 —
+# 어긋나면 생성이 KeyError 로 죽는다. 그래서 여기서 한 번만 정의하고 공유한다.
+LAST_SUBTASK_NAME = "place_done"
 
 
 def _build_subtask_configs() -> list[SubTaskConfig]:
@@ -49,12 +56,22 @@ def _build_subtask_configs() -> list[SubTaskConfig]:
           get_subtask_start_signals()  → 시작 경계 (SkillGen 전용)
       annotate_demos.py 가 --annotate_subtask_start_signals 와 함께 후자를 호출한다.
 
-    마지막 서브태스크는 규약상 subtask_term_signal=None 이다.
+    마지막 서브태스크의 subtask_term_signal 은 MimicGen 에서는 None 이지만
+    SkillGen 에서는 이름이 있어야 한다 (아래 서브태스크 2 주석 참조).
     """
     common = dict(
         selection_strategy="nearest_neighbor_object",
         selection_strategy_kwargs={"nn_k": 3},
-        action_noise=0.03,
+        # ★ 생성 시 액션에 주입하는 가우시안 노이즈. 데이터 다양성을 위한 것인데,
+        #   우리 데모의 액션 크기에 비해 과했다. 실측:
+        #       사람 데모 평균 액션 크기   0.0037
+        #       생성 데이터 스텝간 변화    0.0355 (17.7mm) ← 신호와 같은 크기
+        #       생성 데이터 방향 반전      38.6%  (사람 데모는 1.8%)
+        #   0.03 은 Isaac Lab Franka stack 레퍼런스 값인데, 그 태스크는 사람
+        #   데모의 액션이 우리보다 훨씬 크다. 우리 데모는 텔레옵 감도를 낮춰
+        #   곱게 만든 것이라 같은 노이즈가 신호를 덮는다 (SNR 약 1:8).
+        #   참고로 AgiBot 레퍼런스는 0.01, G1 은 0.003 을 쓴다.
+        action_noise=float(os.environ.get("VLA_ACTION_NOISE", 0.003)),
         num_interpolation_steps=5,
         num_fixed_steps=0,
         apply_noise_during_interpolation=False,
@@ -72,10 +89,27 @@ def _build_subtask_configs() -> list[SubTaskConfig]:
             next_subtask_description="Place the block into the tray",
             **common,
         ),
-        # 서브태스크 2: 타깃 트레이에 넣는다. (마지막 → 종료 시그널 없음)
+        # 서브태스크 2: 타깃 트레이에 넣는다. (마지막)
+        #
+        # ★ 마지막인데도 subtask_term_signal 에 이름이 있다 — SkillGen 규약이다.
+        #   MimicGen 만 쓸 때는 None 이 맞다. 하지만 SkillGen 은 이 이름을
+        #   **시작 시그널 dict 의 키**로 쓴다:
+        #       datagen_info_pool.py:143
+        #       subtask_start_signals[eef_subtask_signal_name]
+        #   annotate_demos.py 도 수동 모드 검증에서 같은 말을 한다 —
+        #   "each subtask (including the last) must specify 'subtask_term_signal'.
+        #    The last subtask's term signal name is used as the final start signal name."
+        #
+        #   ⚠ 그 검증은 --auto 모드에는 없다. None 으로 두면 어노테이션은 조용히
+        #     통과하고, 생성 단계에서 KeyError 로 터진다 (실제로 그렇게 당했다).
+        #
+        #   이 이름으로 **종료 시그널을 만들 필요는 없다.** 마지막 서브태스크의
+        #   종료 인덱스는 이름이 아니라 에피소드 길이로 정해진다
+        #   (datagen_info_pool.py:152-154). get_subtask_term_signals() 는 그대로
+        #   grasp_lift 하나만 돌려주면 된다.
         SubTaskConfig(
             object_ref="tray",
-            subtask_term_signal=None,
+            subtask_term_signal=LAST_SUBTASK_NAME,
             subtask_term_offset_range=(0, 0),
             description="Place the block into the tray",
             **common,
@@ -92,9 +126,25 @@ def _apply_datagen_config(cfg) -> None:
     """
     cfg.datagen_config.name = DATAGEN_NAME
     # 생성 성공을 보장할 때까지 재시도한다.
-    cfg.datagen_config.generation_guarantee = True
+    #
+    # ★ True 면 generation_num_trials 가 **성공 개수**이고 채울 때까지 무한
+    #   재시도한다 (generation.py:132-137 의 check_val 분기). 성공률이 낮을 때
+    #   이게 몇 백 회씩 돌아 GPU 를 태운다 — SkillGen 0% 일 때 296회까지 갔다.
+    #   VLA_TRIALS_ARE_ATTEMPTS=1 로 끄면 generation_num_trials 가 **시도 횟수**
+    #   상한이 되어, 성공률 탐색용 짧은 실행을 정확히 N회에서 끊을 수 있다.
+    cfg.datagen_config.generation_guarantee = os.environ.get(
+        "VLA_TRIALS_ARE_ATTEMPTS", ""
+    ) not in ("1", "true", "True")
     # 실패 궤적은 버린다. SFT 데이터에 실패가 섞이면 정책이 실패를 학습한다.
-    cfg.datagen_config.generation_keep_failed = False
+    #
+    # ★ 진단할 때만 VLA_KEEP_FAILED=1 로 켠다. 그러면 실패분이
+    #   <output>_failed.hdf5 로 따로 나와 replay 로 "어디서 무너지는지" 를 볼 수
+    #   있다. generate_dataset.py 에는 이걸 켜는 CLI 플래그가 없고 cfg 가 유일한
+    #   스위치라, 코드를 직접 고쳤다 되돌리는 대신 환경변수로 뺐다 —
+    #   되돌리는 것을 잊으면 야간 배치가 실패분까지 쓰면서 디스크를 몇 배로 쓴다.
+    cfg.datagen_config.generation_keep_failed = os.environ.get(
+        "VLA_KEEP_FAILED", ""
+    ) in ("1", "true", "True")
     cfg.datagen_config.max_num_failures = 50
     cfg.datagen_config.generation_num_trials = 10   # CLI 인자로 덮어쓴다
     cfg.datagen_config.generation_select_src_per_subtask = True

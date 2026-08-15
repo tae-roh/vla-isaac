@@ -90,7 +90,7 @@ python scripts/dump_obs_reference.py --task VlaPlace-v0 --save \
 > 명령으로 덮어쓸 것 — Phase 4 스펙 대조는 항상 최신 씬 기준이어야 한다.
 
 저장된 PNG 를 **반드시 눈으로 볼 것**:
-- [ ] 박스(블록 3개)와 타깃 트레이가 **둘 다** 화면 안에 있는가
+- [ ] 블록 3개와 타깃 트레이가 **둘 다** 화면 안에 있는가
 - [ ] 블록 3색이 서로 구분되는가 (구분이 안 되면 언어 채널이 죽는다)
 - [ ] 트레이가 블록보다 확실히 넉넉해 보이는가 (한 변 72mm vs 블록 60×30mm)
 - [ ] 파지 순간이 로봇 팔에 가려지지 않는가
@@ -109,7 +109,7 @@ python scripts/dump_obs_reference.py --task VlaPlace-v0 --save \
 > 계산이라 `python configs/vla_spec.py` 만으로 즉시 검증된다 — 카메라를 다시 만질
 > 일이 생기면 렌더 전에 이걸 먼저 볼 것.
 >
-> **개편 후 검사 대상**: 소스 박스 내부 + 타깃 트레이 + 리프트 높이.
+> **개편 후 검사 대상**: 블록 스폰 영역 + 타깃 트레이 + 리프트 높이.
 > 카메라 값은 확정한 것을 그대로 두고 ROI 만 지오메트리에 맞췄으며, 같은 검사를
 > 통과한다.
 
@@ -244,6 +244,20 @@ python -c "import curobo; print('SkillGen 사용 가능')"
 
 실패하면 아래 **"MimicGen 후퇴"** 로 간다. 성공하면:
 
+> ⚠ **Isaac Lab 상류 버그 — 패치가 적용돼 있어야 한다.**
+> 이 리비전의 `annotate_demos.py` 는 `--annotate_subtask_start_signals` 분기에서
+> 누적 리스트를 텐서로 바꾸지 않고 `torch.any()` 에 넘긴다 (바로 위 종료 시그널
+> 분기는 변환한다). 그래서 SkillGen 어노테이션이 **항상**
+> `TypeError: any() received an invalid combination of arguments - got (list)`
+> 로 죽는다. 우리 코드 문제가 아니다.
+>
+> `~/workspace/IsaacLab` 에서 `git pull` / `git checkout` 을 하면 수정이 날아가므로,
+> 그때는 다시 적용할 것:
+> ```bash
+> cd $ISAACLAB_DIR && git apply ~/workspace/vla-isaac/patches/isaaclab-annotate-start-signals.patch
+> ```
+
+
 ```bash
 # 어노테이션 — SkillGen 은 시작 경계가 필수다.
 # --annotate_subtask_start_signals 를 빼면 생성이 실패한다.
@@ -325,6 +339,10 @@ python scripts/convert_hdf5_to_rlds.py --inspect datasets/generated.hdf5
 
 경고를 흘리지 말 것 — 특히 "한 번도 움직이지 않은 액션 차원" 과
 "궤적이 전반적으로 길다".
+
+> 2026-08-13 실행 결과와 판단은 **[docs/DATASET.md](DATASET.md)** 에 남겼다.
+> 요약: 데이터 1,500개는 건강하지만 궤적이 예산(300스텝)의 약 2배라
+> 평가·RFT 예산을 올려야 한다. SkillGen 0% 미해결 건도 같은 문서에 있다.
 
 ```bash
 python scripts/convert_hdf5_to_rlds.py \
@@ -429,7 +447,7 @@ python scripts/eval_rollout.py --checkpoint ckpt/sft \
 - <5% → 학습 신호가 없다. 데이터/스펙부터 본다
 
 **0 이면** 정책 문제가 아니라 파이프라인 문제다. 워커가 보내는
-진단값 `lifted` (박스에서 꺼내는 데까지는 되는가) 와 `yaw_err` (각도) 를 먼저
+진단값 `lifted` (블록을 집어 들어올리는 데까지는 되는가) 와 `yaw_err` (각도) 를 먼저
 볼 것. 둘 다 정상인데 성공률만 0 이면 성공 판정 배선을 의심한다 (§4-2).
 
 추가로 Language split 도 여기서 한 번 재 둔다 (씬은 그대로, 문장만 바꾼다):
@@ -485,7 +503,7 @@ SFT 대비 RFT 가 얼마나 올랐는가. 커브가 오르기 시작하는 것�
   나온다. `temperature` 를 올리거나(1.6 → 1.8), SFT 베이스라인이
   30% 게이트를 넘는지 다시 볼 것 — 대개 후자다
 - 배치는 채우는데 커브가 평평 → 워커 `diag` 로 어디서 막혔는지 가른다:
-  `lifted` 가 낮으면 박스에서 꺼내지를 못하는 것, 높은데 성공률이 낮으면
+  `lifted` 가 낮으면 블록을 집어 들지를 못하는 것, 높은데 성공률이 낮으면
   배치 정밀도 — `yaw_err` 로 각도 문제인지 본다
 - 성공률이 **정확히 0 으로 고정** → 학습이 아니라 배선을 의심할 것. env 보상은
   `func × weight × dt` 라 성공해도 ≈0.042 다. 워커의 성공 임계가 절대값

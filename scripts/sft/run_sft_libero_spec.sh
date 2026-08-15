@@ -172,16 +172,15 @@ fi
 log "SFT 완료. 다음 단계:"
 cat <<NEXT
 
-  1) 베이스라인 성공률 (Base split, 기본 클리어런스)
-     python scripts/eval_rollout.py --checkpoint ${RUN_ROOT}/<run>/  \\
-         --task VlaPlace-v0 --out logs/baseline_c5mm.json
+  1) ★ 정책 경로 검증 — RFT 를 붙이기 전에 반드시
+     python rft/grpo_fallback.py --verify-checkpoint --checkpoint ${RUN_ROOT}/<run>/
+     우리 샘플링 경로(parallel decoding)가 모델의 predict_action 과 같은 액션을
+     내는지 확인한다. 어긋나면 "커브가 안 오른다" 로만 드러난다.
 
-  2) 클리어런스 곡선의 SFT 쪽 점들 — 이게 핵심 결과의 절반이다
-     for T in c5mm c2mm c1mm c0p5mm; do
-       python scripts/eval_rollout.py --checkpoint ${RUN_ROOT}/<run>/ \\
-           --task VlaPlace-\${T}-v0 --out logs/sft_\${T}.json
-     done
-     ★ 성공률 30% 이상인 split 에서만 RFT 를 돌린다 (개정 §5 게이트).
+  2) SFT 베이스라인 성공률 (평가 홀드아웃 64개)
+     python scripts/eval_rollout.py --checkpoint ${RUN_ROOT}/<run>/  \\
+         --task VlaPlace-v0 --out logs/sft_base.json
+     ★ 30% 이상이어야 RFT 를 돌린다 (개정 §5 게이트).
 
   3) 체크포인트 + 설정 업로드
      python scripts/upload_hub.py --path ${RUN_ROOT}/<run> \\

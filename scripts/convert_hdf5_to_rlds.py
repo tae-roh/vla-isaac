@@ -189,19 +189,39 @@ def collect_states(paths: list[Path]) -> np.ndarray | None:
 
 # =============================================================================
 def build_rlds(hdf5_paths: list[Path], out_dir: Path) -> None:
-    builder_dir = REPO_ROOT / "scripts" / "rlds" / "vla_pick"
-    env = os.environ.copy()
-    env["VLA_PICK_HDF5"] = ":".join(str(p.resolve()) for p in hdf5_paths)
+    """TFDS 빌더를 돌려 RLDS 데이터셋을 만든다.
 
+    ★ `tfds build` CLI 를 쓰지 않는다. env_isaaclab 에서 그 CLI 는 두 번 막힌다:
+        1) tensorflow_metadata 가 protobuf>=5.27 의 runtime_version 을 import 하는데
+           tensorflow-cpu 가 protobuf<5.0 을 요구해 올릴 수 없다
+           → tensorflow-metadata 를 1.16.1 로 낮춰 해결 (constraints 로 고정)
+        2) 그래도 CLI 진입점이 apache_beam 을 하드 import 한다
+           → 우리 빌더는 beam 을 쓰지 않으므로 설치할 이유가 없다
+
+      빌더를 직접 import 해 download_and_prepare() 를 부르면 둘 다 우회된다.
+      데이터 내용은 CLI 경로와 동일하다 — 같은 클래스를 같은 인자로 돌린다.
+    """
+    builder_dir = REPO_ROOT / "scripts" / "rlds" / "vla_pick"
+    os.environ["VLA_PICK_HDF5"] = ":".join(str(p.resolve()) for p in hdf5_paths)
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "tfds", "build",
-        "--data_dir", str(out_dir.resolve()),
-        "--overwrite",
-    ]
-    print(f"\n실행: {' '.join(cmd)}\n  (cwd={builder_dir})")
-    print(f"  VLA_PICK_HDF5={env['VLA_PICK_HDF5']}\n")
-    subprocess.run(cmd, cwd=builder_dir, env=env, check=True)
+
+    print(f"\nRLDS 빌드 (프로그래밍 방식)\n  빌더  : {builder_dir}")
+    print(f"  출력  : {out_dir.resolve()}")
+    print(f"  입력  : {os.environ['VLA_PICK_HDF5']}\n")
+
+    sys.path.insert(0, str(builder_dir.parent))
+    import tensorflow_datasets as tfds  # noqa: F401  (여기서만 필요)
+
+    from vla_pick.vla_pick_dataset_builder import VlaPick
+
+    builder = VlaPick(data_dir=str(out_dir.resolve()))
+    builder.download_and_prepare(
+        download_config=tfds.download.DownloadConfig(
+            # 우리 빌더는 다운로드가 없다. 재실행 시 이전 결과를 덮어쓴다.
+            download_mode=tfds.download.GenerateMode.REUSE_CACHE_IF_EXISTS,
+        )
+    )
+    print(f"\n빌드 완료: {builder.info.splits}")
 
 
 # =============================================================================
