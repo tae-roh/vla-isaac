@@ -105,9 +105,11 @@ def cmd_upload(args: argparse.Namespace) -> int:
         private=True,       # 항상 private 로 만든다. 공개는 의도적으로만.
         exist_ok=True,
     )
-    print(f"\n업로드 → {args.repo} ({args.repo_type}, private)")
+    dest = args.path_in_repo or "(루트)"
+    print(f"\n업로드 → {args.repo} ({args.repo_type}, private) : {dest}")
     api.upload_folder(
         folder_path=str(root),
+        path_in_repo=args.path_in_repo,
         repo_id=args.repo,
         repo_type=args.repo_type,
         commit_message=args.message,
@@ -127,6 +129,12 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true",
                         help="해시/매니페스트만 만들고 업로드하지 않는다")
     parser.add_argument("--verify", type=Path, help="매니페스트로 무결성만 확인")
+    parser.add_argument(
+        "--path-in-repo",
+        default=None,
+        help="repo 안의 하위 경로 (예: steps-17500). 한 repo 에 체크포인트를 여러 개 "
+             "둘 때 필요하다 — 생략하면 루트에 올라가 기존 파일을 덮어쓴다.",
+    )
     args = parser.parse_args()
 
     if args.verify:
