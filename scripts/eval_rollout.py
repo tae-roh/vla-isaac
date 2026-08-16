@@ -116,6 +116,22 @@ def load_policy(args):
                     act = model.generate_action_verl(
                         **inputs, unnorm_key=args.unnorm_key
                     )
+            # predict_action 의 반환 형태는 버전마다 다르다 — numpy 배열일 수도,
+            # GPU 텐서일 수도, **텐서를 담은 리스트**일 수도 있다. 어느 쪽이든
+            # 곧바로 np.asarray 하면
+            #   TypeError: can't convert cuda:0 device type tensor to numpy
+            # 로 죽으므로, 중첩까지 훑어 CPU 로 내린 뒤 변환한다.
+            # ★ 이 리비전의 predict_action 은 **튜플**을 돌려준다:
+            #     (액션 ndarray (chunk, ACTION_DIM),  히든스테이트 Tensor(cuda))
+            #   그대로 np.asarray 하면 모양이 다른 두 원소를 쌓으려다
+            #     ValueError: all input arrays must have the same shape
+            #   가 나고, 히든스테이트만 집으면 GPU 텐서라
+            #     TypeError: can't convert cuda:0 device type tensor to numpy
+            #   가 난다. 첫 원소만 쓴다.
+            if isinstance(act, tuple):
+                act = act[0]
+            if isinstance(act, torch.Tensor):
+                act = act.detach().float().cpu().numpy()
             act = np.asarray(act, dtype=np.float32).reshape(-1, SPEC.ACTION_DIM)
             # 청크 길이를 스펙에 맞춘다 (모자라면 마지막 액션을 반복).
             if act.shape[0] < SPEC.NUM_ACTIONS_CHUNK:
@@ -147,6 +163,10 @@ def main() -> int:
         help="Language split: SPEC.INSTRUCTION_TEMPLATES_EVAL 의 인덱스",
     )
     parser.add_argument("--max-steps", type=int, default=SPEC.MAX_EPISODE_STEPS)
+    parser.add_argument(
+        "--livestream", type=int, default=None, choices=[0, 1, 2],
+        help="롤아웃을 WebRTC 로 중계한다. 2=사설망 (PUBLIC_IP 필요).",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--unnorm-key", default="vla_pick")
     parser.add_argument("--norm-stats", default=str(REPO_ROOT / "datasets" / "rlds" / SPEC.NORM_STATS_FILENAME))
@@ -164,12 +184,21 @@ def main() -> int:
     print(SPEC.summary())
     predict = load_policy(args)
 
+    # ★ --livestream 을 주면 롤아웃을 눈으로 볼 수 있다. 브리지는
+    #   --headless --enable_cameras 를 항상 붙이는데, AppLauncher 는 livestream
+    #   이 1/2 이면 호스트를 헤드리스로 두고 WebRTC 로만 내보내므로 둘이
+    #   충돌하지 않는다 (dump_obs_reference.py 와 같은 규약).
+    extra = []
+    if args.livestream is not None:
+        extra += ["--livestream", str(args.livestream)]
+
     client = RolloutClient(
         isaaclab_python=args.isaaclab_python,
         worker_script=REPO_ROOT / "rft" / "isaaclab_rollout_worker.py",
         num_envs=args.num_envs,
         task=args.task,
         device="cuda:0",
+        extra_args=extra,
     )
     client.start()
 

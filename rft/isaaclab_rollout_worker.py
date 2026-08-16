@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -33,10 +34,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", default="VlaPlace-v0")
     parser.add_argument("--num-envs", type=int, default=8)
-    parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-episode-steps", type=int, default=None)
-    # AppLauncher 가 --headless / --enable_cameras 등을 처리한다.
+    # AppLauncher 가 --headless / --enable_cameras / --device 를 처리한다.
+    #
+    # ★ --device 를 여기서 직접 추가하면 안 된다. 이 리비전의
+    #   AppLauncher.add_app_launcher_args() 는 같은 이름이 이미 있으면
+    #     ValueError: The passed ArgParser object already has the field 'device'
+    #   로 죽고, 워커가 그대로 종료되어 브리지는 "응답 없이 종료" 만 보게 된다
+    #   (원인이 GPU 메모리로 오인되기 쉽다).
     from isaaclab.app import AppLauncher
 
     AppLauncher.add_app_launcher_args(parser)
@@ -45,6 +51,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
+    # ★ 프로토콜용 stdout 을 Isaac Sim 이 오염시키기 전에 떼어낸다.
+    #
+    #   브리지는 워커의 stdout 에서 "길이 접두어 + 본문" 을 읽는다. 그런데
+    #   Isaac Sim(Kit) 은 **C++ 레벨에서 fd 1 에 직접** 배너·경고를 쏟는다.
+    #   파이썬에서 sys.stdout 을 바꿔도 그건 막히지 않는다. 그 바이트가 길이
+    #   접두어로 해석되면 브리지가 터무니없는 크기를 할당하려다
+    #       MemoryError  (ipc_bridge._read_exactly)
+    #   로 죽고, 워커는 broken pipe 만 남긴다 — 원인이 GPU 메모리로 오인되기 쉽다.
+    #
+    #   그래서 AppLauncher 를 띄우기 **전에** fd 1 을 복제해 프로토콜 전용으로
+    #   쓰고, fd 1 자체는 stderr 로 돌려 Isaac Sim 의 출력이 로그로 가게 한다.
+    _proto_fd = os.dup(1)
+    os.dup2(2, 1)
+    proto_out = os.fdopen(_proto_fd, "wb")
 
     from isaaclab.app import AppLauncher
 
@@ -67,7 +88,7 @@ def main() -> int:
     instruction_template = {"value": None}
 
     stdin = sys.stdin.buffer
-    stdout = sys.stdout.buffer
+    stdout = proto_out
 
     env = None
     try:

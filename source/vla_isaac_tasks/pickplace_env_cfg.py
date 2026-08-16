@@ -363,8 +363,21 @@ class PickPlaceEnvCfg(ManagerBasedRLEnvCfg):
     curriculum = None
 
     def __post_init__(self):
-        self.decimation = SPEC.DECIMATION
-        self.episode_length_s = SPEC.EPISODE_LENGTH_S
+        # ★ 제어 주기는 정책이 학습된 주기와 반드시 같아야 한다.
+        #   액션이 **델타 포즈**라, 정책이 8Hz(0.125초)용으로 낸 델타를 24Hz
+        #   (0.0417초)에 적용하면 3배 빠르게 움직인다 — 평가·RFT 가 통째로
+        #   무의미해지고 증상은 "성공률 0" 으로만 나타난다.
+        #
+        #   데이터를 8Hz 로 다운샘플했으므로(scripts/downsample_demos.py,
+        #   docs/DATASET.md) 그 데이터로 학습한 체크포인트를 굴릴 때는
+        #   VLA_DECIMATION=15 를 준다 (1/120 × 15 = 0.125초 = 8Hz).
+        #   물리는 그대로 120Hz 로 돈다 — 바뀌는 것은 정책이 명령을 내는 주기뿐이다.
+        self.decimation = int(os.environ.get("VLA_DECIMATION", SPEC.DECIMATION))
+        # 에피소드 길이는 "스텝 수 × 스텝 간격" 이므로 decimation 을 바꾸면
+        # 함께 다시 계산해야 한다. 안 그러면 8Hz 에서 스텝 예산이 1/3 로 줄어든다.
+        self.episode_length_s = (
+            SPEC.MAX_EPISODE_STEPS * SPEC.SIM_DT * self.decimation
+        )
         self.sim.dt = SPEC.SIM_DT
         self.sim.render_interval = SPEC.DECIMATION
 
