@@ -82,17 +82,22 @@ def patch_transforms(oft_dir: Path) -> bool:
         print(f"  transforms.py — 이미 등록됨, 건너뜀")
         return False
 
-    # 변환 함수는 파일 끝에 붙이고, 레지스트리 dict 에 항목을 추가한다.
-    text += _TRANSFORM_FN
-
     marker = "OXE_STANDARDIZATION_TRANSFORMS = {"
     if marker not in text:
         raise RuntimeError(
             f"{path} 에서 OXE_STANDARDIZATION_TRANSFORMS 를 찾지 못했다. "
             "openvla-oft 구조가 바뀌었을 수 있다 — 수동으로 등록할 것."
         )
+
+    # 변환 함수는 레지스트리 dict **바로 앞에** 넣는다. 파일 끝에 붙이면
+    # dict 리터럴이 정의되는 시점에 함수가 아직 없어서 import 하는 순간
+    # NameError 로 죽는다 (dict 가 함수 객체를 값으로 담기 때문).
     entry = f'    "{DATASET_NAME}": {DATASET_NAME}_dataset_transform,\n'
-    text = text.replace(marker, marker + "\n" + entry, 1)
+    text = text.replace(
+        marker,
+        _TRANSFORM_FN.strip("\n") + "\n\n\n" + marker + "\n" + entry,
+        1,
+    )
 
     path.write_text(text, encoding="utf-8")
     print(f"  transforms.py — 등록 완료")
@@ -117,6 +122,47 @@ def patch_configs(oft_dir: Path) -> bool:
     text = text.replace(marker, marker + "\n" + _CONFIG_ENTRY, 1)
     path.write_text(text, encoding="utf-8")
     print(f"  configs.py — 등록 완료")
+    return True
+
+
+_ACTION_HEAD_MARKER = "# --- vla-isaac: 이산 토큰 경로 가드 ---"
+
+_ACTION_HEAD_ANCHOR = """    # If applicable, instantiate continuous action head for L1 regression
+    if cfg.use_l1_regression:"""
+
+_ACTION_HEAD_FIX = f'''{_ACTION_HEAD_MARKER}
+    # 상류 finetune.py 는 use_l1_regression / use_diffusion 중 하나는 켜져 있다고
+    # 가정하고 그 분기에서만 action_head 를 바인딩하는데, 학습 루프(1040줄 근처)는
+    # 플래그와 무관하게 action_head=action_head 로 넘긴다. 우리는 GRPO 호환을 위해
+    # 둘 다 끄므로(README §2 이산 액션 토큰 + CE) 첫 배치에서
+    #   UnboundLocalError: local variable 'action_head' referenced before assignment
+    # 로 죽는다. None 으로 미리 묶어 두면 끝이다 — run_forward_pass 는 두 플래그가
+    # False 면 action_head 를 아예 건드리지 않고, 체크포인트 저장부도
+    # `action_head is not None` 을 명시적으로 확인한다.
+    action_head = None
+
+{_ACTION_HEAD_ANCHOR}'''
+
+
+def patch_finetune(oft_dir: Path) -> bool:
+    """이산 토큰 경로에서 finetune.py 가 UnboundLocalError 로 죽는 것을 막는다."""
+    path = oft_dir / "vla-scripts" / "finetune.py"
+    if not path.exists():
+        raise FileNotFoundError(f"finetune.py 를 찾을 수 없다: {path}")
+
+    text = path.read_text(encoding="utf-8")
+    if _ACTION_HEAD_MARKER in text:
+        print("  finetune.py — 이미 패치됨, 건너뜀")
+        return False
+
+    if _ACTION_HEAD_ANCHOR not in text:
+        raise RuntimeError(
+            f"{path} 에서 action_head 초기화 지점을 찾지 못했다. 상류가 바뀌었을 수 "
+            "있다 — cfg.use_l1_regression 분기 앞에 `action_head = None` 을 직접 넣을 것."
+        )
+
+    path.write_text(text.replace(_ACTION_HEAD_ANCHOR, _ACTION_HEAD_FIX, 1), encoding="utf-8")
+    print("  finetune.py — 이산 토큰 경로 가드(action_head = None) 삽입 완료")
     return True
 
 
@@ -162,7 +208,11 @@ def main() -> int:
         return 2
 
     print(f"openvla-oft 설정: {args.oft_dir}")
-    changed = patch_configs(args.oft_dir) | patch_transforms(args.oft_dir)
+    changed = (
+        patch_configs(args.oft_dir)
+        | patch_transforms(args.oft_dir)
+        | patch_finetune(args.oft_dir)
+    )
     if not args.skip_pin:
         changed |= pin_constants(args.oft_dir)
 

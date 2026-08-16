@@ -140,10 +140,10 @@ env/                         의존성 정의 + 스모크 테스트 (코드보�
   constraints*.txt             환경별 버전 핀 — 모든 pip install 에 -c 로 건다
   smoke/check_*.py             ★ 유일한 환경 검증 기준 (pip check 아님)
 setup/setup_*.sh             환경 구축 (멱등, 스모크 자동 실행, lock 박제)
-source/vla_isaac_tasks/      Isaac Lab 태스크 — gym 등록 15종
+source/vla_isaac_tasks/      Isaac Lab 태스크 — gym 등록 3종
   pickplace_env_cfg.py         VlaPlace-v0             텔레옵·재생·평가
   pickplace_mimic_env*.py      VlaPlace-*-Mimic-v0     Mimic 증강 (헬퍼 6종)
-                               VlaPlace-c{5,2,1,0p5}mm-*  클리어런스 split
+  vla_env.py                   reset_to 후 타깃 복원 + 성공 유지 카운터
   scene_assets.py              블록 3개 + 타깃 트레이 (전부 프리미티브)
   init_states.py               ★ 초기 상태 뱅크 — s0 를 인덱스로 지정한다
   deformable_env_cfg.py        보류 (등록 안 됨. 후속 확장에서 박막부터 재개)

@@ -22,6 +22,19 @@
 #   이산 액션 토큰 + cross-entropy 여야 GRPO 의 ratio 를 계산할 수 있다.
 #   이 한 줄이 이 프로젝트에서 SFT 를 하는 이유의 절반이다.
 #
+# ★ 이 설정이 곧 "SimpleVLA-RL 이 요구하는 SFT" 다 (상류에서 확인한 근거)
+#   - 논문(arXiv:2509.09674)이 밝힌 공식 OFT 대비 유일한 모델 변경이
+#     "LLaMA2 output head + cross-entropy (공식은 MLP + L1 regression)" 이고,
+#     그건 공식 finetune.py 의 `if not (use_l1_regression or use_diffusion)`
+#     분기와 같은 것이다. parallel decoding 과 action chunking(k=8)은 유지된다.
+#   - SimpleVLA-RL 이 벤더링한 train_utils.py 는 openvla-oft 학습 헬퍼 그대로다
+#     (get_current_action_mask 등) — SFT 수식이 다르지 않다.
+#   - 그들의 constants.py LIBERO 값(7 / 8 / 8 / q99)이 configs/vla_spec.py 와 같다.
+#   - 그들의 RL 진입점은 **stock OFT 체크포인트**를 받아 자기 modeling_prismatic.py
+#     를 체크포인트에 복사하고 auto_map 을 고쳐 쓴다 (verl/utils/openvla_utils.py).
+#   → 즉 SFT 를 SimpleVLA-RL 용으로 따로 만들 필요가 없다. 이 스크립트 그대로다.
+#     되돌리지 말 것: --use_l1_regression True 로 바꾸는 순간 RFT 가 불가능해진다.
+#
 # 사용:
 #   tmux new -s sft
 #   bash scripts/sft/run_sft_libero_spec.sh
@@ -47,8 +60,16 @@ LORA_RANK="${LORA_RANK:-32}"
 SAVE_FREQ="${SAVE_FREQ:-2500}"
 NUM_GPUS="${NUM_GPUS:-1}"
 
+# LR 10배 감쇠 시점. openvla-oft 의 LIBERO 레시피는 150,005 스텝 중 100,000 에서
+# 감쇠시킨다 (= 2/3 지점). 우리는 스텝 수를 줄였으므로 같은 비율로 환산한다.
+#   ★ 이 인자를 넘기지 않으면 finetune.py 기본값 100,000 이 쓰이는데,
+#     max_steps 가 그보다 작으면 감쇠가 한 번도 일어나지 않는다. 에러가 아니라
+#     "레시피의 절반만 재현" 으로 조용히 끝나는 종류의 누락이다.
+NUM_STEPS_BEFORE_DECAY="${NUM_STEPS_BEFORE_DECAY:-$(( MAX_STEPS * 2 / 3 ))}"
+
 log()  { echo -e "\n\033[1;32m[SFT]\033[0m $*"; }
 die()  { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; exit 1; }
+warn() { echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 
 # --- 사전 확인 ---------------------------------------------------------------
 log "사전 확인"
@@ -99,6 +120,9 @@ cat > "${CONFIG_RECORD}" <<EOF
   "grad_accumulation_steps": ${GRAD_ACCUM},
   "learning_rate": ${LEARNING_RATE},
   "max_steps": ${MAX_STEPS},
+  "num_steps_before_decay": ${NUM_STEPS_BEFORE_DECAY},
+  "image_aug": true,
+  "use_film": false,
   "note": "액션 헤드는 이산 토큰 + CE (RL 호환). 연속 L1 회귀를 쓰면 log-prob 이 정의되지 않아 GRPO 불가."
 }
 EOF
@@ -132,24 +156,45 @@ torchrun --standalone --nnodes 1 --nproc-per-node "${NUM_GPUS}" \
     --lora_rank "${LORA_RANK}" \
     --image_aug True \
     --max_steps "${MAX_STEPS}" \
+    --num_steps_before_decay "${NUM_STEPS_BEFORE_DECAY}" \
     --save_freq "${SAVE_FREQ}" \
     --save_latest_checkpoint_only False \
     --merge_lora_during_training True \
     --run_id_note "libero_spec_vla_pick"
 
+# --- 산출물 검증 -------------------------------------------------------------
+# 이산 토큰 경로로 학습됐는지 확인한다. 연속 헤드로 돌았으면 action_head 체크포인트가
+# 함께 저장되는데, 그 상태로는 RFT 를 붙일 수 없다 (log π 가 없다).
+# 하룻밤을 태운 뒤 Phase 4 에서야 알게 되는 것을 막는 검사다.
+log "산출물 검증 (연속 헤드 흔적이 없어야 정상)"
+LATEST_RUN="$(ls -dt "${RUN_ROOT}"/*/ 2>/dev/null | head -1)"
+if [[ -n "${LATEST_RUN}" ]]; then
+    # find 로 찾는다. compgen -G "...**/..." 는 globstar 가 꺼져 있으면 ** 가 * 로
+    # 동작해 "한 단계 아래" 만 보게 되고, 파일이 체크포인트 디렉토리 바로 밑에 있는
+    # 실제 배치에서는 영영 매치되지 않는다 — 가드가 조용히 무력화된다.
+    if [[ -n "$(find "${LATEST_RUN}" -name 'action_head*.pt' -print -quit 2>/dev/null)" ]]; then
+        die "체크포인트에 action_head*.pt 가 있다 (${LATEST_RUN}).
+     --use_l1_regression False 가 먹지 않았다는 뜻이다. 이 체크포인트로는
+     GRPO 를 붙일 수 없으니 플래그를 확인하고 다시 학습할 것."
+    fi
+    echo "  OK: ${LATEST_RUN} 에 연속 헤드 산출물 없음"
+    # unnorm_key 로 쓸 통계가 함께 저장됐는지도 본다 (평가·RFT 양쪽이 이걸 읽는다).
+    [[ -n "$(find "${LATEST_RUN}" -name 'dataset_statistics.json' -print -quit 2>/dev/null)" ]] \
+        || warn "dataset_statistics.json 을 못 찾았다 — eval_rollout/grpo 의 unnorm_key 조회가 실패한다."
+fi
+
 log "SFT 완료. 다음 단계:"
 cat <<NEXT
 
-  1) 베이스라인 성공률 (Base split, 기본 클리어런스)
-     python scripts/eval_rollout.py --checkpoint ${RUN_ROOT}/<run>/  \\
-         --task VlaPlace-v0 --out logs/baseline_c5mm.json
+  1) ★ 정책 경로 검증 — RFT 를 붙이기 전에 반드시
+     python rft/grpo_fallback.py --verify-checkpoint --checkpoint ${RUN_ROOT}/<run>/
+     우리 샘플링 경로(parallel decoding)가 모델의 predict_action 과 같은 액션을
+     내는지 확인한다. 어긋나면 "커브가 안 오른다" 로만 드러난다.
 
-  2) 클리어런스 곡선의 SFT 쪽 점들 — 이게 핵심 결과의 절반이다
-     for T in c5mm c2mm c1mm c0p5mm; do
-       python scripts/eval_rollout.py --checkpoint ${RUN_ROOT}/<run>/ \\
-           --task VlaPlace-\${T}-v0 --out logs/sft_\${T}.json
-     done
-     ★ 성공률 30% 이상인 split 에서만 RFT 를 돌린다 (개정 §5 게이트).
+  2) SFT 베이스라인 성공률 (평가 홀드아웃 64개)
+     python scripts/eval_rollout.py --checkpoint ${RUN_ROOT}/<run>/  \\
+         --task VlaPlace-v0 --out logs/sft_base.json
+     ★ 30% 이상이어야 RFT 를 돌린다 (개정 §5 게이트).
 
   3) 체크포인트 + 설정 업로드
      python scripts/upload_hub.py --path ${RUN_ROOT}/<run> \\

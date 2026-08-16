@@ -110,7 +110,7 @@ def main() -> int:
         # 두지 않으면 다음 관측이 이미 새 에피소드 것이라 놓친다.
         success_latch = torch.zeros(num_envs, dtype=torch.bool, device=device)
         done_latch = torch.zeros(num_envs, dtype=torch.bool, device=device)
-        # 진단 래치: "박스에서 꺼내는 것까지는 됐는가".
+        # 진단 래치: "블록을 집어 들어올리는 것까지는 됐는가".
         # 커브가 평평할 때 파지 실패인지 배치 정밀도 문제인지 가르는 값이다.
         lift_latch = torch.zeros(num_envs, dtype=torch.bool, device=device)
         grasp_latch = torch.zeros(num_envs, dtype=torch.bool, device=device)
@@ -312,10 +312,14 @@ def main() -> int:
                         tray_latch |= (
                             _obs_mod.block_in_tray(_u) & _settled & lift_latch
                         )
-                        # 성공은 reward>0 으로 판정한다. RewardsCfg 의 success 항이
-                        # weight=1.0 인 유일한 항이므로 reward 가 곧 0/1 성공이다.
-                        # (진단용 grasp_lift_diag 는 weight=0 이라 섞이지 않는다)
-                        success_latch |= reward > 0.5
+                        # ★ 임계는 0 이다. 절대값(0.5 같은 것)으로 되돌리지 말 것.
+                        #   Isaac Lab 의 RewardManager 는 `func() * weight * dt` 를
+                        #   돌려준다. 성공해도 env 가 주는 값은 1.0 이 아니라
+                        #   1.0 × step_dt 다. 0.5 로 잡으면 **성공이 영원히 안 잡히고**
+                        #   RFT 학습 신호가 0 으로 고정되는데, 에러는 나지 않는다.
+                        #   부호만 보면 decimation 을 바꿔도 맞는다 — 가중치 있는
+                        #   보상 항이 success 하나뿐이기 때문이다.
+                        success_latch |= reward > 1e-6
                         done_latch |= terminated | truncated
 
                     # 진단값은 reward 와 분리해 보낸다. 보상에 섞으면 0/1 이

@@ -328,7 +328,15 @@ MAX_EPISODE_STEPS = 300
 
 # 제어 주기. Isaac Lab decimation 과 맞물린다.
 SIM_DT = 1.0 / 120.0
-DECIMATION = 5                       # → 정책 주기 24Hz
+# ★ 15 다 (8Hz). 5(24Hz) 에서 바꿨다.
+#   학습 데이터를 8Hz 로 다운샘플했으므로 환경도 8Hz 여야 한다. 예전에는
+#   VLA_DECIMATION=15 를 매번 export 해서 맞췄는데, 두 가지 문제가 있었다:
+#     1. 빼먹으면 8Hz 용 델타가 24Hz 에 적용돼 정책이 3배 빨라진다.
+#        증상은 "성공률 0" 하나뿐이라 원인을 찾기 어렵다.
+#     2. 환경변수는 env cfg 의 decimation 만 바꾸고 아래 SUCCESS_HOLD_STEPS 는
+#        24Hz 기준(48)으로 남았다 → 성공 유지 요구가 2초가 아니라 **6초**였다.
+#   SSOT 를 실제 운용값으로 맞춰 둘 다 해소한다.
+DECIMATION = 15
 EPISODE_LENGTH_S = MAX_EPISODE_STEPS * SIM_DT * DECIMATION
 
 # =============================================================================

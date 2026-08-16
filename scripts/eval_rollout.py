@@ -86,17 +86,17 @@ def load_policy(args):
     ).to(args.device)
     model.eval()
 
-    # 정규화 통계 — SFT 때 쓴 것과 반드시 같아야 한다.
-    norm_stats = None
-    stats_path = Path(args.norm_stats) if args.norm_stats else None
-    if stats_path and stats_path.exists():
-        norm_stats = json.loads(stats_path.read_text(encoding="utf-8"))
-        print(f"[eval] 정규화 통계: {stats_path}")
-    else:
-        print(
-            "[eval] ⚠ norm_stats 를 못 찾았다. 모델 내장 통계를 쓴다. "
-            "SFT 때와 다르면 액션이 통째로 어긋난다 — 반드시 확인할 것."
+    # 정규화 통계는 **체크포인트 안의 것**을 쓴다 (predict_action 이 unnorm_key 로
+    # 직접 찾는다). 파일에서 따로 읽어 두면 같은 숫자의 출처가 둘이 되고, 언젠가
+    # 갈라진 뒤 "평가와 RFT 의 액션 스케일이 다르다" 로만 드러난다.
+    # 여기서는 키가 있는지만 미리 확인하고 없으면 즉시 멈춘다.
+    if args.unnorm_key not in getattr(model, "norm_stats", {}):
+        raise SystemExit(
+            f"[eval] unnorm_key '{args.unnorm_key}' 가 체크포인트의 norm_stats 에 "
+            f"없다. 있는 키: {list(getattr(model, 'norm_stats', {}))}\n"
+            "  SFT 가 dataset_statistics.json 을 체크포인트에 남겼는지 확인할 것."
         )
+    print(f"[eval] 정규화 통계: 체크포인트 내장 '{args.unnorm_key}'")
 
     def predict(images: np.ndarray, instructions: list[str]) -> np.ndarray:
         # ★ 프롬프트는 env 마다 다르다. 타깃 블록·슬롯이 env 마다 다르기 때문이다.
@@ -109,30 +109,20 @@ def load_policy(args):
             pil = SPEC.prepare_image_for_vla(images[i])
             inputs = processor(prompt, pil).to(args.device, dtype=torch.bfloat16)
             with torch.no_grad():
-                # openvla-oft 의 병렬 디코딩 API. 체크포인트 종류에 따라
-                # predict_action / generate_action_verl 로 이름이 다를 수 있다.
-                if hasattr(model, "predict_action"):
-                    act = model.predict_action(
-                        **inputs,
-                        unnorm_key=args.unnorm_key,
-                        do_sample=args.sample,
-                    )
-                else:
-                    act = model.generate_action_verl(
-                        **inputs, unnorm_key=args.unnorm_key
-                    )
-            # predict_action 의 반환 형태는 버전마다 다르다 — numpy 배열일 수도,
-            # GPU 텐서일 수도, **텐서를 담은 리스트**일 수도 있다. 어느 쪽이든
-            # 곧바로 np.asarray 하면
-            #   TypeError: can't convert cuda:0 device type tensor to numpy
-            # 로 죽으므로, 중첩까지 훑어 CPU 로 내린 뒤 변환한다.
-            # ★ 이 리비전의 predict_action 은 **튜플**을 돌려준다:
-            #     (액션 ndarray (chunk, ACTION_DIM),  히든스테이트 Tensor(cuda))
-            #   그대로 np.asarray 하면 모양이 다른 두 원소를 쌓으려다
-            #     ValueError: all input arrays must have the same shape
-            #   가 나고, 히든스테이트만 집으면 GPU 텐서라
-            #     TypeError: can't convert cuda:0 device type tensor to numpy
-            #   가 난다. 첫 원소만 쓴다.
+                # openvla-oft 의 병렬 디코딩 API — 청크 전체를 한 번의 forward 로
+                # 예측하고 언노멀라이즈까지 해서 돌려준다.
+                #
+                # ★ do_sample 같은 샘플링 인자를 넘기지 말 것. predict_action 은
+                #   그런 인자를 받지 않고 **kwargs 로 삼켜 아래 forward 로 흘려보낸다.
+                #   넘겨도 조용히 무시되므로 "샘플링을 켰다" 고 착각하기 쉽다
+                #   (실제로 그렇게 오독한 계측이 있었다). 평가는 greedy 가 맞고,
+                #   샘플링이 필요한 곳은 RFT 뿐이다 — rft/grpo_fallback.py 의
+                #   _action_logits 가 같은 입력 구성을 직접 만든다.
+                act = model.predict_action(**inputs, unnorm_key=args.unnorm_key)
+            # 반환 형태는 리비전마다 다르다. 이 체크포인트의 predict_action 은
+            # **튜플** (액션 ndarray, 히든스테이트 cuda Tensor) 을 돌려준다.
+            # 그대로 np.asarray 하면 모양이 다른 두 원소를 쌓으려다 ValueError,
+            # 히든스테이트만 집으면 cuda 텐서라 TypeError 가 난다. 첫 원소만 쓴다.
             if isinstance(act, tuple):
                 act = act[0]
             if isinstance(act, torch.Tensor):
@@ -195,14 +185,10 @@ def main() -> int:
              "★ 프레임은 청크 경계마다 하나씩만 남는다 — 브리지가 관측을 "
              "청크 단위로 돌려주기 때문이다 (실제 제어 주기의 1/8).",
     )
-    parser.add_argument(
-        "--sample", action="store_true",
-        help="액션을 샘플링한다(do_sample=True). RFT 롤아웃은 샘플링하므로 "
-             "탐색 폭을 보려면 이쪽이 맞다. 기본은 greedy.",
-    )
     parser.add_argument("--device", default="cuda:0")
+    # 정규화 통계는 체크포인트 안의 것을 쓴다 (--norm-stats 플래그는 없앴다 —
+    # 파일과 체크포인트 두 출처가 갈라지는 것을 막기 위해서다).
     parser.add_argument("--unnorm-key", default="vla_pick")
-    parser.add_argument("--norm-stats", default=str(REPO_ROOT / "datasets" / "rlds" / SPEC.NORM_STATS_FILENAME))
     parser.add_argument(
         "--isaaclab-python",
         type=Path,

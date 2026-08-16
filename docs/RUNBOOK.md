@@ -417,6 +417,19 @@ python scripts/dump_obs_reference.py --compare datasets/obs_reference \
 라이브 뷰포트로는 검출할 수 없는 종류의 불일치다. 여기서 잡지 않으면
 "RFT 커브가 오르지 않는다" 는 형태로만 드러나고 원인 추적에 며칠이 든다.
 
+같은 이유로 **정책 경로도 여기서 대조한다.** RFT 의 샘플링은 OFT 의 parallel
+decoding(placeholder 56토큰 + stop, 1회 forward, 액션 구간 양방향 어텐션)을
+그대로 재현해야 한다 — `model.generate()` 같은 autoregressive 생성은 모델이
+학습된 적 없는 방식이라 정책 분포가 조용히 달라진다.
+
+```bash
+python rft/grpo_fallback.py --verify-checkpoint --checkpoint ckpt/sft
+# ✓ 정책 경로가 predict_action 과 일치한다   ← 이 줄이 나와야 진행
+```
+
+어긋나면 로짓 슬라이스 위치(`num_patches + num_prompt_tokens`)나 디토크나이즈
+(`model.vocab_size` / `-1` / `bin_centers`)가 상류와 다른 것이다.
+
 ### 3-3. 베이스라인 성공률
 
 ```bash
@@ -433,8 +446,9 @@ python scripts/eval_rollout.py --checkpoint ckpt/sft \
   17.3% 에서 91.7% 까지 올린 사례가 있다)
 - <5% → 학습 신호가 없다. 데이터/스펙부터 본다
 
-**0 이면** 공차 문제가 아니라 파이프라인 문제다. 진단항 `grasp_lift_diag`
-(파지·리프트까지는 되는가) 와 `yaw_diag` (각도) 를 먼저 볼 것.
+**0 이면** 정책 문제가 아니라 파이프라인 문제다. 워커가 보내는
+진단값 `lifted` (블록을 집어 들어올리는 데까지는 되는가) 와 `yaw_err` (각도) 를 먼저
+볼 것. 둘 다 정상인데 성공률만 0 이면 성공 판정 배선을 의심한다 (§4-2).
 
 추가로 Language split 도 여기서 한 번 재 둔다 (씬은 그대로, 문장만 바꾼다):
 
@@ -482,12 +496,18 @@ SFT 대비 RFT 가 얼마나 올랐는가. 커브가 오르기 시작하는 것�
 
 ### 4-2. 커브가 오르지 않을 때
 
-로그의 `무신호그룹` 비율부터 본다:
-- ~100% → `temperature` 를 올린다(1.6 → 1.8). 그룹이 전멸/전승으로 쏠린 것
-  — 전멸 쪽이면 애초에 SFT 베이스라인이 너무 낮은 것일 수 있다
-- 낮은데도 평평 → 진단항으로 어디서 막혔는지 가른다:
-  `grasp_lift_diag` 가 낮으면 블록을 집어 들지를 못하는 것,
-  높은데 성공률이 낮으면 배치 정밀도 — `yaw_diag` 로 각도 문제인지 본다
+로그의 `그룹 used/attempts` 부터 본다. 무신호 그룹은 이제 재샘플링으로 흡수되므로
+(dynamic sampling), **배치를 채웠는지**가 첫 지표다:
+
+- `used < groups_per_step` 이 계속됨 → 시도 상한까지 가도 신호 있는 그룹이 안
+  나온다. `temperature` 를 올리거나(1.6 → 1.8), SFT 베이스라인이
+  30% 게이트를 넘는지 다시 볼 것 — 대개 후자다
+- 배치는 채우는데 커브가 평평 → 워커 `diag` 로 어디서 막혔는지 가른다:
+  `lifted` 가 낮으면 블록을 집어 들지를 못하는 것, 높은데 성공률이 낮으면
+  배치 정밀도 — `yaw_err` 로 각도 문제인지 본다
+- 성공률이 **정확히 0 으로 고정** → 학습이 아니라 배선을 의심할 것. env 보상은
+  `func × weight × dt` 라 성공해도 ≈0.042 다. 워커의 성공 임계가 절대값
+  (0.5 같은 것)으로 돌아가 있으면 성공이 영원히 안 잡힌다
 - 발산 → `learning_rate` 를 1e-6 → 3e-7, 또는 `kl_coef` 를 0.01 로
 
 ### 4-3. 후속 확장 (지금은 하지 않는다)

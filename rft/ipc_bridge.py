@@ -283,7 +283,7 @@ class RolloutClient:
 
         진단값은 `self.last_diag` 에 남긴다 (보상에 섞으면 0/1 이 아니게 되어
         GRPO 의 그룹 정규화가 망가진다):
-          lifted  — 박스에서 꺼내는 데까지 성공한 env 비율
+          lifted  — 블록을 집어 들어올리는 데까지 성공한 env 비율
           yaw_err — 타깃 블록의 (대칭 접힌) yaw 오차 평균 [rad]
         """
         reply = self._request({"cmd": "step", "action_chunk": action_chunk})

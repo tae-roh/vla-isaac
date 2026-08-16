@@ -3,9 +3,9 @@
 # 블록 배치 태스크 RFT — 이 프로젝트의 핵심 결과를 내는 설정.
 #
 # ★ 이 파일 하나가 클리어런스 곡선의 **점 하나**다.
-#   다른 split 을 돌릴 때는 `task` 와 `log_dir` 을 **함께** 바꾼다
+#   설정을 바꿔 실험을 나눌 때는 `log_dir` 도 함께 바꾼다
 #   (섞이면 어느 점이 무엇으로 학습된 것인지 알 수 없다).
-#   돌리기 전에 그 split 의 SFT 성공률이 30% 이상인지 확인할 것 (개정 §5 게이트).
+#   돌리기 전에 SFT 베이스라인이 30% 이상인지 확인할 것 (개정 §5 게이트).
 #
 # 규모는 축소했다:
 #   SimpleVLA-RL 레퍼런스가 8× A100 에서 스텝당 ~20분(롤아웃 88%), 300스텝 ~4.3일.
@@ -22,6 +22,10 @@
 checkpoint: ""                    # --checkpoint 로 넘기거나 여기에 채운다
 task: VlaPlace-v0                 # 등록된 태스크는 이것 하나뿐이다
 bank: train                       # 초기 상태 뱅크. 평가 홀드아웃(eval_base)과 달라야 한다
+# 액션 언노멀라이즈 통계 키. **체크포인트 안의** norm_stats 에서 찾는다
+# (SFT 가 dataset_statistics.json 으로 함께 저장한다). 파일에서 따로 읽지 않는다 —
+# 같은 숫자의 출처가 둘이면 갈라지고, 그때 증상은 "RFT 만 액션 스케일이 다름" 이다.
+unnorm_key: vla_pick
 isaaclab_python: ~/env_isaaclab/bin/python
 
 # --- 롤아웃 ---
@@ -30,7 +34,16 @@ isaaclab_python: ~/env_isaaclab/bin/python
 #   collect_group(init_index=…) 가 전 env 에 같은 s₀ 를 넣는다.
 num_envs: 8
 group_size: 8
-groups_per_step: 2
+groups_per_step: 2                # 한 업데이트에 쓸 **유효** 그룹 수
+
+# dynamic sampling (DAPO / SimpleVLA-RL). 전멸·전승 그룹은 advantage 가 0 이라
+# 버리고 다시 뽑아 배치를 채운다. 건너뛰기만 하면 성공률이 낮은 초기에
+# 업데이트가 거의 일어나지 않은 채 스텝만 흐른다.
+dynamic_sampling: true
+# 한 스텝의 그룹 시도 상한 (0 = groups_per_step 의 3배).
+# 정책이 태스크를 못 풀면 유효 그룹이 영원히 안 나오므로 상한이 필요하다.
+# 로그의 `그룹 used/attempts` 가 계속 상한에 붙으면 온도나 SFT prior 를 의심할 것.
+max_group_attempts: 0
 
 # 에피소드를 짧게 자른다. 스텝 시간에 선형으로 들어가는 항목이라 여기가 가장 효과적이다.
 # 200스텝이면 24Hz 기준 8초 — 이 태스크에 충분하다.

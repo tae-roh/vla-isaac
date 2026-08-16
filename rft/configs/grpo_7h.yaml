@@ -1,0 +1,44 @@
+# =============================================================================
+# rft/configs/grpo_7h.yaml — RTX 6000 PRO (Blackwell 96GB), 7h 예산
+#
+# ★ 실행 전 반드시:
+#     export VLA_DECIMATION=15      # 8Hz. 안 주면 24Hz 로 돌아 정책이 3배 빨라진다
+#     export VLA_STAGED_REWARD=1    # 단계형 보상. 없으면 outcome-only 라 무신호
+#
+# 시간 산정 (실측 앵커: L40S / num_envs=8 / 300스텝 = 6.0s/에피소드)
+#   RTX 6000 PRO 추론 1.6배 가정 → 200스텝 기준 2.5s/에피소드
+#   스텝당 = 롤아웃(에피소드수 × 2.5s) + 학습(청크수/배치 × 0.5s)
+#   ⚠ 추정이다. 첫 10스텝의 실제 소요를 보고 total_steps 를 조정할 것.
+# =============================================================================
+
+checkpoint: ""
+task: VlaPlace-v0
+# ★ 커리큘럼 30% 를 섞은 뱅크. 원래 분포에서 트레이 진입률이 2.5% 라 마지막
+#   단계에 신호가 거의 없다. 커리큘럼 초기 상태에서는 실측 50% 가 나왔다.
+#   평가는 반드시 eval_base(원래 분포)로만 한다.
+bank: train_mix
+isaaclab_python: ~/env_isaaclab/bin/python
+
+num_envs: 8
+group_size: 8
+groups_per_step: 2
+max_steps_per_episode: 200        # 8Hz 에서 25초. 성공 유지 2초를 충분히 담는다
+
+# 온도. SimpleVLA-RL 은 1.6 을 쓰지만 그건 성공률이 이미 높은 정책 기준이다.
+# 우리 정책은 샘플링만 켜도 파지가 15%→7.5% 로 떨어졌다 — 궤적이 쉽게 망가진다.
+# 낮춰 시작하고, 로그의 무신호그룹 비율이 높으면 올린다.
+temperature: 1.2
+
+learning_rate: 1.0e-6
+clip_eps: 0.2
+clip_eps_high: 0.28
+kl_coef: 0.0
+max_grad_norm: 1.0
+total_steps: 320
+
+log_dir: logs/grpo_7h
+save_every: 40
+eval_every: 40
+wandb_project: ""
+device: cuda:0
+seed: 0
