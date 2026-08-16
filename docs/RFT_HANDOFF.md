@@ -180,23 +180,23 @@ datasets/init_states/eval_base.npz  평가 홀드아웃 (원래 분포만)
 
 ---
 
-## 6. ⚠ norm_stats 경로 충돌 (반드시 확인)
+## 6. 정규화 통계 — 체크포인트 내장을 쓴다
 
-학습 머신과 이 저장소의 디렉터리 규약이 다르다.
+`--norm-stats` 플래그는 **없다** (병합으로 제거됐다). 파일과 체크포인트라는 두
+출처가 갈라지는 것을 막기 위해서다. `predict_action` 이 `unnorm_key` 로 모델
+안의 통계를 찾아 쓰고, 키가 없으면 명시적으로 에러를 낸다.
 
 ```
-학습 머신:  datasets/rlds/           = 8Hz 데이터
-이 저장소:  datasets/rlds/           = 24Hz
-            datasets/rlds_8hz/       = 8Hz   ← 체크포인트가 쓴 통계
+--unnorm-key vla_pick     (기본값)
 ```
 
-병합 시 `datasets/rlds/norm_stats.json` 이 충돌했고, **이 저장소 규약(24Hz)을
-유지**했다. 8Hz 통계는 `datasets/rlds_8hz/norm_stats.json` 에 있고 origin 버전과
-바이트 단위로 동일함을 확인했다.
+`ckpt/sft/config.json` 의 `norm_stats["vla_pick"]` 에 8Hz 통계가 심겨 있음을
+확인했다 (q99[0] = 0.1467). 체크포인트를 새로 만들면
+`scripts/sft/embed_norm_stats.py` 로 심어야 한다.
 
-**평가·RFT 는 반드시 `datasets/rlds_8hz/norm_stats.json` 을 명시할 것.**
-`eval_rollout.py` 의 `--norm-stats` 기본값은 24Hz 쪽을 가리킨다. 틀리면 액션
-스케일이 3배 어긋나는데 에러는 안 난다.
+⚠ 참고: 학습 머신은 `datasets/rlds/` 에 8Hz 데이터를 뒀지만 이 저장소는
+`rlds/`=24Hz, `rlds_8hz/`=8Hz 로 나눈다. 파일을 직접 읽는 코드를 새로 쓸 때만
+주의하면 된다 (평가 경로는 이제 파일을 안 읽는다).
 
 ---
 
@@ -216,8 +216,7 @@ datasets/init_states/eval_base.npz  평가 홀드아웃 (원래 분포만)
 
 ```bash
 ~/env_eval/bin/python -u scripts/eval_rollout.py \
-    --checkpoint ckpt/sft --num-episodes 40 --num-envs 8 \
-    --norm-stats datasets/rlds_8hz/norm_stats.json
+    --checkpoint ckpt/sft --num-episodes 40 --num-envs 8
 ```
 
 ### 태스크 완화 이력 (헐거운 split)
