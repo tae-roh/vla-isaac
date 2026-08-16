@@ -22,7 +22,12 @@ torchvision==0.17.0
 torchaudio==2.2.0
 
 # --- 모델/학습 스택 ---
-transformers==4.40.1          # openvla-oft 가 이 버전 기준. 상향 시 prismatic 모델 로딩이 깨진다
+# ★ transformers 는 PyPI 판이 아니라 openvla-oft 의 포크다 (2026-08-15 확인).
+#   포크 = v4.40.1 + 커밋 하나("Customize Llama modeling code for OpenVLA-OFT:
+#   Full bidirectional attention"). 버전 문자열도 4.40.1 이라 핀은 그대로 맞는다.
+#   PyPI 판으로 학습하면 액션 토큰 구간이 causal mask 로 학습되어 OFT 의 병렬
+#   디코딩 전제가 깨진다 — 에러 없이 성능만 무너지는 종류다.
+transformers @ git+https://github.com/moojink/transformers-openvla-oft.git
 tokenizers==0.19.1
 peft==0.11.1                  # LoRA r=32
 accelerate>=0.32.1
@@ -32,12 +37,32 @@ huggingface_hub>=0.24
 # --- RLDS 데이터 로딩 ---
 # SFT 인스턴스는 렌더를 하지 않으므로 tensorflow 는 CPU 판이면 충분하고,
 # GPU 판은 VRAM 을 선점해 학습 배치를 깎아먹는다.
+# 다만 openvla-oft(와 dlimp)가 `tensorflow==2.15.0` 을 하드 의존으로 걸어서
+# GPU 판도 같이 깔린다 — 지울 수 없다. 대신 상류가 스스로 막는다:
+#   prismatic/vla/datasets/rlds/dataset.py:35  tf.config.set_visible_devices([], "GPU")
+# 학습 경로 import 후 TF 가시 GPU 가 []인 것을 확인했다 (2026-08-15).
+# → 스모크의 "TensorFlow 가 GPU 를 잡고 있다" 경고는 이 스택에서는 오경보다.
 tensorflow-cpu==2.15.0
 tensorflow-datasets==4.9.3
-dlimp @ git+https://github.com/kvablack/dlimp@5edaa4691567873d495633f2708982b42edf1972
+# ★ protobuf 3계열 고정 (2026-08-15). tensorflow-metadata 는 python<3.11 에서
+#   protobuf<4.21 을 요구하는데, 최신판(1.21.0)은 protoc 5.x 로 생성한 pb2 를
+#   담고 있어 그 조합이 성립하지 않는다 → import 시
+#   "cannot import name 'runtime_version' from 'google.protobuf'".
+#   1.16.1 이 protobuf 3.20.3 과 맞는 마지막 조합이다.
+tensorflow-metadata==1.16.1
+protobuf==3.20.3
+# dlimp 도 openvla-oft 가 쓰는 포크로 맞춘다 (kvablack@5edaa46 + "Set
+# options.deterministic = True" 한 커밋). 원래 핀(kvablack@5edaa46)은 그 부모라
+# 내용은 거의 같지만, URL 이 다르면 pip 이 openvla-oft 설치 자체를 거부한다.
+# URL 은 openvla-oft 의 pyproject 와 문자 단위로 같아야 한다 (.git 을 붙이면
+# pip 이 다른 요구사항으로 보고 ResolutionImpossible 을 낸다).
+dlimp @ git+https://github.com/moojink/dlimp_openvla
 
 # --- 실험 관리 ---
-wandb>=0.17
+# wandb 는 protobuf 3.20 을 쓰는 마지막 계열로 내린다. 0.18+ 는 proto v3 지원을
+# 빼서 위 protobuf 핀과 같이 쓰면 import 단계에서 죽는다
+# (ImportError: cannot import name 'Imports' from wandb.proto.wandb_telemetry_pb2).
+wandb==0.17.9
 draccus==0.8.0                # openvla-oft 의 CLI 파서. 버전 민감
 tqdm>=4.66
 rich>=13.0
