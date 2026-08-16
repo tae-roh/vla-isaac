@@ -52,7 +52,7 @@ def bank_path(name: str) -> Path:
 # -----------------------------------------------------------------------------
 # 샘플링
 # -----------------------------------------------------------------------------
-def sample_bank(size: int, seed: int) -> np.ndarray:
+def sample_bank(size: int, seed: int, curriculum_frac: float = 0.0) -> np.ndarray:
     """초기 상태 뱅크를 만든다. Shape (size, SPEC.INIT_STATE_DIM).
 
     제약 (개정 §2-6):
@@ -63,6 +63,22 @@ def sample_bank(size: int, seed: int) -> np.ndarray:
         삐져나가면 카메라 ROI 검사와 어긋난다.
       - 타깃 블록은 반드시 보이도록 → 겹침이 없으므로 자동으로 만족된다.
         "묻힌 타깃"은 별도 hard split 으로 만든다 (지금은 만들지 않는다).
+
+    curriculum_frac: 타깃 블록을 **트레이 근처에** 놓는 행의 비율 (0~1).
+
+      ★ 왜 필요한가
+        SFT 정책의 트레이 진입률이 2.5% 라, GRPO 의 마지막 단계에 신호가 거의
+        없다. 운반 거리를 짧게 만든 초기 상태를 섞으면 우연한 성공이 늘어
+        그 단계에도 학습 신호가 생긴다 (자동 커리큘럼).
+
+      ⚠ 이 행들은 SFT 가 **초기 상태로는 본 적 없는** 배치다. 데모에서 블록이
+        트레이 근처에 오는 순간은 언제나 "그리퍼에 들려 공중에" 있는 상태였고,
+        "테이블에 놓인 채 + 팔은 홈 포지션" 조합은 새롭다. 그래서 비율을 낮게
+        두고(기본 0.3) 나머지는 원래 분포로 채운다 — 순수 커리큘럼으로 오래
+        학습하면 원래 분포에서의 성능이 드리프트한다.
+
+      ★ 평가 뱅크에는 절대 쓰지 않는다. 평가는 원래 분포로만 한다
+        (그래야 숫자가 학습 목표 분포를 대변한다).
     """
     rng = np.random.default_rng(seed)
     bx, by = SPEC.SPAWN_CENTER
@@ -77,10 +93,21 @@ def sample_bank(size: int, seed: int) -> np.ndarray:
     targets = np.arange(size) % n
     rng.shuffle(targets)
 
+    # 커리큘럼 행은 앞쪽에 모으되, targets 가 이미 셔플돼 있어 색 배분은 고르다.
+    n_curriculum = int(round(size * float(curriculum_frac)))
     rows = np.zeros((size, SPEC.INIT_STATE_DIM), dtype=np.float64)
     for k in range(size):
         xy = _sample_non_overlapping(rng, n, bx, by, half_x, half_y)
         yaw = rng.uniform(-math.pi, math.pi, size=n)
+        if k < n_curriculum:
+            # 타깃만 트레이 앞쪽으로 옮긴다. 나머지 블록은 원래 자리에 둬서
+            # 화면 구성이 통째로 달라지지 않게 한다 (OOD 를 최소로).
+            tx, ty = SPEC.TRAY_CENTER
+            offset = SPEC.tray_half_extent() + SPEC.CURRICULUM_TRAY_GAP
+            xy[targets[k]] = (
+                tx + rng.uniform(-offset, offset),
+                ty - offset - rng.uniform(0.0, SPEC.CURRICULUM_TRAY_GAP),
+            )
         rows[k, : 3 * n] = np.stack([xy[:, 0], xy[:, 1], yaw], axis=1).reshape(-1)
         rows[k, 3 * n] = targets[k]
     return rows

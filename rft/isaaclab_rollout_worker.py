@@ -80,6 +80,7 @@ def main() -> int:
     import vla_isaac_tasks  # noqa: F401  — gym.register
     from isaaclab_tasks.utils import parse_env_cfg
     from rft.ipc_bridge import PROTOCOL_VERSION, recv_message, send_message
+    from vla_isaac_tasks.mdp import observations as _obs_mod
     from vla_isaac_tasks.mdp import set_forced_indices, use_bank
     from vla_isaac_tasks.spec import SPEC
 
@@ -112,8 +113,51 @@ def main() -> int:
         # 진단 래치: "박스에서 꺼내는 것까지는 됐는가".
         # 커브가 평평할 때 파지 실패인지 배치 정밀도 문제인지 가르는 값이다.
         lift_latch = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        grasp_latch = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        height_max = torch.zeros(num_envs, dtype=torch.float32, device=device)
+        tray_latch = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        # 파지 "유지" 카운터. 스치듯 잡았다 놓친 것에 크레딧을 주지 않는다.
+        # ★ 놓친 것에 **패널티를 주지는 않는다**. 파지 보상 0.2 보다 큰 벌점을
+        #   주면 "아예 안 잡는" 쪽이 이득이 되어 정책이 블록을 회피하게 된다
+        #   (shaping 의 전형적 실패). 인정 조건만 엄격히 하고 재시도는 자유롭게.
+        grasp_run = torch.zeros(num_envs, dtype=torch.int32, device=device)
 
         # ---------------------------------------------------------------
+        # 단계형 sparse 보상 (VLA_STAGED_REWARD=1 로 켠다. 기본은 outcome-only)
+        #
+        # ★ 왜 필요한가
+        #   outcome-only 는 그룹 전체가 실패하면 표준편차가 0 이라 어드밴티지가
+        #   0 이 된다 (grpo_fallback.compute_group_advantages). 그래서 SimpleVLA-RL
+        #   은 성공률 몇 % 를 착수 조건으로 요구한다. 우리 SFT 는 최종 성공이
+        #   0% 지만 파지 60% / 리프트 22.5% 로 **중간 단계에는 분산이 있다**.
+        #   단계를 나누면 그 분산이 학습 신호가 된다.
+        #
+        # ★ 반복 수확 방지
+        #   각 이벤트는 래치라 에피소드당 한 번만 켜지고, 보상은 켜진 단계들의
+        #   **최댓값 하나**다. 누적이 아니므로 같은 이벤트를 반복해도 늘지 않고,
+        #   한 번 얻은 단계를 잃지도 않는다(뒤로 갈 유인이 없다).
+        #
+        # ★ 보고는 outcome 으로
+        #   diag["success"] 에 원래 기준의 성공률을 따로 실어 보낸다. 학습을
+        #   단계 보상으로 하더라도 최종 숫자는 outcome 으로 보고할 것.
+        STAGED = os.environ.get("VLA_STAGED_REWARD", "") in ("1", "true", "True")
+        STAGE_GRASP, STAGE_LIFT, STAGE_TRAY = 0.2, 0.4, 0.7
+        # 파지를 인정하는 최소 유지 스텝 (8Hz 기준 4스텝 = 0.5초)
+        GRASP_HOLD_STEPS = int(os.environ.get("VLA_GRASP_HOLD_STEPS", 4))
+
+        def _reward():
+            if not STAGED:
+                return success_latch.float()
+            r = torch.zeros(num_envs, dtype=torch.float32, device=device)
+            r = torch.maximum(r, grasp_latch.float() * STAGE_GRASP)
+            r = torch.maximum(r, lift_latch.float() * STAGE_LIFT)
+            r = torch.maximum(r, tray_latch.float() * STAGE_TRAY)
+            return torch.maximum(r, success_latch.float())
+
+        if STAGED:
+            log(f"단계형 보상 ON — 파지 {STAGE_GRASP} / 리프트 {STAGE_LIFT} / "
+                f"트레이 {STAGE_TRAY} / 성공 1.0")
+
         def extract_obs(obs_dict) -> dict:
             """VLA 가 받을 관측만 추려서 numpy 로 바꾼다."""
             policy = obs_dict["policy"]
@@ -199,6 +243,10 @@ def main() -> int:
                     success_latch.zero_()
                     done_latch.zero_()
                     lift_latch.zero_()
+                    grasp_latch.zero_()
+                    height_max.zero_()
+                    tray_latch.zero_()
+                    grasp_run.zero_()
                     send_ok({"obs": extract_obs(obs_dict)})
 
                 elif cmd == "step":
@@ -232,6 +280,38 @@ def main() -> int:
                         sub = obs_dict.get("subtask_terms")
                         if sub is not None and "grasp_lift" in sub:
                             lift_latch |= sub["grasp_lift"].bool()
+                        # ★ lifted 가 0 일 때 "전혀 못 들었다" 와 "들었지만
+                        #   60mm 임계에 못 미쳤다" 를 구분할 수 없어 진단이 막힌다.
+                        #   실제 도달 높이와 파지 여부를 따로 기록해 둔다.
+                        # ★ env 는 gym 래퍼다. observations 의 함수들은
+                        #   ManagerBasedRLEnv 를 기대하므로 unwrapped 를 넘긴다.
+                        #   (래퍼를 넘기면 조용히 예외가 나 계측이 0 으로 남는다)
+                        _u = env.unwrapped
+                        h = _obs_mod.target_height_above_table(_u).squeeze(-1)
+                        height_max = torch.maximum(height_max, h)
+                        # ★ 파지 판정에 "블록이 실제로 떴는가" 를 덧붙인다.
+                        #   target_grasped 는 eef-블록 거리 60mm + 그리퍼 폭
+                        #   60mm 미만이면 참이라, **닫힌 빈 손이 블록 옆을
+                        #   지나가기만 해도** 켜진다. 보상 단계로 쓰면 거의 공짜다.
+                        #   놓인 중심(블록높이/2)보다 5mm 위를 함께 요구해
+                        #   "쥐고 움직였다" 는 증거를 붙인다.
+                        _rest = SPEC.BLOCK_SIZE[2] / 2
+                        _g_now = _obs_mod.target_grasped(_u) & (h > _rest + 0.005)
+                        grasp_run = torch.where(
+                            _g_now, grasp_run + 1, torch.zeros_like(grasp_run)
+                        )
+                        grasp_latch |= grasp_run >= GRASP_HOLD_STEPS
+                        lift_latch |= _obs_mod.grasp_lift_signal(_u)
+                        # 트레이 진입. 두 가지를 함께 요구한다:
+                        #   settled — 튕겨 지나가는 한 프레임으로 크레딧을 주지 않는다
+                        #   lift_latch — 들지 않고 **끌어서 밀어넣는** 해를 막는다
+                        #     (박스가 사라져 지금은 끌기가 물리적으로 가능하다)
+                        _settled = torch.linalg.norm(
+                            _obs_mod.target_block_lin_vel(_u), dim=-1
+                        ) < SPEC.SUCCESS_LIN_VEL_THRESHOLD
+                        tray_latch |= (
+                            _obs_mod.block_in_tray(_u) & _settled & lift_latch
+                        )
                         # 성공은 reward>0 으로 판정한다. RewardsCfg 의 success 항이
                         # weight=1.0 인 유일한 항이므로 reward 가 곧 0/1 성공이다.
                         # (진단용 grasp_lift_diag 는 weight=0 이라 섞이지 않는다)
@@ -243,10 +323,14 @@ def main() -> int:
                     yaw = obs_dict["policy"].get("yaw_err")
                     send_ok({
                         "obs": extract_obs(obs_dict),
-                        "reward": success_latch.float().cpu().numpy(),
+                        "reward": _reward().cpu().numpy(),
                         "done": done_latch.cpu().numpy(),
                         "diag": {
                             "lifted": float(lift_latch.float().mean()),
+                            "grasped": float(grasp_latch.float().mean()),
+                            "height_max": float(height_max.max()),
+                            "in_tray": float(tray_latch.float().mean()),
+                            "success": float(success_latch.float().mean()),
                             "yaw_err": (
                                 float(yaw.mean()) if yaw is not None else float("nan")
                             ),

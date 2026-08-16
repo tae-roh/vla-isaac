@@ -63,3 +63,6 @@ env_*/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 롤아웃/데모 mp4. 재생성 가능하고 용량만 먹는다.
+videos/

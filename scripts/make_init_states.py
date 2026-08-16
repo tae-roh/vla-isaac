@@ -69,6 +69,12 @@ def main() -> int:
     parser.add_argument("--size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--show", metavar="NAME", default=None, help="내용만 출력")
+    parser.add_argument(
+        "--curriculum-frac", type=float, default=0.0,
+        help="타깃 블록을 트레이 근처에 놓는 행의 비율 (0~1). GRPO 의 마지막 "
+             "단계에 신호를 만들기 위한 커리큘럼이다. ★ 평가 뱅크에는 쓰지 말 것 "
+             "— 평가는 원래 분포로만 해야 숫자가 의미를 갖는다.",
+    )
     parser.add_argument("--force", action="store_true", help="기존 파일 덮어쓰기")
     args = parser.parse_args()
 
@@ -87,7 +93,10 @@ def main() -> int:
               "★ 덮어쓰면 이전 실험과 초기 상태가 달라져 비교가 깨진다.")
         return 1
 
-    bank = init_states.sample_bank(size, seed)
+    if is_eval and args.curriculum_frac:
+        print("평가 뱅크에는 커리큘럼을 섞지 않는다 — 원래 분포로만 평가할 것.")
+        return 1
+    bank = init_states.sample_bank(size, seed, curriculum_frac=args.curriculum_frac)
     init_states.save_bank(args.name, bank, seed)
     print(f"뱅크 '{args.name}' 생성: {len(bank)}개 (시드 {seed}) → {path}")
     return show(args.name)
