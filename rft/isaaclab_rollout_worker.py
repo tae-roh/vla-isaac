@@ -50,8 +50,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    args = parse_args()
-
     # ★ 프로토콜용 stdout 을 Isaac Sim 이 오염시키기 전에 떼어낸다.
     #
     #   브리지는 워커의 stdout 에서 "길이 접두어 + 본문" 을 읽는다. 그런데
@@ -63,9 +61,18 @@ def main() -> int:
     #
     #   그래서 AppLauncher 를 띄우기 **전에** fd 1 을 복제해 프로토콜 전용으로
     #   쓰고, fd 1 자체는 stderr 로 돌려 Isaac Sim 의 출력이 로그로 가게 한다.
+    #
+    # ★ 이 블록은 parse_args() **보다도 앞**이어야 한다. parse_args() 는 인자
+    #   정의를 위해 `from isaaclab.app import AppLauncher` 를 하는데, EULA 를
+    #   수락하지 않은 환경에서는 **그 import 만으로** Kit 이 동의 프롬프트
+    #   240바이트를 fd 1 에 쓴다 (실측). 예전에는 이 블록이 parse_args() 뒤에
+    #   있어서 그 240바이트가 그대로 프로토콜 스트림에 섞였고, 증상은
+    #   "워커 왕복 MemoryError" 하나로만 나타났다.
     _proto_fd = os.dup(1)
     os.dup2(2, 1)
     proto_out = os.fdopen(_proto_fd, "wb")
+
+    args = parse_args()
 
     from isaaclab.app import AppLauncher
 

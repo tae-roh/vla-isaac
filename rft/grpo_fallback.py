@@ -39,6 +39,12 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
+# ★ 체크포인트의 원격 코드(modeling_prismatic.py)가 `import prismatic` 을 요구한다.
+#   eval_rollout.py 와 **같은 셰임**을 쓴다 — 두 경로가 서로 다른 prismatic 을
+#   보면 액션 마스크 규약이 갈라져도 알 방법이 없다 (--verify-checkpoint 는
+#   같은 프로세스 안에서 두 경로를 비교하므로 이 어긋남을 잡지 못한다).
+#   셰임에는 torch 2.7 호환 수정이 들어 있다 (vendor/README.md 참조).
+sys.path.insert(0, str(REPO_ROOT / "vendor"))
 
 _spec_mod = importlib.util.spec_from_file_location(
     "vla_spec", REPO_ROOT / "configs" / "vla_spec.py"
@@ -75,6 +81,37 @@ class GRPOConfig:
     # 한다 (SFT 가 dataset_statistics.json 으로 함께 저장한다).
     unnorm_key: str = "vla_pick"
 
+    # --- LoRA ---
+    # ★ 체크포인트 본체는 SFT LoRA 가 **병합된** 가중치다
+    #   (scripts/sft/run_sft_libero_spec.sh 가 --merge_lora_during_training True,
+    #    openvla-oft/vla-scripts/finetune.py:653-661 이 merge_and_unload 후 저장).
+    #   그래서 from_pretrained 하면 7.54B 전 파라미터가 requires_grad=True 가 되고,
+    #   그대로 두면 **LoRA 가 아니라 풀 파인튜닝**이 된다 (설계 의도와 다르고
+    #   옵티마이저 상태만 30GB 다). 여기서 새 어댑터를 붙여 학습면을 좁힌다.
+    #
+    #   ⚠ ckpt/sft/lora_adapter/ 를 다시 얹으면 **이중 적용**이다. 그건 이미
+    #     본체에 병합돼 있다. 반드시 새 어댑터를 0 에서 시작한다.
+    #     (init_lora_weights="gaussian" 은 A 만 가우시안, B 는 0 → 붙인 직후
+    #      정책은 SFT 와 수치적으로 동일하다. --verify-checkpoint 로 확인 가능)
+    use_lora: bool = True
+    # SFT 와 같은 형상. rank 를 바꾸면 SFT 가 쓰던 방향을 표현하지 못하거나
+    # (낮출 때) 검증되지 않은 방향이 열린다(높일 때). 평가 분산이 ±10%p 라
+    # rank 차이는 어차피 측정되지 않으므로 축을 늘리지 않는다.
+    # (SimpleVLA-RL 은 LoRA 를 쓰지 않는다 — 8×A800 FSDP 풀 파인튜닝이라
+    #  물려받을 rank 값 자체가 없다. 근거는 SFT 쪽에서 가져왔다.)
+    lora_rank: int = 32
+    lora_alpha: int = 16          # α/r = 0.5. SFT 와 동일한 보수적 스케일
+    lora_dropout: float = 0.0
+    # SFT 어댑터가 건드린 15개 모듈 그대로. LLM(q/k/v/o/gate/up/down)뿐 아니라
+    # 비전 백본(qkv/proj/fc1/fc2 — DINOv2 + SigLIP 둘 다)과 lm_head 를 포함한다.
+    lora_target_modules: list = field(
+        default_factory=lambda: [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+            "qkv", "proj", "fc1", "fc2", "fc3", "q", "kv", "lm_head",
+        ]
+    )
+
     # 최적화
     learning_rate: float = 1e-6
     clip_eps: float = 0.2
@@ -83,12 +120,19 @@ class GRPOConfig:
     clip_eps_high: float = 0.28
     kl_coef: float = 0.0          # 0 = KL 항 없음 (SimpleVLA-RL 기본)
     max_grad_norm: float = 1.0
+    # 같은 롤아웃 배치로 밟는 그래디언트 스텝 수 (PPO inner epoch).
+    #   1 = ratio≡1 이라 클리핑이 죽는다 → 실효 REINFORCE (+그룹 baseline).
+    #   2+ = 두 번째 패스부터 ratio≠1 → 클리핑(트러스트 리전)이 실제로 작동한다.
+    # SimpleVLA-RL 은 512궤적에 4회(mini_batch 128×4). 우리는 16궤적이라
+    # 배치 대비 재사용 비율을 낮게(2) 잡는다 — 작은 배치에 4회는 과적합이다.
+    ppo_epochs: int = 1
     total_steps: int = 300
 
     # 로깅/체크포인트
     log_dir: str = "logs/grpo"
     save_every: int = 25
-    eval_every: int = 25
+    eval_every: int = 25          # 0 이면 끈다. 이제 실제로 쓰인다 (train() 참조)
+    eval_episodes: int = 16       # eval_base 홀드아웃에서 뽑을 에피소드 수
     wandb_project: str = ""
 
     device: str = "cuda:0"
@@ -143,6 +187,16 @@ def degenerate_fraction(rewards: np.ndarray) -> float:
     return float((std <= 1e-6).mean())
 
 
+def _diag_mean(diags: list, key: str) -> float:
+    """워커 diag 들의 평균. 값이 하나도 없으면 nan (빈 리스트 경고 없이).
+
+    ★ 반드시 **시도한 그룹 전체**의 diag 를 넘길 것. 유효 그룹만 넘기면
+      전멸 그룹이 통계에서 빠져 숫자가 낙관적으로 부풀려진다.
+    """
+    vals = [d[key] for d in diags if isinstance(d, dict) and key in d]
+    return float(np.mean(vals)) if vals else float("nan")
+
+
 def is_degenerate(reward_row: np.ndarray) -> bool:
     """그룹 하나가 전멸(전부 0) 또는 전승(전부 1)인가 → advantage 가 0 이다."""
     return bool(np.std(reward_row) <= 1e-6)
@@ -161,28 +215,62 @@ def action_logits(
       (증상: 롤아웃 성공률이 eval_rollout 로 잰 SFT 성공률과 다르고, GRPO 의
        ratio 가 모델이 구현하지도 않는 분포를 비교한다)
 
-      입력 구성은 모델 자신의 헬퍼(_prepare_input_for_action_prediction)에 맡긴다.
-      손으로 흉내 내면 상류가 배치를 바꿀 때 조용히 어긋난다.
+      입력 구성은 모델 자신의 헬퍼(_prepare_input_for_action_prediction,
+      _prepare_labels_for_action_prediction)에 맡긴다. 손으로 흉내 내면 상류가
+      배치를 바꿀 때 조용히 어긋난다.
+
+    ★ predict_action 이 forward 전에 하는 일이 **3가지**다. 하나라도 빠지면 안 된다:
+        1) 특수 빈 토큰 29871 을 프롬프트 끝에 붙인다. 학습 때 "OUT:" 뒤에
+           있던 토큰이라, 없으면 액션 구간의 위치가 한 칸 밀린다.
+        2) placeholder 액션 토큰 56개 + stop 토큰을 붙인다.
+        3) **labels 를 만든다.** 액션 마스크(_process_action_masks)가 이걸로
+           "어디가 액션 구간인가"를 센다. labels 없이 forward 하면
+           `None != IGNORE_INDEX` 가 파이썬 bool 이 되어
+           `cumsum() received an invalid combination of arguments -
+            got (bool, dim=int)` 로 죽는다 — torch 버전 문제로 오독하기 쉽다.
 
     로짓 슬라이스 위치가 predict_action 과 같은지는 --verify-checkpoint 로 확인한다.
     """
     import torch
+
+    from prismatic.vla.constants import IGNORE_INDEX
 
     inputs = processor(
         SPEC.build_prompt(instruction), SPEC.prepare_image_for_vla(image)
     ).to(device, dtype=torch.bfloat16)
 
     input_ids, attention_mask = inputs["input_ids"], inputs["attention_mask"]
+
+    # (1) 특수 빈 토큰. predict_action 과 같은 조건·같은 방식으로 붙인다.
+    if not torch.all(input_ids[:, -1] == 29871):
+        input_ids = torch.cat(
+            (
+                input_ids,
+                torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device),
+            ),
+            dim=1,
+        )
+
     # placeholder 를 붙이기 **전** 길이여야 한다 (predict_action 과 동일 규약).
+    # ★ 29871 을 붙인 **뒤**에 세는 것도 규약의 일부다 — predict_action 이 그렇다.
     num_prompt_tokens = input_ids.shape[-1] - 1
+
+    # (3) 액션 마스크용 labels. 아래 _prepare_input_for_action_prediction 이
+    #     input_ids 를 늘리기 전 길이로 만들어야 한다 (predict_action 과 동일 순서).
+    labels = input_ids.clone()
+    labels[:] = IGNORE_INDEX
+
+    # (2) placeholder 액션 토큰 + stop 토큰.
     input_ids, attention_mask = model._prepare_input_for_action_prediction(
         input_ids, attention_mask
     )
+    labels = model._prepare_labels_for_action_prediction(labels, input_ids)
 
     out = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         pixel_values=inputs["pixel_values"],
+        labels=labels,
     )
     start = num_patches + num_prompt_tokens
     logits = out.logits[0, start : start + n_action_tokens, :]
@@ -283,20 +371,46 @@ class GRPOTrainer:
         ).to(cfg.device)
 
         # LoRA 파라미터만 학습한다. 7B 전체를 열면 48GB 에 옵티마이저 상태가 안 들어간다.
+        n_total = sum(p.numel() for p in self.model.parameters())
+        if cfg.use_lora:
+            from peft import LoraConfig, get_peft_model
+
+            # ★ 병합된 체크포인트 위에 **새** 어댑터를 얹는다. 기존
+            #   ckpt/sft/lora_adapter/ 를 얹으면 이중 적용이다 (이미 병합돼 있다).
+            #   B=0 초기화라 붙인 직후 정책은 SFT 와 수치적으로 동일하다.
+            self.model = get_peft_model(
+                self.model,
+                LoraConfig(
+                    r=cfg.lora_rank,
+                    lora_alpha=cfg.lora_alpha,
+                    lora_dropout=cfg.lora_dropout,
+                    target_modules=list(cfg.lora_target_modules),
+                    init_lora_weights="gaussian",
+                    bias="none",
+                ),
+            )
+
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         if not trainable:
             raise RuntimeError(
                 "학습 가능한 파라미터가 없다. LoRA 어댑터가 붙은 체크포인트인지 확인할 것 "
                 "(SFT 시 merge_lora_during_training=True 였다면 새로 LoRA 를 붙여야 한다)."
             )
-        n_train = sum(p.numel() for p in trainable) / 1e6
-        print(f"[grpo] 학습 파라미터 {n_train:.1f}M / "
-              f"전체 {sum(p.numel() for p in self.model.parameters()) / 1e9:.1f}B")
+        n_train = sum(p.numel() for p in trainable)
+        # ★ 비율을 함께 찍는다. 100% 로 나오면 LoRA 가 안 붙어 풀 파인튜닝 중이라는
+        #   뜻이다 — 에러 없이 메모리만 폭증하고 학습 성격이 달라지는 종류라
+        #   로그 한 줄로 즉시 구분되게 둔다.
+        print(f"[grpo] 학습 파라미터 {n_train / 1e6:.1f}M / 전체 {n_total / 1e9:.2f}B "
+              f"({n_train / n_total * 100:.2f}%)"
+              + (f" — LoRA r={cfg.lora_rank}, α={cfg.lora_alpha}"
+                 if cfg.use_lora else " — ⚠ 풀 파인튜닝"))
 
         self.optimizer = torch.optim.AdamW(trainable, lr=cfg.learning_rate)
 
         # 초기 상태 뱅크 커서. 그룹을 하나 뽑을 때마다 나아간다 (재샘플링 포함).
         self._init_cursor = 0
+        # 한 스텝에서 시도한 그룹들의 diag (버린 그룹 포함). train() 이 스텝마다 비운다.
+        self._step_diags: list = []
 
         # --- parallel decoding 에 필요한 상수 (체크포인트에서 읽는다) ---
         # 액션 토큰 수 = 청크 × 액션 차원. OFT 는 이만큼을 한 번에 예측한다.
@@ -463,9 +577,109 @@ class GRPOTrainer:
         return rewards, transitions, dict(self.client.last_diag)
 
     def _collect_for_sampling(self, init_index: int):
-        """collect_groups 가 요구하는 형태로 감싼다 → (보상, 나머지 페이로드)."""
+        """collect_groups 가 요구하는 형태로 감싼다 → (보상, 나머지 페이로드).
+
+        ★ diag 는 여기서 따로 쌓는다. collect_groups 는 무신호 그룹의 페이로드를
+          버리므로, 반환값만 보면 **버려진 그룹의 진단이 사라진다** — 그러면
+          성공률·파지율이 "유효 그룹만" 기준이 되어 낙관적으로 부풀려진다.
+          (transitions 는 이미지가 들어 있어 버리는 게 맞다. diag 만 남긴다)
+        """
         rewards, transitions, diag = self.collect_group(init_index)
+        self._step_diags.append(diag)
         return rewards, (transitions, diag)
+
+    # -------------------------------------------------------------------------
+    def evaluate(self, num_episodes: int) -> dict:
+        """eval_base 홀드아웃에서 greedy 성공률을 잰다 (학습 스텝 사이에 낀다).
+
+        ★ 왜 eval_rollout.py 를 서브프로세스로 부르지 않는가
+          그러면 Isaac Sim 워커가 하나 더 뜬다 — 셰이더 캐시가 있어도 기동에
+          수십 초~수 분이 들고, 단일 GPU에서 학습용 워커와 VRAM/렌더를
+          나눠 써야 한다. 대신 학습에 이미 떠 있는 self.client 를 그대로 쓰고
+          뱅크만 bank(train/train_mix) → eval_base 로 바꿔 reset 한다 —
+          추가 프로세스 기동 비용이 0이다.
+
+        ★ 왜 샘플링이 아니라 greedy 인가
+          평가 프로토콜은 eval_rollout.py 와 동일해야 SFT/RFT 곡선이 비교
+          가능하다 (개정 §6). RFT 롤아웃의 multinomial 샘플링을 그대로 쓰면
+          eval_every 로 잰 "성공률"이 eval_rollout.py 로 잰 값과 어긋난다.
+
+        비용: eval_episodes 를 작게 유지할 것 (기본 16). num_envs=8 이면
+        라운드 2개 = 학습 그룹 2개를 도는 것과 같은 시간이라, eval_every=25~40
+        스텝마다 한 번이면 전체 학습 시간에 몇 % 수준의 지연만 더한다.
+        """
+        import torch
+
+        was_training = self.model.training
+        self.model.eval()
+        t0 = time.time()
+
+        num_envs = self.cfg.num_envs
+        num_rounds = int(np.ceil(num_episodes / num_envs))
+        steps_per_round = int(np.ceil(self.cfg.max_steps_per_episode / SPEC.NUM_ACTIONS_CHUNK))
+
+        successes: list[float] = []
+        # ★ 단계 도달률을 함께 잰다. 원래 분포에서 성공률은 0% 라 그것만 보면
+        #   커브가 평평한 직선이 되어 아무 정보가 없다. 인수인계 문서도 목표를
+        #   "최종 성공률이 아니라 단계 도달률 개선" 으로 잡으라고 적었다.
+        #   래치는 에피소드 안에서 단조 증가하므로 라운드 최댓값을 쓴다
+        #   (eval_rollout.py 와 같은 방식).
+        stages = {k: [] for k in ("grasped", "lifted", "in_tray")}
+        try:
+            for rnd in range(num_rounds):
+                # eval_rollout.py 와 같은 인덱스 스킴 — 같은 뱅크·순서라 SFT 결과와
+                # 직접 비교된다.
+                indices = [
+                    (rnd * num_envs + i) % SPEC.EVAL_HOLDOUT_SIZE for i in range(num_envs)
+                ]
+                obs = self.client.reset(init_indices=indices, bank="eval_base")
+                done = np.zeros(num_envs, dtype=bool)
+                round_stage = {k: 0.0 for k in stages}
+
+                for _ in range(steps_per_round):
+                    images, instr = obs["image"], obs["instruction"]
+                    chunk = np.zeros(
+                        (num_envs, SPEC.NUM_ACTIONS_CHUNK, SPEC.ACTION_DIM),
+                        dtype=np.float32,
+                    )
+                    with torch.no_grad():
+                        for i in range(num_envs):
+                            logits = self._action_logits(images[i], instr[i])
+                            ids = logits.argmax(dim=-1).cpu().numpy()
+                            chunk[i] = tokens_to_action(
+                                ids,
+                                vocab_size=self.model.vocab_size,
+                                bin_centers=np.asarray(self.model.bin_centers),
+                                action_stats=self.model.norm_stats[
+                                    self.cfg.unnorm_key
+                                ]["action"],
+                            )
+                    obs, _, done = self.client.step(chunk)
+                    for k in round_stage:
+                        round_stage[k] = max(
+                            round_stage[k], float(self.client.last_diag.get(k, 0.0))
+                        )
+                    if bool(done.all()):
+                        break
+                for k, v in round_stage.items():
+                    stages[k].append(v)
+
+                # diag 의 이동평균이 아니라 워커가 들고 있는 정확한 래치를 읽는다
+                # (에피소드 단위 성공 플래그, N개 bool).
+                successes.extend(np.asarray(self.client.get_success()).tolist())
+        finally:
+            if was_training:
+                self.model.train()
+
+        rate = float(np.mean(successes)) if successes else 0.0
+        out = {
+            "eval_success_rate": rate,
+            "eval_episodes": len(successes),
+            "eval_elapsed_s": time.time() - t0,
+        }
+        for k, v in stages.items():
+            out[f"eval_{k}_frac"] = float(np.mean(v)) if v else float("nan")
+        return out
 
     # -------------------------------------------------------------------------
     def train(self) -> int:
@@ -484,6 +698,8 @@ class GRPOTrainer:
             # 뱅크 인덱스로 s₀ 를 지정한다. 그룹 안에서는 전 env 가 동일한 s₀ 이고
             # (GRPO 전제), 커서는 시도마다 나아간다 — 재시도에 같은 s₀ 를 다시
             # 쓰면 같은 결과가 나와 재샘플링이 무의미해진다.
+            # 이 스텝에서 시도한 모든 그룹의 diag (버린 것 포함). 위 참조.
+            self._step_diags = []
             used, payloads, attempted, self._init_cursor = collect_groups(
                 collect_fn=self._collect_for_sampling,
                 groups_per_step=cfg.groups_per_step,
@@ -491,14 +707,23 @@ class GRPOTrainer:
                 cursor=self._init_cursor,
             )
             group_transitions = [p[0] for p in payloads]
-            group_diags = [p[1] for p in payloads]
 
-            # ★ 성공률과 무신호 비율은 **버린 그룹까지 포함해** 센다.
-            #   유효 그룹만 세면 전멸 그룹이 통계에서 사라져 성공률이 부풀려진다 —
+            # ★ 진단·성공률은 **버린 그룹까지 포함해** 센다.
+            #   유효 그룹만 세면 전멸 그룹이 통계에서 사라져 숫자가 부풀려진다 —
             #   재샘플링을 켠 순간 로그가 조용히 낙관적으로 변하는 함정이다.
+            #   (_collect_for_sampling 이 시도마다 self._step_diags 에 쌓는다)
+            all_diags = list(self._step_diags)
             attempted_arr = np.stack(attempted)
             degen = degenerate_fraction(attempted_arr)
-            success_rate = float(attempted_arr.mean())
+
+            # ★ reward 평균을 "성공률" 이라 부르면 안 된다.
+            #   VLA_STAGED_REWARD=1 이면 reward 가 0.2/0.4/0.7/1.0 이라 평균이
+            #   0.31 처럼 나오는데, 그것은 "31% 성공" 이 아니라 "파지·리프트까지
+            #   간 에피소드가 섞인 평균 보상" 이다. 실제 outcome 성공률은 워커가
+            #   diag["success"] 로 따로 보낸다 (eval_rollout.py 와 같은 규약).
+            #   인수인계 문서가 함정으로 명시한 오독이라 둘을 분리해 기록한다.
+            mean_reward = float(attempted_arr.mean())
+            success_rate = _diag_mean(all_diags, "success")
 
             # 유효 그룹이 하나도 없으면 group_transitions 도 비어 있어 아래 업데이트
             # 루프가 그냥 돌지 않는다. 그 스텝은 로그만 남는다 —
@@ -506,68 +731,98 @@ class GRPOTrainer:
             rewards = np.stack(used) if used else attempted_arr
             advantages = compute_group_advantages(rewards)
 
-            # --- 정책 업데이트 (PPO 클리핑) ---
+            # --- 정책 업데이트 (PPO inner epoch) ---
             # advantage 는 궤적 단위다. 궤적 안의 모든 액션 청크가 같은 advantage 를
-            # 공유한다 (sparse 0/1 보상이라 credit assignment 를 더 쪼갤 근거가 없다).
-            self.optimizer.zero_grad()
+            # 공유한다 (sparse 보상이라 credit assignment 를 더 쪼갤 근거가 없다).
+            #
+            # ★ epoch 1 에서는 파라미터가 수집 시점과 같아 ratio ≡ 1 이고, loss 는
+            #   -mean(adv) = 0 으로 찍힌다 (그룹 정규화라 평균 0). 그래디언트는
+            #   0 이 아니다 — 이 epoch 만 돌리면 실효 REINFORCE 다.
+            # ★ epoch 2+ 는 첫 optimizer.step 이후라 ratio ≠ 1 이고, 그때부터
+            #   클리핑(트러스트 리전)이 실제로 물린다. 우리 ratio 는 56토큰 logp 의
+            #   **합**의 지수라 작은 드리프트도 증폭된다 — clip_frac 으로 감시한다.
             total_loss = 0.0
             num_terms = 0
+            ratio_max = 1.0
+            clip_hits = 0
+            clip_total = 0
 
-            for gi, transitions in enumerate(group_transitions):
-                adv_row = torch.tensor(
-                    advantages[gi], device=cfg.device, dtype=torch.float32
-                )
-                # advantage 가 전부 0 인 그룹은 그래디언트가 0 이므로 건너뛴다
-                # (forward 비용만 나가고 얻는 게 없다).
-                if float(adv_row.abs().max()) < 1e-8:
-                    continue
+            for _ppo_epoch in range(max(cfg.ppo_epochs, 1)):
+                self.optimizer.zero_grad()
+                epoch_terms = 0
 
-                for images, tokens, behavior_logp, instructions in transitions:
-                    new_logp = self._recompute_logp(images, tokens, instructions)
-                    ratio = torch.exp(new_logp - behavior_logp.to(new_logp.dtype))
-                    unclipped = ratio * adv_row
-                    clipped = (
-                        torch.clamp(
-                            ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps_high
-                        )
-                        * adv_row
+                for gi, transitions in enumerate(group_transitions):
+                    adv_row = torch.tensor(
+                        advantages[gi], device=cfg.device, dtype=torch.float32
                     )
-                    loss = -torch.min(unclipped, clipped).mean()
+                    # advantage 가 전부 0 인 그룹은 그래디언트가 0 이므로 건너뛴다
+                    # (forward 비용만 나가고 얻는 게 없다).
+                    if float(adv_row.abs().max()) < 1e-8:
+                        continue
 
-                    if cfg.kl_coef > 0:
-                        # 사전학습 정책 대비 KL 예산. SimpleVLA-RL 기본은 0 이지만,
-                        # 정책이 발산하면 여기를 켜는 것이 첫 번째 대응이다.
-                        approx_kl = (behavior_logp.to(new_logp.dtype) - new_logp).mean()
-                        loss = loss + cfg.kl_coef * approx_kl
+                    for images, tokens, behavior_logp, instructions in transitions:
+                        new_logp = self._recompute_logp(images, tokens, instructions)
+                        ratio = torch.exp(new_logp - behavior_logp.to(new_logp.dtype))
+                        with torch.no_grad():
+                            ratio_max = max(ratio_max, float(ratio.max()))
+                            clip_hits += int(
+                                (
+                                    (ratio < 1 - cfg.clip_eps)
+                                    | (ratio > 1 + cfg.clip_eps_high)
+                                ).sum()
+                            )
+                            clip_total += int(ratio.numel())
+                        unclipped = ratio * adv_row
+                        clipped = (
+                            torch.clamp(
+                                ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps_high
+                            )
+                            * adv_row
+                        )
+                        loss = -torch.min(unclipped, clipped).mean()
 
-                    # 청크 수로 나눠 스케일을 맞춘 뒤 즉시 backward —
-                    # 전체 그래프를 들고 있으면 VRAM 이 터진다.
-                    (loss / max(len(transitions), 1)).backward()
-                    total_loss += float(loss.item())
-                    num_terms += 1
+                        if cfg.kl_coef > 0:
+                            # 사전학습 정책 대비 KL 예산. SimpleVLA-RL 기본은 0 이지만,
+                            # 정책이 발산하면 여기를 켜는 것이 첫 번째 대응이다.
+                            approx_kl = (behavior_logp.to(new_logp.dtype) - new_logp).mean()
+                            loss = loss + cfg.kl_coef * approx_kl
 
-            if num_terms:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in self.model.parameters() if p.requires_grad],
-                    cfg.max_grad_norm,
-                )
-                self.optimizer.step()
+                        # 청크 수로 나눠 스케일을 맞춘 뒤 즉시 backward —
+                        # 전체 그래프를 들고 있으면 VRAM 이 터진다.
+                        (loss / max(len(transitions), 1)).backward()
+                        total_loss += float(loss.item())
+                        num_terms += 1
+                        epoch_terms += 1
+
+                if epoch_terms:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in self.model.parameters() if p.requires_grad],
+                        cfg.max_grad_norm,
+                    )
+                    self.optimizer.step()
 
             mean_loss = total_loss / num_terms if num_terms else 0.0
+            clip_frac = clip_hits / clip_total if clip_total else 0.0
             elapsed = time.time() - t0
             record = {
                 "step": step,
+                # outcome 성공률 (diag["success"]). 보고는 반드시 이 값으로 한다.
                 "success_rate": success_rate,
+                # 단계형 보상의 평균. 학습 신호의 세기를 보는 값이지 성공률이 아니다.
+                "mean_reward": mean_reward,
                 "loss": mean_loss,
                 "degenerate_group_frac": degen,
                 # 진단: 성공률이 낮을 때 "블록을 집어 들지 못하는 것"인지
                 # "포켓에 못 넣는 것"인지 가른다 (보상에는 섞지 않는다).
-                "lifted_frac": float(
-                    np.mean([d.get("lifted", np.nan) for d in group_diags])
-                ),
-                "yaw_err": float(
-                    np.mean([d.get("yaw_err", np.nan) for d in group_diags])
-                ),
+                "grasped_frac": _diag_mean(all_diags, "grasped"),
+                "lifted_frac": _diag_mean(all_diags, "lifted"),
+                "in_tray_frac": _diag_mean(all_diags, "in_tray"),
+                "yaw_err": _diag_mean(all_diags, "yaw_err"),
+                # 트러스트 리전 감시. clip_frac 은 클리핑 경계 밖으로 나간 궤적
+                # ratio 의 비율 (epoch 1 은 ratio≡1 이라 기여 0). 이게 0.5 를
+                # 넘으면 한 스텝의 이동이 너무 크다 — lr 을 내릴 것.
+                "ratio_max": ratio_max,
+                "clip_frac": clip_frac,
                 "updated_terms": num_terms,
                 # 재샘플링 비용. 이게 안 보이면 상한을 조정할 근거가 없다.
                 "groups_used": len(used),
@@ -575,11 +830,15 @@ class GRPOTrainer:
                 "elapsed_min": elapsed / 60,
             }
             history.append(record)
+            # ★ 성공률과 평균보상을 **나란히** 찍는다. 하나만 찍으면 단계형 보상을
+            #   켰을 때 어느 쪽인지 알 수 없다 (0.31 을 "31% 성공" 으로 읽는 사고).
             print(
-                f"[grpo] step {step:4d} | 성공률 {success_rate:.1%} | "
-                f"loss {mean_loss:+.4f} | 무신호그룹 {degen:.0%} | "
-                f"그룹 {len(used)}/{len(attempted)} | "
-                f"리프트 {record['lifted_frac']:.0%} | "
+                f"[grpo] step {step:4d} | 성공 {success_rate:.1%} | "
+                f"보상 {mean_reward:.3f} | loss {mean_loss:+.4f} | "
+                f"무신호그룹 {degen:.0%} | 그룹 {len(used)}/{len(attempted)} | "
+                f"파지 {record['grasped_frac']:.0%} / 리프트 {record['lifted_frac']:.0%} "
+                f"/ 진입 {record['in_tray_frac']:.0%} | "
+                f"clip {clip_frac:.0%} r≤{ratio_max:.2f} | "
                 f"{elapsed / 60:.1f}분"
             )
             if len(used) < cfg.groups_per_step:
@@ -588,17 +847,39 @@ class GRPOTrainer:
                       "쏠린다는 뜻이다. temperature 를 올리거나(탐색↑), "
                       "SFT 베이스라인이 30% 게이트를 넘는지 먼저 확인할 것.")
 
+            # eval_base 홀드아웃 평가. save_every 와 같은 주기로 맞춰 두면
+            # "이 체크포인트가 몇 % 였는가"를 바로 대응시킬 수 있다.
+            if cfg.eval_every > 0 and cfg.eval_episodes > 0 and (step + 1) % cfg.eval_every == 0:
+                eval_result = self.evaluate(cfg.eval_episodes)
+                record.update(eval_result)
+                print(
+                    f"       [eval] eval_base 성공 {eval_result['eval_success_rate']:.1%} | "
+                    f"파지 {eval_result['eval_grasped_frac']:.0%} / "
+                    f"리프트 {eval_result['eval_lifted_frac']:.0%} / "
+                    f"진입 {eval_result['eval_in_tray_frac']:.0%} "
+                    f"({eval_result['eval_episodes']}에피소드, greedy) — "
+                    f"{eval_result['eval_elapsed_s']:.0f}s"
+                )
+
             if self.writer:
                 self.writer.log(record)
             (self.log_dir / "history.json").write_text(
                 json.dumps(history, indent=2), encoding="utf-8"
             )
 
-            if (step + 1) % cfg.save_every == 0:
+            # save_every <= 0 이면 저장하지 않는다 (0 을 그대로 % 에 넣으면
+            # ZeroDivisionError 로 학습이 통째로 죽는다 — 저장을 끄려다 잃는다).
+            if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
                 out = self.log_dir / f"checkpoint-{step + 1}"
+                # ★ LoRA 를 쓰면 여기서 저장되는 것은 **어댑터뿐**이다(약 484MB).
+                #   덕분에 저장이 빨라 학습 지연이 거의 없지만, 나중에 평가할 때는
+                #   베이스(ckpt/sft) 위에 이 어댑터를 얹어야 한다 — 이 디렉터리만
+                #   단독으로 eval_rollout.py 에 넘기면 모델을 못 찾는다.
                 self.model.save_pretrained(out)
                 self.processor.save_pretrained(out)
-                print(f"       체크포인트 저장: {out}")
+                print(f"       체크포인트 저장: {out}"
+                      + ("  (LoRA 어댑터만 — 평가 시 베이스 위에 얹을 것)"
+                         if cfg.use_lora else ""))
 
         self.client.close()
         return 0
@@ -680,7 +961,28 @@ def self_check() -> int:
     mid = tokens_to_action(np.full(n, vocab_size - 128), vocab_size, centers, stats)
     assert np.allclose(mid, 0.5 * (centers[127] + 1.0) * 2.0, atol=1e-6), mid[0, 0]
 
-    print("자체 검사 통과 (재샘플링 / 상한 / 커서 전진 / 토큰→액션 왕복).")
+    # (5) 설정 필드가 학습 루프에서 **실제로 쓰이는지**.
+    #     eval_every 는 한동안 GRPOConfig 에 있기만 하고 train() 어디에서도
+    #     읽히지 않았다 — 설정에 값을 적어도 평가가 돌지 않는데 에러도 안 났다.
+    #     필드 추가만으로는 재발을 막지 못하므로 소스를 직접 확인한다.
+    import inspect
+
+    train_src = inspect.getsource(GRPOTrainer.train)
+    for field in ("save_every", "eval_every", "eval_episodes", "ppo_epochs"):
+        assert f"cfg.{field}" in train_src, (
+            f"GRPOConfig.{field} 가 train() 에서 쓰이지 않는다 — 설정에 값을 적어도 "
+            "조용히 무시된다. 필드만 있고 배선이 없는 상태로 되돌아갔다."
+        )
+    # 평가는 반드시 홀드아웃 뱅크로. cfg.bank(train_mix)로 평가하면 커리큘럼
+    # 성능이 섞여 원래 분포 성능이 부풀려진다.
+    eval_src = inspect.getsource(GRPOTrainer.evaluate)
+    assert '"eval_base"' in eval_src, (
+        "evaluate() 가 eval_base 홀드아웃을 쓰지 않는다 — 학습 뱅크로 평가하면 "
+        "커리큘럼이 섞여 숫자가 부풀려진다 (개정 §6)."
+    )
+
+    print("자체 검사 통과 (재샘플링 / 상한 / 커서 전진 / 토큰→액션 왕복 / "
+          "설정 배선).")
     return 0
 
 
@@ -736,9 +1038,19 @@ def verify_checkpoint(checkpoint: str, device: str, unnorm_key: str) -> int:
         inputs = processor(
             SPEC.build_prompt(instruction), SPEC.prepare_image_for_vla(image)
         ).to(device, dtype=torch.bfloat16)
-        ref = np.asarray(
-            model.predict_action(**inputs, unnorm_key=unnorm_key), dtype=np.float32
-        ).reshape(-1, SPEC.ACTION_DIM)[: SPEC.NUM_ACTIONS_CHUNK]
+        # ★ 반환 형태가 리비전마다 다르다. 이 체크포인트의 predict_action 은
+        #   **튜플** (액션 ndarray, 히든스테이트 cuda Tensor) 를 돌려준다.
+        #   그대로 np.asarray 하면 "can't convert cuda:0 device type tensor to
+        #   numpy" 로 죽는다. eval_rollout.py 와 같은 방식으로 첫 원소만 쓴다 —
+        #   두 곳의 해석이 갈라지면 비교 자체가 무의미해진다.
+        ref = model.predict_action(**inputs, unnorm_key=unnorm_key)
+        if isinstance(ref, tuple):
+            ref = ref[0]
+        if isinstance(ref, torch.Tensor):
+            ref = ref.detach().float().cpu().numpy()
+        ref = np.asarray(ref, dtype=np.float32).reshape(-1, SPEC.ACTION_DIM)[
+            : SPEC.NUM_ACTIONS_CHUNK
+        ]
 
     diff = float(np.abs(ours - ref).max())
     print(f"[verify] 최대 절대차 {diff:.3e}")

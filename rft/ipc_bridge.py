@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import os
 import pickle
 import struct
 import subprocess
@@ -161,8 +162,13 @@ class RolloutClient:
         startup_timeout: float = 900.0,
         extra_args: list[str] | None = None,
     ) -> None:
-        self.isaaclab_python = Path(isaaclab_python)
-        self.worker_script = Path(worker_script)
+        # ★ `~` 를 반드시 편다. YAML 설정들이 `~/env_isaaclab/bin/python` 로 적어
+        #   두었는데, subprocess.Popen 은 셸이 아니라 `~` 를 리터럴 디렉터리명으로
+        #   본다 → FileNotFoundError 로 워커가 아예 안 뜬다. 학습 스크립트는 정책을
+        #   다 로드한 **뒤** 이 지점에서 죽으므로, 모델 로드가 성공하는 것만 보고
+        #   "환경은 됐다" 고 오해하기 쉽다.
+        self.isaaclab_python = Path(isaaclab_python).expanduser()
+        self.worker_script = Path(worker_script).expanduser()
         self.num_envs = num_envs
         self.task = task
         self.device = device
@@ -189,6 +195,16 @@ class RolloutClient:
             "--enable_cameras",
             *self.extra_args,
         ]
+        # ★ EULA 를 미리 수락해 둔다. 수락돼 있지 않으면 Kit 이 동의 프롬프트를
+        #   띄우고 **stdin 에서 답을 기다린다** — 그런데 워커의 stdin 은 프로토콜
+        #   파이프다. Kit 이 프로토콜 바이트를 EULA 답변으로 먹어 버리거나
+        #   그대로 멎어, 증상은 "워커가 응답 없이 정지" 로만 나타난다.
+        #   setup/setup_isaaclab.sh 가 이미 ~/.bashrc 에 같은 값을 넣지만,
+        #   학습을 띄운 셸이 그걸 안 읽었을 수 있으므로 여기서 못 박는다.
+        #   (이미 설정돼 있으면 그 값을 존중한다)
+        env = dict(os.environ)
+        env.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
+
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -196,6 +212,7 @@ class RolloutClient:
             # stderr 는 부모로 그대로 흘린다 — Isaac Sim 로그가 유일한 디버깅 단서다.
             stderr=None,
             bufsize=0,
+            env=env,
         )
 
         # 첫 실행은 extension 다운로드 + 셰이더 캐시로 10분 이상 걸릴 수 있다.

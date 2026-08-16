@@ -112,7 +112,7 @@ log 4 "Isaac Sim ${ISAACSIM_VERSION} + PyTorch ${TORCH_VERSION} (cu128) — 수�
 # 버전까지 확인한다. `import isaacsim` 성공만으로 건너뛰면, 직접 설치해 둔
 # 다른 버전이 그대로 남아 조용히 진행된다 — constraints 는 5.1.0 기준이므로
 # 버전이 다르면 나중에 원인 불명 오류로 나타난다.
-INSTALLED_ISAACSIM="$(pip show isaacsim 2>/dev/null | awk '/^Version:/{print $2}')"
+INSTALLED_ISAACSIM="$(pip show isaacsim 2>/dev/null | awk '/^Version:/{print $2}')" || true
 if [[ "${INSTALLED_ISAACSIM}" == "${ISAACSIM_VERSION}" ]]; then
     info "isaacsim ${ISAACSIM_VERSION} 이미 설치됨 — 건너뜀"
 else
