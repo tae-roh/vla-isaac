@@ -75,8 +75,53 @@ class GRPOConfig:
     max_group_attempts: int = 0
     max_steps_per_episode: int = SPEC.MAX_EPISODE_STEPS
     temperature: float = 1.6      # 개정 §5: SimpleVLA-RL 설정값
+    # 정책 forward 를 몇 개씩 묶어 돌릴지. 예전에는 1개씩 순차로 돌아 96GB 중
+    # 35GB 만 썼고, groups_per_step 을 늘려도 VRAM 이 아니라 **시간만** 늘었다.
+    # ★ 상한은 _recompute_logp 다 — 거긴 그래디언트가 살아 있어 활성값이
+    #   배치에 비례한다. OOM 이면 이 값을 4/2 로 낮춘다 (수집·평가는 no_grad
+    #   라 여유가 크지만 같은 손잡이로 통일했다).
+    policy_batch_size: int = 8
     # 초기 상태 뱅크 (개정 §3). 학습용 뱅크를 쓰고, 평가는 별도 홀드아웃을 쓴다.
     bank: str = "train"
+    # 커리큘럼 어닐링 스케줄: [[시작스텝, 뱅크이름], ...] (시작스텝 오름차순).
+    # 비어 있으면 `bank` 를 끝까지 쓴다.
+    #
+    # ★ 왜 어닐링인가 — 고정 혼합비는 커리큘럼이 아니다.
+    #   reverse curriculum(Florensa 2017) 계열의 동력은 "쉬운 시작 상태로 신호를
+    #   만든 뒤, 성공률이 오르면 원래 분포로 되돌리는" 것이다. 되돌리지 않으면
+    #   커리큘럼 분포에서만 잘하고 목표 분포로 전이된다는 보장이 없다.
+    #
+    # ⚠ 뱅크는 **행 순서가 섞여 있어야** 한다. sample_bank 는 커리큘럼 행을
+    #   앞쪽에 몰아 넣는데(k < n_curriculum), 학습은 커서 0 부터 순차로 순회하므로
+    #   섞지 않으면 "30% 혼합" 뱅크가 실제로는 **100% 커리큘럼**으로 소비된다.
+    #   (train_mix 가 그랬다 — 인덱스 0~1228 이 전부 커리큘럼)
+    #   train_c30/c20/c10 은 생성 후 셔플해 두었다.
+    bank_schedule: list = field(default_factory=list)
+
+    # --- 성공률 기반 커리큘럼 어닐링 (bank_schedule 보다 우선한다) ---
+    # bank_stages 가 비어 있지 않으면 스텝 기준(bank_schedule) 대신 이쪽을 쓴다.
+    #
+    # ★ 왜 스텝이 아니라 성공률인가
+    #   reverse curriculum 의 정석은 "정책이 실제로 잘하게 됐을 때" 난이도를
+    #   올리는 것이다. 스텝 기준은 정책 상태와 무관하게 시간표대로 밀어붙이므로,
+    #   아직 못 푸는데 어려워지거나 이미 쉬운데 오래 머무르는 일이 생긴다.
+    #
+    # ★ 판정은 eval_base 홀드아웃으로만 한다 (평가 시점에만 갱신).
+    #   학습 롤아웃 성공률은 스텝당 16궤적이라 노이즈가 크고, 무엇보다
+    #   **커리큘럼이 섞인 분포**라 "목표 분포에서 잘하게 됐는가" 를 답하지 못한다.
+    #   eval_success_rate 는 diag["success"] 기반이라 단계형 보상에 오염되지 않는다.
+    #
+    # ★ 승급 전용(monotonic). 강등은 넣지 않는다 — 평가 지점이 적어(10스텝마다)
+    #   진동하면 회복할 기회가 없다.
+    bank_stages: list = field(default_factory=list)
+    # eval_base 성공률이 이 값 이상이면 다음 단계로 승급.
+    promote_eval_success: float = 0.30
+    # 한 단계에 이 스텝 수를 넘게 머무르면 성공률과 무관하게 승급한다.
+    # ★ 없으면 임계에 영영 못 미칠 때 원래 분포(마지막 단계)에 도달하지 못해
+    #   목표 분포 성능을 아예 못 재게 된다. 마감이 있는 실행에서는 필수다.
+    #   0 이면 데드라인 없음(성공률로만 승급).
+    promote_deadline_steps: int = 20
+
     # 액션 언노멀라이즈에 쓸 데이터셋 통계 키. 체크포인트의 norm_stats 안에 있어야
     # 한다 (SFT 가 dataset_statistics.json 으로 함께 저장한다).
     unnorm_key: str = "vla_pick"
@@ -203,9 +248,21 @@ def is_degenerate(reward_row: np.ndarray) -> bool:
 
 
 def action_logits(
-    model, processor, image, instruction, *, device, num_patches, n_action_tokens
+    model, processor, images, instructions, *, device, num_patches, n_action_tokens
 ):
-    """관측 하나 → 액션 구간 로짓 (n_action_tokens, vocab).
+    """관측 **배치** → 액션 구간 로짓 (B, n_action_tokens, vocab).
+
+    ★ 2026-08-16 배치화. 이전에는 샘플 1개씩 순차로 돌아 96GB GPU 중 35GB 만
+      쓰고 있었다. 모델 쪽은 원래 배치를 지원한다 —
+      modeling_prismatic 의 forward() 멀티모달 경로가 `(B, seq_len, D)` 전제이고
+      _prepare_input/labels_for_action_prediction 도 전부 `.shape[0]` 기반이다.
+      ("Only batch size == 1 supported right now" 주석은 실제 코드와 맞지 않는
+       stale 주석이다. B>1 을 막는 곳은 KV캐시 생성과 generate() 뿐인데 RFT 는
+       둘 다 쓰지 않는다.)
+
+    Args:
+        images: (B, H, W, 3) uint8 또는 길이 B 시퀀스.
+        instructions: 길이 B 문자열 시퀀스.
 
     ★ OpenVLA-OFT 는 **parallel decoding** 으로 학습된다. placeholder 액션 토큰
       56개(= 청크 8 × 액션 7)와 stop 토큰을 프롬프트 뒤에 붙여 **한 번의 forward**
@@ -235,18 +292,39 @@ def action_logits(
 
     from prismatic.vla.constants import IGNORE_INDEX
 
-    inputs = processor(
-        SPEC.build_prompt(instruction), SPEC.prepare_image_for_vla(image)
-    ).to(device, dtype=torch.bfloat16)
+    prompts = [SPEC.build_prompt(ins) for ins in instructions]
+    pils = [SPEC.prepare_image_for_vla(img) for img in images]
+    inputs = processor(prompts, pils).to(device, dtype=torch.bfloat16)
 
     input_ids, attention_mask = inputs["input_ids"], inputs["attention_mask"]
+    batch = input_ids.shape[0]
+
+    # ★ 프롬프트 길이가 전 행 동일한지 확인한다 — 배치화의 유일한 전제다.
+    #   아래 num_prompt_tokens 는 **스칼라**라, 행마다 길이가 다르면 액션 구간
+    #   슬라이스가 어긋난 채 **에러 없이** 엉뚱한 로짓을 정책으로 쓰게 된다.
+    #   (이번 프로젝트에서 반복해서 당한 "조용히 실패" 유형이다)
+    #   학습 경로는 SPEC.INSTRUCTION_TEMPLATE 하나로 고정이고 색 이름
+    #   red/blue/green 이 모두 단일 토큰이라 22토큰으로 균일하다. 다만
+    #   INSTRUCTION_TEMPLATES_EVAL 중 하나는 24토큰이라 섞이면 깨진다.
+    _lens = attention_mask.sum(dim=-1)
+    if batch > 1 and not bool((_lens == _lens[0]).all()):
+        raise RuntimeError(
+            f"배치 안에서 프롬프트 길이가 다르다: {_lens.tolist()}. "
+            "액션 구간 슬라이스가 행마다 어긋나므로 배치 forward 를 쓸 수 없다. "
+            "지시문 템플릿을 하나로 고정하거나, 좌측 패딩 + 행별 슬라이스로 "
+            "action_logits 를 확장할 것."
+        )
 
     # (1) 특수 빈 토큰. predict_action 과 같은 조건·같은 방식으로 붙인다.
+    #     ★ 배치에서는 (B,1) 로 만들어야 한다. predict_action 은 (1,1) 로
+    #       하드코딩돼 있어 B>1 이면 cat 이 dim0 불일치로 죽는다.
     if not torch.all(input_ids[:, -1] == 29871):
         input_ids = torch.cat(
             (
                 input_ids,
-                torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device),
+                torch.full(
+                    (batch, 1), 29871, dtype=input_ids.dtype, device=input_ids.device
+                ),
             ),
             dim=1,
         )
@@ -273,10 +351,11 @@ def action_logits(
         labels=labels,
     )
     start = num_patches + num_prompt_tokens
-    logits = out.logits[0, start : start + n_action_tokens, :]
-    if logits.shape[0] != n_action_tokens:
+    # ★ 배치 차원을 보존한다. 예전에는 [0, ...] 로 첫 행만 집었다.
+    logits = out.logits[:, start : start + n_action_tokens, :]
+    if logits.shape[1] != n_action_tokens:
         raise RuntimeError(
-            f"액션 구간 로짓이 {logits.shape[0]}개다 (기대 {n_action_tokens}). "
+            f"액션 구간 로짓이 {logits.shape[1]}개다 (기대 {n_action_tokens}). "
             f"시퀀스 길이 {out.logits.shape[1]}, 슬라이스 시작 {start}. "
             "num_patches 계산이나 프롬프트 길이 규약이 상류와 어긋났다."
         )
@@ -411,6 +490,13 @@ class GRPOTrainer:
         self._init_cursor = 0
         # 한 스텝에서 시도한 그룹들의 diag (버린 그룹 포함). train() 이 스텝마다 비운다.
         self._step_diags: list = []
+        # 현재 스텝에서 쓸 초기 상태 뱅크 (어닐링이 갱신한다).
+        # bank_stages 를 쓰면 첫 단계에서, 아니면 cfg.bank 에서 시작한다.
+        self._stage_idx: int = 0
+        self._stage_entered_step: int = 0     # 현재 단계에 들어온 스텝 (데드라인 계산용)
+        self._active_bank: str = (
+            str(cfg.bank_stages[0]) if cfg.bank_stages else cfg.bank
+        )
 
         # --- parallel decoding 에 필요한 상수 (체크포인트에서 읽는다) ---
         # 액션 토큰 수 = 청크 × 액션 차원. OFT 는 이만큼을 한 번에 예측한다.
@@ -452,6 +538,60 @@ class GRPOTrainer:
             self.writer = wandb
 
     # -------------------------------------------------------------------------
+    def bank_for_step(self, step: int) -> str:
+        """어닐링 스케줄에서 이 스텝의 뱅크를 고른다.
+
+        스케줄이 비어 있으면 cfg.bank 를 그대로 쓴다. 스케줄이 있으면
+        `시작스텝 <= step` 인 항목 중 마지막 것을 쓴다.
+        """
+        bank = self.cfg.bank
+        for entry in self.cfg.bank_schedule or []:
+            start, name = entry[0], entry[1]
+            if step >= int(start):
+                bank = str(name)
+        return bank
+
+    # -------------------------------------------------------------------------
+    def maybe_promote(self, step: int, eval_success: float | None) -> str | None:
+        """성공률 기반 커리큘럼 승급을 판정한다. 승급했으면 사유 문자열, 아니면 None.
+
+        두 가지 경로로 승급한다:
+          1. eval_base 성공률이 promote_eval_success 이상  ← 본래 의도
+          2. 현재 단계 체류가 promote_deadline_steps 초과  ← 마감 대비 안전장치
+
+        Args:
+            step: 현재 스텝.
+            eval_success: 방금 나온 eval_base 성공률. 평가가 없던 스텝이면 None.
+
+        ★ 승급 전용이다. 성공률이 떨어져도 되돌아가지 않는다 — 평가가 드물어
+          (10스텝마다) 진동하면 회복할 기회가 없기 때문이다.
+        ★ 마지막 단계에 도달하면 더 올라갈 곳이 없으므로 항상 None 을 돌려준다.
+        """
+        stages = self.cfg.bank_stages or []
+        if not stages or self._stage_idx >= len(stages) - 1:
+            return None
+
+        dwell = step - self._stage_entered_step
+        reason = None
+        if eval_success is not None and eval_success >= self.cfg.promote_eval_success:
+            reason = (f"eval 성공률 {eval_success:.1%} ≥ "
+                      f"{self.cfg.promote_eval_success:.0%}")
+        elif self.cfg.promote_deadline_steps > 0 and dwell >= self.cfg.promote_deadline_steps:
+            reason = f"데드라인 {dwell}스텝 ≥ {self.cfg.promote_deadline_steps}"
+
+        if reason is None:
+            return None
+
+        self._stage_idx += 1
+        self._stage_entered_step = step
+        prev = self._active_bank
+        self._active_bank = str(stages[self._stage_idx])
+        # 뱅크가 바뀌면 커서를 0 으로 돌린다. 새 뱅크의 인덱스 공간이라
+        # 이전 커서를 이어 쓰면 앞부분을 통째로 건너뛰게 된다.
+        self._init_cursor = 0
+        return f"{prev} → {self._active_bank} ({reason})"
+
+    # -------------------------------------------------------------------------
     def _sample_actions(self, images: np.ndarray, instructions):
         """관측 배치 → (액션 청크, 샘플된 토큰, behavior log-prob).
 
@@ -469,30 +609,42 @@ class GRPOTrainer:
         """
         import torch
 
-        actions, tokens, logps = [], [], []
+        tokens_all, logps_all = [], []
 
-        for i in range(images.shape[0]):
+        # ★ 배치 forward. 마이크로배치로 잘라 도는 이유는 메모리 상한 때문이다
+        #   (수집은 no_grad 라 여유가 크지만, 같은 손잡이로 통일해 둔다).
+        for lo in range(0, images.shape[0], max(self.cfg.policy_batch_size, 1)):
+            hi = min(lo + max(self.cfg.policy_batch_size, 1), images.shape[0])
             with torch.no_grad():
-                logits = self._action_logits(images[i], instructions[i])
+                logits = self._action_logits(images[lo:hi], instructions[lo:hi])
 
             # 위치별 categorical 샘플링. 56개 위치가 서로 독립이다 —
             # parallel decoding 이라 앞 토큰이 뒤 토큰의 조건이 아니다.
+            # (b, 56, V) → multinomial 은 2D 만 받으므로 (b*56, V) 로 펴서 뽑는다.
             logp_all = torch.log_softmax(logits.float() / self.cfg.temperature, dim=-1)
-            seq = torch.multinomial(logp_all.exp(), num_samples=1).squeeze(-1)
+            b, n, v = logp_all.shape
+            seq = torch.multinomial(
+                logp_all.exp().reshape(b * n, v), num_samples=1
+            ).reshape(b, n)
 
-            logps.append(logp_all.gather(-1, seq.unsqueeze(-1)).squeeze(-1).sum())
-            tokens.append(seq)
-            actions.append(self._tokens_to_action(seq))
+            # 궤적별 log-prob 은 56개 위치의 합 (dim=-1).
+            tokens_all.append(seq)
+            logps_all.append(
+                logp_all.gather(-1, seq.unsqueeze(-1)).squeeze(-1).sum(dim=-1)
+            )
 
-        return np.stack(actions), torch.stack(tokens), torch.stack(logps)
+        tokens = torch.cat(tokens_all, dim=0)
+        logps = torch.cat(logps_all, dim=0)
+        actions = np.stack([self._tokens_to_action(tokens[i]) for i in range(tokens.shape[0])])
+        return actions, tokens, logps
 
-    def _action_logits(self, image: np.ndarray, instruction: str):
-        """관측 하나 → 액션 구간 로짓. 샘플링과 logp 재계산이 이걸 공유한다."""
+    def _action_logits(self, images, instructions):
+        """관측 배치 → 액션 구간 로짓 (B, 56, vocab). 샘플링·logp 재계산·평가가 공유한다."""
         return action_logits(
             self.model,
             self.processor,
-            image,
-            instruction,
+            images,
+            instructions,
             device=self.cfg.device,
             num_patches=self._num_patches,
             n_action_tokens=self._n_action_tokens,
@@ -514,14 +666,18 @@ class GRPOTrainer:
         """
         import torch
 
+        # ★ 여기는 그래디언트가 살아 있어 활성값이 배치 크기에 비례한다.
+        #   policy_batch_size 로 잘라 도는 것이 OOM 방어의 유일한 손잡이다.
         logps = []
-        for i in range(images.shape[0]):
-            logits = self._action_logits(images[i], instructions[i])
+        bs = max(self.cfg.policy_batch_size, 1)
+        for lo in range(0, images.shape[0], bs):
+            hi = min(lo + bs, images.shape[0])
+            logits = self._action_logits(images[lo:hi], instructions[lo:hi])
             logp_all = torch.log_softmax(logits.float() / self.cfg.temperature, dim=-1)
-            picked = logp_all.gather(-1, tokens[i].unsqueeze(-1)).squeeze(-1)
-            logps.append(picked.sum())
+            picked = logp_all.gather(-1, tokens[lo:hi].unsqueeze(-1)).squeeze(-1)
+            logps.append(picked.sum(dim=-1))
 
-        return torch.stack(logps)
+        return torch.cat(logps, dim=0)
 
     def _tokens_to_action(self, token_ids) -> np.ndarray:
         """액션 토큰 → 연속 액션.
@@ -560,7 +716,7 @@ class GRPOTrainer:
         메모리 주의: 궤적당 스텝 수 × num_envs 개의 224² 이미지를 들고 있게 된다.
         max_steps_per_episode 를 키우면 여기가 먼저 터진다.
         """
-        obs = self.client.reset(init_index=init_index, bank=self.cfg.bank)
+        obs = self.client.reset(init_index=init_index, bank=self._active_bank)
         steps = int(np.ceil(self.cfg.max_steps_per_episode / SPEC.NUM_ACTIONS_CHUNK))
 
         transitions = []      # [(images, tokens, behavior_logp, instructions), ...]
@@ -642,18 +798,22 @@ class GRPOTrainer:
                         (num_envs, SPEC.NUM_ACTIONS_CHUNK, SPEC.ACTION_DIM),
                         dtype=np.float32,
                     )
+                    # 배치 forward + greedy. 학습 롤아웃과 같은 경로를 쓴다.
+                    bs = max(self.cfg.policy_batch_size, 1)
                     with torch.no_grad():
-                        for i in range(num_envs):
-                            logits = self._action_logits(images[i], instr[i])
-                            ids = logits.argmax(dim=-1).cpu().numpy()
-                            chunk[i] = tokens_to_action(
-                                ids,
-                                vocab_size=self.model.vocab_size,
-                                bin_centers=np.asarray(self.model.bin_centers),
-                                action_stats=self.model.norm_stats[
-                                    self.cfg.unnorm_key
-                                ]["action"],
-                            )
+                        for lo in range(0, num_envs, bs):
+                            hi = min(lo + bs, num_envs)
+                            logits = self._action_logits(images[lo:hi], instr[lo:hi])
+                            ids = logits.argmax(dim=-1).cpu().numpy()   # (b, 56)
+                            for j in range(hi - lo):
+                                chunk[lo + j] = tokens_to_action(
+                                    ids[j],
+                                    vocab_size=self.model.vocab_size,
+                                    bin_centers=np.asarray(self.model.bin_centers),
+                                    action_stats=self.model.norm_stats[
+                                        self.cfg.unnorm_key
+                                    ]["action"],
+                                )
                     obs, _, done = self.client.step(chunk)
                     for k in round_stage:
                         round_stage[k] = max(
@@ -698,6 +858,23 @@ class GRPOTrainer:
             # 뱅크 인덱스로 s₀ 를 지정한다. 그룹 안에서는 전 env 가 동일한 s₀ 이고
             # (GRPO 전제), 커서는 시도마다 나아간다 — 재시도에 같은 s₀ 를 다시
             # 쓰면 같은 결과가 나와 재샘플링이 무의미해진다.
+            # 커리큘럼 어닐링 — 이 스텝에서 쓸 뱅크를 정한다.
+            # bank_stages 를 쓰면 승급은 **평가 직후**에만 일어나므로(아래 참조)
+            # 여기서는 데드라인만 본다. bank_stages 가 없으면 예전 스텝 기준.
+            if cfg.bank_stages:
+                promoted = self.maybe_promote(step, eval_success=None)
+                if promoted:
+                    print(f"[grpo] 커리큘럼 승급: {promoted} (step {step})")
+            else:
+                prev_bank = self._active_bank
+                self._active_bank = self.bank_for_step(step)
+                if self._active_bank != prev_bank:
+                    print(f"[grpo] 커리큘럼 어닐링: 뱅크 {prev_bank} → {self._active_bank} "
+                          f"(step {step})")
+                    # 뱅크가 바뀌면 커서를 0 으로 돌린다. 새 뱅크의 인덱스 공간이라
+                    # 이전 커서를 이어 쓰면 앞부분을 통째로 건너뛰게 된다.
+                    self._init_cursor = 0
+
             # 이 스텝에서 시도한 모든 그룹의 diag (버린 것 포함). 위 참조.
             self._step_diags = []
             used, payloads, attempted, self._init_cursor = collect_groups(
@@ -823,6 +1000,9 @@ class GRPOTrainer:
                 # 넘으면 한 스텝의 이동이 너무 크다 — lr 을 내릴 것.
                 "ratio_max": ratio_max,
                 "clip_frac": clip_frac,
+                # 어느 뱅크로 학습했는지. 어닐링 구간을 나중에 되짚으려면 필요하다.
+                "bank": self._active_bank,
+                "stage_idx": self._stage_idx,
                 "updated_terms": num_terms,
                 # 재샘플링 비용. 이게 안 보이면 상한을 조정할 근거가 없다.
                 "groups_used": len(used),
@@ -860,6 +1040,15 @@ class GRPOTrainer:
                     f"({eval_result['eval_episodes']}에피소드, greedy) — "
                     f"{eval_result['eval_elapsed_s']:.0f}s"
                 )
+                # ★ 승급 판정은 여기서만 한다. 판정 기준이 eval_base 성공률이라
+                #   평가가 갱신되는 시점 외에는 새 정보가 없다.
+                #   다음 스텝부터 새 뱅크가 적용된다(이번 스텝의 롤아웃은 이미 끝).
+                if cfg.bank_stages:
+                    promoted = self.maybe_promote(
+                        step + 1, eval_success=eval_result["eval_success_rate"]
+                    )
+                    if promoted:
+                        print(f"       [grpo] 커리큘럼 승급: {promoted}")
 
             if self.writer:
                 self.writer.log(record)
@@ -967,8 +1156,80 @@ def self_check() -> int:
     #     필드 추가만으로는 재발을 막지 못하므로 소스를 직접 확인한다.
     import inspect
 
+    # (5b) 커리큘럼 어닐링 스케줄이 실제로 뱅크를 바꾸는지.
+    class _FakeCfg:
+        bank = "train"
+        bank_schedule = [[0, "train_c30"], [30, "train_c20"], [60, "train_c10"], [90, "train"]]
+
+    _t = GRPOTrainer.__new__(GRPOTrainer)
+    _t.cfg = _FakeCfg()
+    for step, want in [(0, "train_c30"), (29, "train_c30"), (30, "train_c20"),
+                       (89, "train_c10"), (90, "train"), (200, "train")]:
+        got = _t.bank_for_step(step)
+        assert got == want, f"어닐링 스케줄 오류: step {step} → {got} (기대 {want})"
+    assert GRPOTrainer.__new__(GRPOTrainer).__class__ is GRPOTrainer
+    # 스케줄이 비면 cfg.bank 를 그대로 써야 한다.
+    _t.cfg.bank_schedule = []
+    assert _t.bank_for_step(50) == "train"
+
+    # (5c) 성공률 기반 승급 (maybe_promote).
+    class _StageCfg:
+        bank = "train"
+        bank_schedule = []
+        bank_stages = ["train_c30", "train_c20", "train_c10", "train"]
+        promote_eval_success = 0.30
+        promote_deadline_steps = 20
+
+    def _fresh():
+        t = GRPOTrainer.__new__(GRPOTrainer)
+        t.cfg = _StageCfg()
+        t._stage_idx = 0
+        t._stage_entered_step = 0
+        t._active_bank = "train_c30"
+        t._init_cursor = 123          # 승급 시 0 으로 리셋되는지 확인용
+        return t
+
+    # 임계 미달 + 데드라인 전 → 승급 없음
+    t = _fresh()
+    assert t.maybe_promote(5, eval_success=0.20) is None
+    assert t._active_bank == "train_c30" and t._init_cursor == 123
+
+    # 임계 도달 → 승급, 커서 리셋
+    t = _fresh()
+    assert t.maybe_promote(5, eval_success=0.30) is not None
+    assert t._active_bank == "train_c20", t._active_bank
+    assert t._init_cursor == 0, "승급 시 커서를 리셋하지 않았다"
+    assert t._stage_entered_step == 5
+
+    # 데드라인 초과 → 성공률 낮아도 승급
+    t = _fresh()
+    assert t.maybe_promote(20, eval_success=0.05) is not None
+    assert t._active_bank == "train_c20"
+    # 평가가 없는 스텝(None)에서도 데드라인은 작동해야 한다
+    t = _fresh()
+    assert t.maybe_promote(20, eval_success=None) is not None
+
+    # 마지막 단계에서는 더 올라가지 않는다
+    t = _fresh()
+    t._stage_idx = 3
+    t._active_bank = "train"
+    assert t.maybe_promote(999, eval_success=1.0) is None
+    assert t._active_bank == "train"
+
+    # bank_stages 가 비면 승급 로직은 아무것도 하지 않는다 (스텝 기준으로 폴백)
+    t = _fresh()
+    t.cfg.bank_stages = []
+    assert t.maybe_promote(999, eval_success=1.0) is None
+
+    # 4단계를 데드라인만으로 끝까지 승급하면 마지막이 train 이어야 한다
+    t = _fresh()
+    for s in (20, 40, 60):
+        t.maybe_promote(s, eval_success=0.0)
+    assert t._active_bank == "train" and t._stage_idx == 3, t._active_bank
+
     train_src = inspect.getsource(GRPOTrainer.train)
-    for field in ("save_every", "eval_every", "eval_episodes", "ppo_epochs"):
+    for field in ("save_every", "eval_every", "eval_episodes", "ppo_epochs",
+                  "bank_stages"):
         assert f"cfg.{field}" in train_src, (
             f"GRPOConfig.{field} 가 train() 에서 쓰이지 않는다 — 설정에 값을 적어도 "
             "조용히 무시된다. 필드만 있고 배선이 없는 상태로 되돌아갔다."
@@ -1024,10 +1285,11 @@ def verify_checkpoint(checkpoint: str, device: str, unnorm_key: str) -> int:
 
     with torch.no_grad():
         # 우리 경로: 같은 로짓에서 greedy (샘플링만 빼면 롤아웃과 동일한 경로다)
+        # ★ 배치 함수가 됐으므로 (1,H,W,3) / 길이 1 리스트로 감싼다.
         logits = action_logits(
-            model, processor, image, instruction,
+            model, processor, image[None], [instruction],
             device=device, num_patches=num_patches, n_action_tokens=n_tokens,
-        )
+        )[0]
         ours = tokens_to_action(
             logits.argmax(dim=-1).cpu().numpy(),
             vocab_size=model.vocab_size,
@@ -1066,6 +1328,77 @@ def verify_checkpoint(checkpoint: str, device: str, unnorm_key: str) -> int:
         )
         return 1
     print("\n[verify] ✓ 정책 경로가 predict_action 과 일치한다.")
+
+    # -----------------------------------------------------------------------
+    # 배치 ↔ 순차 동치 시험 — forward 배치화의 핵심 회귀 시험이다.
+    #
+    # 배치화는 "값은 그대로 두고 처리량만 올리는" 변경이어야 한다. 만약 슬라이스
+    # 위치나 패딩 때문에 행마다 다른 로짓이 나오면 정책 분포가 조용히 달라지고,
+    # 증상은 "커브가 안 오른다" 로만 보인다. 같은 관측을 배치로 한 번, 순차로
+    # B 번 돌려 로짓이 일치하는지 직접 확인한다.
+    # -----------------------------------------------------------------------
+    B = 8
+    imgs = rng.integers(
+        0, 255, (B, SPEC.IMAGE_HEIGHT, SPEC.IMAGE_WIDTH, 3), dtype=np.uint8
+    )
+    # 지시문도 섞는다 — 색이 달라도 토큰 길이가 같아야 배치가 성립한다.
+    instrs = [SPEC.instruction_for(i % SPEC.NUM_BLOCKS) for i in range(B)]
+
+    with torch.no_grad():
+        batched = action_logits(
+            model, processor, imgs, instrs,
+            device=device, num_patches=num_patches, n_action_tokens=n_tokens,
+        )
+        seq = torch.cat([
+            action_logits(
+                model, processor, imgs[i][None], [instrs[i]],
+                device=device, num_patches=num_patches, n_action_tokens=n_tokens,
+            )
+            for i in range(B)
+        ], dim=0)
+
+    # ★ 판정은 **로짓 수준**에서 한다. 토큰(argmax) 완전일치를 요구하면 안 된다.
+    #
+    #   bf16 은 배치 크기에 따라 GEMM 타일링과 누적 순서가 달라져 로짓이 미세하게
+    #   달라진다(실측 0.19). 그 결과 **근소한 동점** 위치에서 argmax 가 뒤집힌다.
+    #   실측: 21/448 토큰이 뒤집혔고, 뒤집힌 위치의 top1-top2 격차는 중앙값 0.031
+    #   최대 0.125 로 **전부 수치 오차보다 작았다**. 즉 모델이 사실상 무차별한
+    #   지점들이다. 액션 공간 % 로 재면 그리퍼(사실상 이진, 범위 2.0)가 한 번만
+    #   뒤집혀도 99% 로 보여 판정이 무의미해진다.
+    #
+    #   반면 **진짜 버그**(슬라이스 위치 오류, 패딩 혼입)는 서로 다른 위치의 로짓을
+    #   비교하게 되므로 로짓 차이가 O(10) 이상으로 벌어지고 거의 모든 토큰이 어긋난다.
+    #   따라서 로짓 최대차 하나로 두 경우가 깨끗하게 갈린다.
+    ldiff = float((batched.float() - seq.float()).abs().max())
+    n_flip = int((batched.argmax(-1) != seq.argmax(-1)).sum())
+    gaps = []
+    fi, fj = (batched.argmax(-1) != seq.argmax(-1)).nonzero(as_tuple=True)
+    for i, j in zip(fi.tolist(), fj.tolist()):
+        top2 = torch.topk(batched[i, j].float(), 2).values
+        gaps.append(float(top2[0] - top2[1]))
+    max_gap = max(gaps) if gaps else 0.0
+
+    print(f"[verify] 배치({B}) ↔ 순차: 로짓 최대차 {ldiff:.4f}, "
+          f"토큰 불일치 {n_flip}/{B * n_tokens}, "
+          f"불일치 지점의 top1-top2 격차 최대 {max_gap:.4f}")
+
+    TOL = 1.0   # bf16 노이즈(~0.2)는 통과, 슬라이스 오류(O(10))는 탈락
+    if ldiff > TOL:
+        print(
+            f"\n[verify] ✗ 배치와 순차의 로짓이 {ldiff:.3f} 만큼 다르다 "
+            f"(허용 {TOL}). 수치 오차가 아니라 로직 오류다.\n"
+            "  - 프롬프트 길이 균일성 검사가 통과했는지\n"
+            "  - out.logits[:, start:start+n, :] 슬라이스가 맞는지\n"
+            "  - processor 가 패딩을 넣지 않았는지 (attention_mask 합 확인)"
+        )
+        return 1
+    if gaps and max_gap > ldiff * 2:
+        # 뒤집힘이 동점이 아닌 곳에서 났다면 수치 오차로 설명되지 않는다.
+        print(f"\n[verify] ⚠ 불일치가 동점 지점이 아니다 "
+              f"(격차 {max_gap:.3f} > 로짓오차 {ldiff:.3f}의 2배). 확인 필요.")
+        return 1
+    print("[verify] ✓ 배치 forward 가 순차와 일치한다 "
+          "(불일치는 전부 동점 지점의 bf16 수치 오차).")
     return 0
 
 

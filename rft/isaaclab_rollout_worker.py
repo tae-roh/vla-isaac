@@ -162,8 +162,9 @@ def main() -> int:
             return torch.maximum(r, success_latch.float())
 
         if STAGED:
-            log(f"단계형 보상 ON — 파지 {STAGE_GRASP} / 리프트 {STAGE_LIFT} / "
-                f"트레이 {STAGE_TRAY} / 성공 1.0")
+            log(f"단계형 보상 ON — 파지 {STAGE_GRASP}({GRASP_HOLD_STEPS}스텝 유지) / "
+                f"리프트 {STAGE_LIFT} / 트레이 {STAGE_TRAY}(순간값) / "
+                f"성공 1.0({SPEC.SUCCESS_HOLD_STEPS}스텝 유지)")
 
         def extract_obs(obs_dict) -> dict:
             """VLA 가 받을 관측만 추려서 numpy 로 바꾼다."""
@@ -313,6 +314,11 @@ def main() -> int:
                         #   settled — 튕겨 지나가는 한 프레임으로 크레딧을 주지 않는다
                         #   lift_latch — 들지 않고 **끌어서 밀어넣는** 해를 막는다
                         #     (박스가 사라져 지금은 끌기가 물리적으로 가능하다)
+                        # ★ 유지 조건은 두지 않는다(순간값). settled 임계가
+                        #   0.03 m/s 라 느리게 통과하는 중에도 만족되므로, 이 단계는
+                        #   "스침" 을 포함한다는 것을 알고 쓸 것 — 0.7 → 1.0 의
+                        #   간격이 완수를 유인하는 구조에 의존한다.
+                        #   로그의 `진입` 대비 `성공` 격차가 벌어지면 해킹을 의심.
                         _settled = torch.linalg.norm(
                             _obs_mod.target_block_lin_vel(_u), dim=-1
                         ) < SPEC.SUCCESS_LIN_VEL_THRESHOLD
