@@ -43,7 +43,29 @@ def success_bonus(
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
 ) -> torch.Tensor:
-    """태스크 성공 시 1.0, 아니면 0.0. RFT 의 유일한 학습 신호다."""
-    return placed_signal(env, robot_cfg=robot_cfg, ee_frame_cfg=ee_frame_cfg).float()
+    """태스크 성공 시 1.0, 아니면 0.0. RFT 의 유일한 학습 신호다.
+
+    ★ 2026-08-16 수정 — **유지 조건까지 반영한다.**
+
+      예전에는 `placed_signal()` 의 **순간값**을 돌려주었다. 그런데 종료 조건
+      `task_success()` 는 같은 술어가 SUCCESS_HOLD_STEPS(16스텝 = 2초) 연속
+      유지될 때만 참이다. 두 정의가 갈라져 있어서, 블록이 트레이 영역을 느리게
+      **스치기만 해도** 보상이 1 로 뜨고 성공으로 집계됐다
+      (settled 임계가 0.03 m/s 라 통과 중에도 만족된다).
+
+      실측 증거: SFT 체크포인트 12 에피소드에서 `diag["success"]` 는 2건을
+      잡았지만, 12개 **전부** 300스텝을 완주했다 — 즉 task_success 종료가
+      한 번도 발동하지 않았고 실제 안착은 0건이었다. 영상에도 트레이에 들어가는
+      장면이 없다. 그 상태로 RFT 를 돌리면 "안착" 이 아니라 "스침" 을 강화한다.
+
+      이제 종료 조건과 **같은 카운터**를 읽으므로 보상·종료·평가가 한 정의다
+      (placed_signal 의 주석이 원래 의도한 바이기도 하다).
+
+    ⚠ 카운터 전진은 VlaEnvMixin.step() 의 update_success_hold() 가 담당한다.
+      이 함수는 읽기만 한다 — 여기서 전진시키면 호출 횟수만큼 중복 계수된다.
+    """
+    from .terminations import task_success
+
+    return task_success(env, robot_cfg=robot_cfg, ee_frame_cfg=ee_frame_cfg).float()
 
 
