@@ -1,0 +1,86 @@
+# =============================================================================
+# rft/configs/grpo_anneal.yaml — outcome-only + 커리큘럼 어닐링
+#
+# ★ 실행 (단계형 보상 끄고):
+#     unset VLA_STAGED_REWARD
+#     ~/env_eval/bin/python -u rft/grpo_fallback.py \
+#         --config rft/configs/grpo_anneal.yaml --checkpoint ckpt/sft
+#
+# =============================================================================
+# §이 설정 이전에 고친 두 가지 (둘 다 실측으로 확인된 결함)
+#
+# 1) 성공 보상이 "스침" 을 잡고 있었다.
+#    success_bonus 가 placed_signal() 의 **순간값**을 돌려줬는데, 종료 조건
+#    task_success 는 같은 술어가 16스텝(2초) 연속일 때만 참이다. settled 임계가
+#    0.03 m/s 라 블록이 트레이 영역을 느리게 지나가기만 해도 보상이 1 로 떴다.
+#    증거: SFT 12 에피소드에서 diag["success"] 는 2건을 잡았으나 12개 **전부**
+#    300스텝을 완주했다(= task_success 종료 0건). 영상에도 안착 장면이 없다.
+#    → success_bonus 가 task_success 와 같은 유지 카운터를 읽도록 수정.
+#      이제 보상·종료·평가가 한 정의다.
+#    ⇒ 그 전까지 보고된 "SFT 기준선 20.3%" 는 무효다. 실제 완수는 0% 이고
+#      문서의 L40S 기준선(0%)과 일치한다.
+#
+# 2) 커리큘럼 뱅크가 실제로는 100% 커리큘럼으로 소비되고 있었다.
+#    sample_bank 는 커리큘럼 행을 앞쪽에 몰아 넣는다(k < n_curriculum).
+#    train_mix 는 인덱스 0~1228 이 전부 커리큘럼이고 그 뒤는 0% 다. 그런데 학습은
+#    커서 0 부터 순차 순회하므로, 실제 소비 구간(~수백 행)이 전부 커리큘럼이었다.
+#    → train_c30/c20/c10 을 새로 만들고 **행 순서를 셔플**했다.
+#      실측: 소비 구간(0~400행)에서 27.5% / 16.2% / 9.2%.
+# =============================================================================
+# §커리큘럼 어닐링
+#   고정 혼합비는 커리큘럼이 아니라 "리셋 분포를 넓혀 둔 것" 에 가깝다.
+#   reverse curriculum(Florensa 2017) 계열의 동력은 쉬운 상태로 신호를 만든 뒤
+#   **원래 분포로 되돌리는** 데 있다. 되돌리지 않으면 커리큘럼 분포에서만 잘하고
+#   목표 분포로의 전이가 보장되지 않는다.
+#   30% → 20% → 10% → 0% 로 4단계. 마지막 구간은 순수 원래 분포라, 그 구간의
+#   성적이 곧 목표 분포 성능이다 (평가는 처음부터 끝까지 eval_base 로만 한다).
+# =============================================================================
+
+checkpoint: ""
+task: VlaPlace-v0
+unnorm_key: vla_pick
+isaaclab_python: ~/env_isaaclab/bin/python
+
+bank: train                       # 스케줄이 끝난 뒤 기본값
+bank_schedule:
+  - [0,  train_c30]               # 커리큘럼 30%
+  - [30, train_c20]               # 20%
+  - [60, train_c10]               # 10%
+  - [90, train]                   # 0% — 순수 원래 분포
+
+num_envs: 8
+group_size: 8
+groups_per_step: 2
+dynamic_sampling: true
+max_group_attempts: 6
+
+# 8Hz 데모 궤적이 평균 202스텝이라(docs/DATASET.md) 200 에서 끊으면 절반이 잘린다.
+# 환경 기본 예산(SPEC.MAX_EPISODE_STEPS)과 같은 300 으로 맞춘다.
+max_steps_per_episode: 300
+
+temperature: 1.2
+
+# outcome-only. 성공 판정이 이제 "2초 유지" 이므로 신호가 훨씬 희소해진다.
+# 그래서 커리큘럼이 필요하고, 그것이 이 설정의 전제다.
+learning_rate: 2.0e-5
+clip_eps: 0.2
+clip_eps_high: 0.28
+kl_coef: 0.0
+max_grad_norm: 1.0
+ppo_epochs: 2
+
+use_lora: true
+lora_rank: 32
+lora_alpha: 16
+
+# 실측 4.6분/스텝(경합 없을 때). 마감까지 약 10.5h → 여유 포함 130.
+total_steps: 130
+
+log_dir: logs/grpo_anneal
+save_every: 15
+eval_every: 15
+eval_episodes: 32
+
+wandb_project: ""
+device: cuda:0
+seed: 0

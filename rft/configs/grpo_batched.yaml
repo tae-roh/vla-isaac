@@ -1,0 +1,103 @@
+# =============================================================================
+# rft/configs/grpo_staged_adaptive.yaml
+#   단계형 sparse 보상 + 성공률(eval_base) 기반 커리큘럼 어닐링
+#
+# ★ 실행 (★ 단계형 보상을 반드시 켤 것):
+#     export VLA_STAGED_REWARD=1
+#     ~/env_eval/bin/python -u rft/grpo_fallback.py \
+#         --config rft/configs/grpo_staged_adaptive.yaml --checkpoint ckpt/sft
+#
+#   워커 로그에 아래 줄이 나와야 한다. 없으면 outcome-only 로 도는 것이다:
+#     [worker] 단계형 보상 ON — 파지 0.2(4스텝 유지) / 리프트 0.4 /
+#                               트레이 0.7(순간값) / 성공 1.0(16스텝 유지)
+#   또 학습 로그의 `보상` 이 `성공` 보다 **커야** 한다 (0.2/0.4/0.7 이 섞이므로).
+#   둘이 같으면 환경변수가 안 걸린 것이다.
+#
+# ⚠ 진입(0.7)은 **순간값**이다. settled 임계가 0.03 m/s 라 블록이 트레이를
+#   느리게 통과하는 중에도 조건이 만족되므로, 이 단계는 "스침" 을 포함한다.
+#   안착 없이 0.7 을 수확할 여지가 있고, 0.7 → 1.0 의 간격이 완수를 유인하는
+#   구조에 의존한다. 감시 지표: 로그의 `진입` 대비 `성공` 격차가 계속 벌어지면
+#   해킹을 의심할 것 (성공은 2초 유지라 스침으로 얻을 수 없다).
+# =============================================================================
+# §직전 실행(grpo_anneal)에서 무엇을 바꿨나
+#
+#   run3 는 outcome-only + 스텝 기준 어닐링으로 96스텝(8시간)을 돌았으나
+#   개선 근거를 만들지 못했다. 홀드아웃 평가가 6.2~25.0% 를 추세 없이 진동했고
+#   학습 롤아웃도 구간 평균 18~22% 로 평평했다. 파지·리프트는 SFT 기준선과
+#   사실상 같아, 조작 능력 자체가 변하지 않았다.
+#
+#   유력한 원인은 **신호의 희소함**이다. 이번 세션에서 성공 판정을
+#   placed_signal() 순간값 → task_success(2초 유지)로 바로잡으면서 보상이 훨씬
+#   드물어졌고, outcome-only 로는 그룹당 학습 신호가 부족했다.
+#
+#   → 두 가지를 바꾼다:
+#     1) 단계형 보상 ON — 파지/리프트/트레이 중간 단계에 신호를 준다
+#     2) 어닐링을 스텝 기준 → eval_base 성공률 기준으로
+# =============================================================================
+
+checkpoint: ""
+task: VlaPlace-v0
+unnorm_key: vla_pick
+isaaclab_python: ~/env_isaaclab/bin/python
+
+# --- 커리큘럼: 성공률 기반 어닐링 ---
+# bank_stages 가 비어 있지 않으면 bank_schedule(스텝 기준)은 무시된다.
+bank: train_c30                   # 폴백용. 실제 시작 단계는 bank_stages[0]
+bank_stages: [train_c30, train_c20, train_c10, train]
+# eval_base 성공률이 이 값 이상이면 다음 단계로. 직전 실행의 eval 실측 최고치가
+# 25.0% 였으므로, 그보다 높게 잡아 **실제 개선이 났을 때만** 승급하게 한다.
+promote_eval_success: 0.30
+# 임계에 못 미쳐도 이 스텝 수를 넘기면 강제 승급. 없으면 원래 분포(마지막 단계)에
+# 영영 도달하지 못해 목표 분포 성능을 아예 못 잰다.
+promote_deadline_steps: 0    # ★ 데드라인 제거 — 성공률이 임계를 넘을 때만 승급한다.
+
+num_envs: 8
+group_size: 8
+groups_per_step: 6
+dynamic_sampling: true
+max_group_attempts: 12   # ★ groups_per_step(6) 의 2배. 6 이면 무신호가 하나만 나와도 배치를 못 채운다
+
+# 8Hz 데모 궤적이 평균 202스텝이라(docs/DATASET.md) 200 에서 끊으면 절반이 잘린다.
+max_steps_per_episode: 300
+
+temperature: 1.2
+learning_rate: 2.0e-5
+clip_eps: 0.2
+clip_eps_high: 0.28
+kl_coef: 0.0
+max_grad_norm: 1.0
+ppo_epochs: 2
+
+use_lora: true
+lora_rank: 32
+lora_alpha: 16
+
+# =============================================================================
+# §시간 — 약 8.8시간 (110스텝)
+#   스텝 약 4.5분 (단계형 보상이 무신호그룹을 낮춰 시도 2회로 안정될 것.
+#   run2 에서 단계형일 때 무신호 평균 2% 였다)
+#   평가 11회 × 3분 = 33분
+#
+#   승급 경로 (데드라인 20 기준):
+#     최선(매 평가 0.30 돌파)  c30: 0~9   c20: 10~19  c10: 20~29  train: 30~110
+#     최악(전부 데드라인)      c30: 0~19  c20: 20~39  c10: 40~59  train: 60~110
+#   어느 쪽이든 원래 분포 구간에서 평가를 5회 이상 확보한다.
+# =============================================================================
+total_steps: 50
+
+log_dir: logs/grpo_batched
+# 승급 판정은 평가 시점에만 일어나므로 eval_every 가 곧 승급 기회 빈도다.
+# 15 → 10 으로 줄여 판정 기회를 늘렸다 (평가 비용 3분 × 11회 = 33분).
+save_every: 10
+eval_every: 10
+eval_episodes: 32
+
+wandb_project: ""
+device: cuda:0
+seed: 0
+
+# --- 배치 forward (2026-08-16 신규) ---
+# 벤치마크 실측: B=8 에서 처리량 포화(no_grad 2.57x, grad 2.87x), B=16 은 이득 없음.
+# grad peak 32.6GB / 96GB 라 여유 충분. 정책 forward 는 num_envs(8) 가 상한이라
+# policy_batch_size 를 그보다 키워도 의미가 없다.
+policy_batch_size: 8
