@@ -15,7 +15,7 @@
 set -uo pipefail
 
 REPO_ID="${REPO_ID:-tae-roh/vla-pick-rft-ckpts}"
-CKPT_DIR="${CKPT_DIR:-/home/shadeform/vla-isaac/logs/grpo_15h_lora}"
+CKPT_DIR="${CKPT_DIR:-/home/shadeform/vla-isaac/logs/grpo_batched}"
 HF="${HF:-$HOME/.local/bin/hf}"
 POLL_SEC="${POLL_SEC:-120}"
 # 로컬에 남겨 둘 최근 체크포인트 수. 업로드가 끝난 것만 지운다.
@@ -54,15 +54,31 @@ cleanup() {
     done
 }
 
+# ★ 학습이 잠깐 안 보인다고 바로 끝내지 않는다. 크래시 후 재시작하는 몇 초
+#   사이에 감시가 죽어 버리면, 이후 체크포인트가 통째로 업로드되지 않는다
+#   (2026-08-16 실제로 그렇게 유실될 뻔했다 — 학습 재시작 1분 전에 종료됨).
+#   MISS_LIMIT 번 연속으로 안 보일 때만 종료한다.
+MISS_LIMIT="${MISS_LIMIT:-5}"
+miss=0
+
 while true; do
-    # 학습이 끝났고 남은 것도 없으면 종료
-    if ! pgrep -f "grpo_fallback.py --config" >/dev/null 2>&1; then
-        pending=$(find "${CKPT_DIR}" -maxdepth 1 -type d -name 'checkpoint-*' 2>/dev/null | wc -l)
-        if [[ "${pending}" == "0" ]] || [[ "${DRAIN_DONE:-0}" == "1" ]]; then
-            log "학습 프로세스 없음 — 감시 종료"
+    if ! pgrep -f "grpo_fallback.p[y]" >/dev/null 2>&1; then
+        miss=$((miss+1))
+        log "학습 프로세스 미검출 (${miss}/${MISS_LIMIT})"
+        if (( miss >= MISS_LIMIT )); then
+            log "학습 프로세스 없음 — 남은 것 업로드하고 감시 종료"
+            # 마지막으로 한 바퀴 더 돌아 남은 체크포인트를 올린다
+            for d in $(find "${CKPT_DIR}" -maxdepth 1 -type d -name 'checkpoint-*' -printf '%f\n' 2>/dev/null |
+                       sed 's/checkpoint-//' | sort -n | sed 's/^/checkpoint-/'); do
+                grep -qxF "${d}" "${STATE}" && continue
+                "${HF}" upload "${REPO_ID}" "${CKPT_DIR}/${d}" "${d}" \
+                    --commit-message "RFT ${d} (final)" >/dev/null 2>&1 && \
+                    { echo "${d}" >> "${STATE}"; log "  ✓ 최종 업로드: ${d}"; }
+            done
             break
         fi
-        DRAIN_DONE=1   # 마지막 한 바퀴만 더 돌고 끝낸다
+    else
+        miss=0
     fi
 
     for d in $(find "${CKPT_DIR}" -maxdepth 1 -type d -name 'checkpoint-*' -printf '%f\n' 2>/dev/null |

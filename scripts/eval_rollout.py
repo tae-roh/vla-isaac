@@ -65,7 +65,7 @@ def load_policy(args):
         def predict(images: np.ndarray, instructions: list[str]) -> np.ndarray:
             n = images.shape[0]
             a = rng.uniform(
-                -0.3, 0.3, size=(n, SPEC.NUM_ACTIONS_CHUNK, SPEC.ACTION_DIM)
+                -0.3, 0.3, size=(n, args.chunk_len, SPEC.ACTION_DIM)
             ).astype(np.float32)
             a[..., -1] = np.where(a[..., -1] > 0, 1.0, -1.0)
             return a
@@ -84,6 +84,21 @@ def load_policy(args):
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     ).to(args.device)
+
+    # ★ RFT 체크포인트는 **LoRA 어댑터만** 담는다 (약 465MB). 단독으로는
+    #   from_pretrained 가 모델 가중치를 찾지 못하므로, 베이스(--checkpoint)를
+    #   먼저 올리고 그 위에 어댑터를 얹는다.
+    #     python scripts/eval_rollout.py --checkpoint ckpt/sft \
+    #         --adapter logs/<run>/checkpoint-N
+    #   ⚠ 베이스는 SFT 체크포인트여야 한다. RFT 어댑터는 그 위에서 학습됐다.
+    if args.adapter:
+        from peft import PeftModel
+
+        print(f"[eval] LoRA 어댑터 적용: {args.adapter}")
+        model = PeftModel.from_pretrained(model, args.adapter)
+        # PeftModel 은 알 수 없는 속성을 베이스로 넘긴다(norm_stats, vocab_size,
+        # bin_centers, predict_action 모두 그대로 쓸 수 있다).
+
     model.eval()
 
     # 정규화 통계는 **체크포인트 안의 것**을 쓴다 (predict_action 이 unnorm_key 로
@@ -128,13 +143,16 @@ def load_policy(args):
             if isinstance(act, torch.Tensor):
                 act = act.detach().float().cpu().numpy()
             act = np.asarray(act, dtype=np.float32).reshape(-1, SPEC.ACTION_DIM)
-            # 청크 길이를 스펙에 맞춘다 (모자라면 마지막 액션을 반복).
-            if act.shape[0] < SPEC.NUM_ACTIONS_CHUNK:
-                pad = np.repeat(
-                    act[-1:], SPEC.NUM_ACTIONS_CHUNK - act.shape[0], axis=0
-                )
+            # ★ 청크 길이. OFT 체크포인트는 8개를 한 번에 내지만, **베이스
+            #   OpenVLA 는 관측마다 1개**를 내는 폐루프 제어용이다.
+            #   그 1개를 8번 반복하면 델타가 8배로 적용되어 실제보다 훨씬
+            #   나쁘게 나온다 — 베이스를 평가할 때는 --chunk-len 1 로 매 스텝
+            #   질의해야 한다 (워커는 가변 청크 길이를 받는다).
+            k = args.chunk_len
+            if act.shape[0] < k:
+                pad = np.repeat(act[-1:], k - act.shape[0], axis=0)
                 act = np.concatenate([act, pad], axis=0)
-            chunks.append(act[: SPEC.NUM_ACTIONS_CHUNK])
+            chunks.append(act[:k])
         return np.stack(chunks).astype(np.float32)
 
     return predict
@@ -158,6 +176,16 @@ def _write_video(outdir: Path, name: str, frames: list, scale: int = 2) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--chunk-len", type=int, default=SPEC.NUM_ACTIONS_CHUNK,
+        help="한 번의 관측으로 실행할 액션 수. OFT 체크포인트는 기본값(8)을 쓰고, "
+             "관측마다 액션 1개를 내는 베이스 OpenVLA 는 1 로 줄 것.",
+    )
+    parser.add_argument(
+        "--adapter", type=str, default=None,
+        help="RFT LoRA 어댑터 디렉터리. RFT 체크포인트는 어댑터만 담으므로 "
+             "--checkpoint 에 베이스(ckpt/sft)를, 여기에 checkpoint-N 을 준다.",
+    )
     parser.add_argument("--random-policy", action="store_true")
     parser.add_argument("--task", default="VlaPlace-v0")
     parser.add_argument("--num-envs", type=int, default=8)
@@ -225,7 +253,8 @@ def main() -> int:
     client.start()
 
     num_rounds = int(np.ceil(args.num_episodes / args.num_envs))
-    steps_per_round = int(np.ceil(args.max_steps / SPEC.NUM_ACTIONS_CHUNK))
+    # ★ 청크 길이가 1 이면 라운드당 스텝 수가 8배가 된다 (매 스텝 재질의).
+    steps_per_round = int(np.ceil(args.max_steps / args.chunk_len))
 
     successes: list[float] = []
     episode_lengths: list[int] = []
@@ -284,7 +313,7 @@ def main() -> int:
                 #   평균 내면 "성공률" 이 아니다. outcome 성공률은 워커가
                 #   diag["success"] 로 따로 보낸다. 보고는 반드시 이쪽으로.
                 succ = max(succ, float(client.last_diag.get("success", 0.0)))
-                steps_taken += SPEC.NUM_ACTIONS_CHUNK
+                steps_taken += args.chunk_len
                 if bool(done.all()):
                     break
             lifted_all.append(lifted)
